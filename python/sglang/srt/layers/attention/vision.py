@@ -14,14 +14,18 @@ from einops import rearrange
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.utils import (
     get_device_capability,
+    get_bool_env_var,
     is_blackwell,
     is_cuda,
     is_npu,
+    is_hip,
     print_info_once,
 )
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
@@ -347,7 +351,7 @@ class VisionAiterAttention(nn.Module):
         self,
         **kwargs,
     ):
-        if not _is_hip:
+        if not _use_aiter:
             raise Exception("aiter_attn is only available for AMD")
         try:
             from aiter import flash_attn_varlen_func as aiter_flash_attn_varlen_func
@@ -452,6 +456,7 @@ class VisionAscendAttention(nn.Module):
 
 QKV_BACKEND_IMPL = {
     "triton_attn": VisionTritonAttention,
+    "aiter_attn": VisionAiterAttention,
     "sdpa": VisionSdpaAttention,
     "fa3": VisionFlash3Attention,
     "ascend_attn": VisionAscendAttention,
