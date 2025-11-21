@@ -733,6 +733,7 @@ def get_processor(
 
 def get_dataset(args, tokenizer, model_id=None):
     tokenize_prompt = getattr(args, "tokenize_prompt", False)
+    exclude_speical_tokens = getattr(args, "exclude_special_tokens", False)
     if args.dataset_name == "sharegpt":
         assert not tokenize_prompt
         input_requests = sample_sharegpt_requests(
@@ -768,6 +769,7 @@ def get_dataset(args, tokenizer, model_id=None):
             image_format=args.image_format,
             image_resolution=args.image_resolution,
             backend=args.backend,
+            exclude_speical_tokens = exclude_speical_tokens
         )
     elif args.dataset_name == "generated-shared-prefix":
         assert not tokenize_prompt
@@ -1403,6 +1405,7 @@ def sample_image_requests(
     image_format: str,
     image_resolution: str,
     backend: str,
+    exclude_speical_tokens: bool
 ) -> List[DatasetRow]:
     """Generate requests with images.
 
@@ -1452,9 +1455,24 @@ def sample_image_requests(
 
     dataset: List[DatasetRow] = []
     total_image_bytes = 0
+
+    def _get_special_token_ids(tokenizer: PreTrainedTokenizer) -> set[int]:
+        special_token_set = set()
+        for token_value in tokenizer.special_tokens_map.values():
+            if isinstance(token_value, str):
+                tok_id = tokenizer.convert_tokens_to_ids(token_value)
+                special_token_set.add(tok_id)
+            elif isinstance(token_value, list):
+                tok_ids = tokenizer.convert_tokens_to_ids(token_value)
+                special_token_set.update(tok_ids)
+        return special_token_set
+    special_token_set = {}
+    if exclude_speical_tokens:
+        special_token_set = _get_special_token_ids(processor.tokenizer)
+        
     for i in range(num_requests):
         # Generate text prompt
-        text_prompt = gen_prompt(processor.tokenizer, int(input_lens[i]))
+        text_prompt = gen_prompt(processor.tokenizer, int(input_lens[i]), special_token_set)
 
         # Generate image list
         images, images_base64, images_bytes = zip(
@@ -1481,9 +1499,11 @@ def sample_image_requests(
     return dataset
 
 
-def gen_prompt(tokenizer, token_num):
+def gen_prompt(tokenizer, token_num, special_token_set):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
-    all_available_tokens = list(tokenizer.get_vocab().values())
+    all_available_tokens = [
+        t for t in tokenizer.get_vocab().values() if t not in special_token_set
+    ]
     selected_tokens = random.choices(all_available_tokens, k=token_num)
     return tokenizer.decode(selected_tokens)
 
@@ -2147,6 +2167,9 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "tokenize_prompt"):
         args.tokenize_prompt = False
 
+    if not hasattr(args, "exclude_special_tokens"):
+        args.exclude_special_tokens = False
+
     if not hasattr(args, "use_trace_timestamps"):
         args.use_trace_timestamps = False
     if not hasattr(args, "mooncake_slowdown_factor"):
@@ -2427,7 +2450,7 @@ if __name__ == "__main__":
             "Resolution of images for image dataset. "
             "Supports presets 4k/1080p/720p/360p or custom 'heightxwidth' (e.g., 1080x1920)."
         ),
-    )
+    ) 
     parser.add_argument(
         "--image-format",
         type=str,
@@ -2567,7 +2590,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately",
     )
-
+    parser.add_argument(
+        "--exclude-special-tokens",
+        action="store_true",
+        help="Exclude special tokens when generating random prompt.  " 
+        "Useful in multimodal preprocessing to avoid inserting tokens like <|image_placeholder|>, <|audio_placeholder|>"
+        "which could trigger special handling during preprocessing.",
+    )
     group = parser.add_argument_group("generated-shared-prefix dataset arguments")
     group.add_argument(
         "--gsp-num-groups",
