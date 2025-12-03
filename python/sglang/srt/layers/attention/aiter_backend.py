@@ -169,7 +169,11 @@ class ForwardMetadata:
 
 global_workspace_buffer = None
 
-_AITER_PARTITION_SIZE_ROCM = 256
+import os
+p = os.getenv("USE_PA")
+
+_AITER_PARTITION_SIZE_ROCM = 256 * 4 if p is None or p.startswith("1") else 256
+
 
 
 class AiterAttnBackend(AttentionBackend):
