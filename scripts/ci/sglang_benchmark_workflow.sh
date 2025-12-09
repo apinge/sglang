@@ -49,21 +49,22 @@ if [[ "${TYPE}" == "launch" ]]; then
             --max-running-requests 128 &
         sglang_pid=$!
     elif [[ "${model_name}" == "Qwen3-Omni" ]]; then
-            export SGLANG_USE_AITER=1
-            python3 -m sglang.launch_server \
-                --model-path "${model_path}" \
-                --host localhost \
-                --port 9000 \
-                --tp-size ${TP} \
-                --ep-size ${EP} \
-                --trust-remote-code \
-                --mm-attention-backend "aiter_attn"\
-                --chunked-prefill-size 16384 \
-                --mem-fraction-static 0.85 \
-                --disable-radix-cache \
-                --max-prefill-tokens 16384 \
-                --cuda-graph-max-bs 64 \
-                --page-size 64 &
+        echo "Qwen3-Omni-Server Launch"
+        export SGLANG_USE_AITER=1
+        python3 -m sglang.launch_server \
+            --model-path "${model_path}" \
+            --host localhost \
+            --port 9000 \
+            --tp-size ${TP} \
+            --ep-size ${EP} \
+            --trust-remote-code \
+            --mm-attention-backend "aiter_attn"\
+            --chunked-prefill-size 16384 \
+            --mem-fraction-static 0.85 \
+            --disable-radix-cache \
+            --max-prefill-tokens 16384 \
+            --cuda-graph-max-bs 64 \
+            --page-size 64 &
             sglang_pid=$!
     else
         echo "Unknown model_name: ${model_name}"
