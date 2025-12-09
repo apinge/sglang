@@ -44,8 +44,12 @@ from sglang.srt.models.qwen3_vl_moe import (
     load_fused_expert_weights,
 )
 from sglang.srt.utils import add_prefix, logger
+from sglang.srt.server_args import get_global_server_args
 
-
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
     def __init__(
         self,
@@ -56,6 +60,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         super().__init__()
         embed_dim = config.d_model
         self.embed_dim = config.d_model
+        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
         self.self_attn = VisionAttention(
             embed_dim=embed_dim,
             num_heads=config.encoder_attention_heads,
@@ -65,6 +70,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
+            use_data_parallel=self.use_data_parallel,
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.dropout = config.dropout
@@ -314,6 +320,7 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_postshuffle_norm=False,
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
@@ -321,6 +328,10 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
         self.ln_q = RMSNorm(
             self.hidden_size if use_postshuffle_norm else context_dim, eps=1e-6
         )
+
+        tp_size = 1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
+
         self.mlp = nn.ModuleList(
             [
                 ColumnParallelLinear(
@@ -329,6 +340,8 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
                     bias=True,
                     quant_config=quant_config,
                     prefix=add_prefix("mlp.0", prefix),
+                    tp_size=tp_size,
+                    tp_rank=tp_rank,
                 ),
                 nn.GELU(),
                 RowParallelLinear(
@@ -337,6 +350,8 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
                     bias=True,
                     quant_config=quant_config,
                     prefix=add_prefix("mlp.2", prefix),
+                    tp_size=tp_size,
+                    tp_rank=tp_rank,
                 ),
             ]
         )
@@ -373,8 +388,9 @@ class Qwen3OmniMoeVisionEncoder(Qwen3VLMoeVisionModel):
             vision_config=config,
             quant_config=quant_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+            use_data_parallel = get_global_server_args().mm_enable_dp_encoder,
         )
-
+        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
         self.merger = Qwen3OmniMoeVisionPatchMerger(
             dim=config.out_hidden_size,
             context_dim=config.hidden_size,
@@ -382,6 +398,7 @@ class Qwen3OmniMoeVisionEncoder(Qwen3VLMoeVisionModel):
             quant_config=quant_config,
             use_postshuffle_norm=False,
             prefix=add_prefix("merger", prefix),
+            use_data_parallel=self.use_data_parallel,
         )
         self.merger_list = nn.ModuleList(
             [
@@ -392,6 +409,7 @@ class Qwen3OmniMoeVisionEncoder(Qwen3VLMoeVisionModel):
                     use_postshuffle_norm=True,
                     quant_config=quant_config,
                     prefix=add_prefix("merger_list", prefix),
+                    use_data_parallel=self.use_data_parallel,
                 )
                 for _ in range(len(config.deepstack_visual_indexes))
             ]

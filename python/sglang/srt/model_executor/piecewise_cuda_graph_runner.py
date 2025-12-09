@@ -96,7 +96,7 @@ def use_original_ca_comm(tp_group):
         return
 
     current_disabled = tp_group.ca_comm.disabled
-    original_disabled = tp_group.ca_comm.original_disabled
+    original_disabled = False #tp_group.ca_comm.original_disabled
     try:
         tp_group.ca_comm.disabled = original_disabled
         yield
