@@ -65,7 +65,7 @@ if [[ "${TYPE}" == "launch" ]]; then
             --max-prefill-tokens 16384 \
             --cuda-graph-max-bs 64 \
             --page-size 64 &
-            sglang_pid=$!
+        sglang_pid=$!
     else
         echo "Unknown model_name: ${model_name}"
         exit 1
