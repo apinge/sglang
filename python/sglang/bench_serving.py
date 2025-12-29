@@ -740,7 +740,7 @@ def get_processor(
     ):
         pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
     return AutoProcessor.from_pretrained(
-        pretrained_model_name_or_path, trust_remote_code=True
+        pretrained_model_name_or_path, trust_remote_code=True, truncation=False
     )
 
 
