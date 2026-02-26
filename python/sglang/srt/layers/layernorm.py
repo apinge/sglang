@@ -65,6 +65,15 @@ if _is_cuda or _is_xpu:
         gemma_rmsnorm,
         rmsnorm,
     )
+elif _is_hip:
+    # HIP: is_cuda() is False (no torch.version.cuda), so import sgl_kernel here
+    # for Gemma RMSNorm and other norm ops (ROCm build registers gemma_rmsnorm etc.)
+    from sgl_kernel import (
+        fused_add_rmsnorm,
+        gemma_fused_add_rmsnorm,
+        gemma_rmsnorm,
+        rmsnorm,
+    )
 _has_vllm_rms_norm = False
 if _use_aiter:
     from aiter import rmsnorm2d_fwd as rms_norm
@@ -430,19 +439,18 @@ class GemmaRMSNorm(MultiPlatformOp):
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
 
-        # Re-dispatch
-        if _is_hip:
-            self._forward_method = self.forward_native
-
     def _forward_impl(
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # HIP/CUDA kernel requires contiguous input (e.g. Q/K norm path passes reshaped views)
+        x = x.contiguous() if not x.is_contiguous() else x
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
+            residual = residual.contiguous() if not residual.is_contiguous() else residual
             gemma_fused_add_rmsnorm(
                 x, residual, self.weight.data, self.variance_epsilon
             )

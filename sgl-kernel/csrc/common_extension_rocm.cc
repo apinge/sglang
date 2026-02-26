@@ -214,6 +214,14 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   /*
    * From csrc/elementwise
    */
+  m.def("gemma_rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
+  m.impl("gemma_rmsnorm", torch::kCUDA, &gemma_rmsnorm);
+
+  m.def(
+      "gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool "
+      "enable_pdl) -> ()");
+  m.impl("gemma_fused_add_rmsnorm", torch::kCUDA, &gemma_fused_add_rmsnorm);
+
   m.def(
       "rotary_embedding(Tensor positions, Tensor! query,"
       "                 Tensor!? key, int head_size,"
