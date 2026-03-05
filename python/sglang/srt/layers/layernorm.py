@@ -417,7 +417,6 @@ class GemmaRMSNorm(MultiPlatformOp):
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
 
-        # Re-dispatch: use aiter gemma kernels on HIP when SGLANG_USE_AITER is set
         if _use_aiter:
             self._forward_method = self.forward_gemma_aiter
         elif _is_hip:
