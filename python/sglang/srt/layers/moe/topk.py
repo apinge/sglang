@@ -466,7 +466,7 @@ def fused_topk(
         M, topk, dtype=torch.float32, device=hidden_states.device
     )
     topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
-    
+
     if scoring_func == "softmax":
         if _use_aiter:
             #logger.info("[Attention] Use Aiter softmax")
