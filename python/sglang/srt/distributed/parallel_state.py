@@ -68,6 +68,11 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
+# When ROCM_QUICK_REDUCE_QUANTIZATION is set (INT4/INT6/INT8/FP), prefer
+# QuickReduce over custom allreduce so the quick reduce kernel is used
+# when the tensor meets size/dtype constraints (see _QR_MIN_SIZE in
+# quick_all_reduce.py). Otherwise custom allreduce is tried first.
+use_quick_reduce_env = os.environ.get("ROCM_QUICK_REDUCE_QUANTIZATION", "NONE") not in ("NONE", "")
 
 @dataclass
 class GraphCaptureContext:
@@ -590,6 +595,13 @@ class GroupCoordinator:
 
         outplace_all_reduce_method = None
         if (
+            self.qr_comm is not None
+            and not self.qr_comm.disabled
+            and self.qr_comm.should_quick_allreduce(input_)
+            and use_quick_reduce_env
+        ):
+            outplace_all_reduce_method = "qr"
+        elif (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and self.ca_comm.should_custom_ar(input_)

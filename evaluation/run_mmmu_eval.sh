@@ -1,0 +1,1 @@
+python3 ../benchmark/mmmu/bench_sglang.py --concurrency 64 --port 9000 --max-new-tokens 512
