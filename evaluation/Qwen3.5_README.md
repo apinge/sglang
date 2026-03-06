@@ -2,7 +2,7 @@
 
 1. Docker image:
    ```
-   rocm/sgl-dev:v0.5.9-rocm720-mi30x-20260301
+   rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260301
    ```
 
 2. Install aiter:
