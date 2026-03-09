@@ -407,6 +407,11 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         cos_combined = cos[pos_ids].flatten(1)
         sin_combined = sin[pos_ids].flatten(1)
 
+        # Duplicate cos/sin to match full head_dim for apply_rotary_pos_emb,
+        # so we do the cat once here instead of in every attention layer.
+        cos_combined = torch.cat([cos_combined, cos_combined], dim=-1)
+        sin_combined = torch.cat([sin_combined, sin_combined], dim=-1)
+
         return cos_combined, sin_combined
 
     def _get_interpolation_indices(self, dim_size: int) -> torch.Tensor:

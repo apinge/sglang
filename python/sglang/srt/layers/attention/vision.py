@@ -918,10 +918,6 @@ class VisionAttention(nn.Module):
             q = q.view(-1, head, self.head_size)
             k = k.view(-1, head, self.head_size)
 
-            if cos.size(-1) * 2 == self.head_size:
-                cos = torch.cat([cos, cos], dim=-1)
-                sin = torch.cat([sin, sin], dim=-1)
-
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
             q = q.view(original_shape)
             k = k.view(original_shape)
