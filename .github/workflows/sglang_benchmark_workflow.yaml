@@ -1,0 +1,188 @@
+name: SGLang Benchmark Workflow
+
+on:
+  pull_request:
+    branches:
+      - dev/perf
+  workflow_dispatch:
+    inputs:
+      model_list:
+        description: 'Model list to benchmark on MI350X (JSON array format, default: ["Qwen3.5-397B-A17B"])'
+        required: false
+        default: '["Qwen3.5-397B-A17B"]'
+      image:
+        description: 'Image to use for the benchmark (default: "rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260301")'
+        required: true
+        default: "rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260301"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ${{ github.event.inputs.image || 'rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260301' }}
+  SGLANG_GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || format('{0}/{1}.git', github.server_url, github.repository) }}
+  SGLANG_GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
+
+jobs:
+  benchmark:
+    runs-on: mi350x-1node-8gpus
+    strategy:
+      fail-fast: false
+      matrix:
+        model: ${{ fromJson(github.event.inputs.model_list || '["Qwen3.5-397B-A17B"]') }} 
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Download SGLang Image
+        run: |
+          pull_success=false
+          for i in 1 2 3; do
+            if docker pull ${{ env.IMAGE }}; then
+              pull_success=true
+              break
+            else
+              echo "docker pull failed, retrying ($i/3)..."
+              sleep 5
+            fi
+          done
+          if [ "$pull_success" != "true" ]; then
+            echo "docker pull failed after 3 attempts."
+            exit 1
+          fi
+    
+      - name: Generate Dockerfile
+        run: |
+          cat <<'EOF' > Dockerfile.mod
+          FROM ${{ env.IMAGE }}
+          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
+          RUN pip uninstall -y aiter amd-aiter
+          RUN rm -rf /sgl-workspace/aiter/aiter/jit/build
+          RUN rm -rf /sgl-workspace/aiter/aiter/jit/*.so
+          RUN rm -rf /sgl-workspace/aiter/
+          RUN rm -rf ~/.aiter
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN pip show pybind11
+
+          RUN git clone https://github.com/sammysun0711/aiter /aiter && \
+            cd /aiter && \
+            git checkout dev/perf && \
+            git submodule sync && git submodule update --init --recursive && \
+            PYTORCH_ROCM_ARCH="gfx950" python3 setup.py develop
+
+          RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
+
+          RUN echo "=== sgl-kernel version before installation ===" && pip show sgl-kernel || true
+          RUN echo "=== sglang version before installation ===" && pip show sglang || true
+          RUN pip uninstall -y sgl-kernel sglang
+          RUN git clone ${{ env.SGLANG_GITHUB_REPO_URL }} /sglang-checkout && \
+              cd /sglang-checkout && \
+              git checkout ${{ env.SGLANG_GITHUB_COMMIT_SHA }} && \
+              git rev-parse HEAD && \
+              pip install --upgrade pip && \
+              pip install "transformers>=4.57.0" && \
+              cd sgl-kernel && \
+              AMDGPU_TARGET=gfx950 python3 setup_rocm.py install && \
+              cd .. && \
+              rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml && \
+              AMDGPU_TARGET=gfx950 PYTORCH_ROCM_ARCH="gfx950" pip install -e "python[all_hip]"
+          RUN echo "=== sgl-kernel version after installation ===" && pip show sgl-kernel || true
+          RUN echo "=== sglang version after installation ===" && pip show sglang || true
+          EOF
+
+      - name: Show dockerfile
+        run: |
+          cat Dockerfile.mod 
+
+      - name: Build Docker image
+        run: |
+          docker build --no-cache --network=host -t "sglang_test:ci" -f Dockerfile.mod .
+          # Remove dangling images from this build to free disk
+          docker image prune -f
+          # Remove build cache to free more disk
+          docker builder prune -f
+
+
+      - name: Start CI container
+        run: |
+          echo "Clean up containers..."
+          docker ps -aq -f name=sglang_test | xargs -r docker stop | xargs -r docker rm
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          echo "Starting container: sglang_test:ci"
+          docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
+            --device=/dev/mem \
+            --ipc=host \
+            --network=host \
+            --group-add video \
+            --shm-size 16g \
+            --privileged \
+            --cap-add=CAP_SYS_ADMIN \
+            --cap-add=SYS_PTRACE \
+            -v /data/models:/models \
+            --security-opt seccomp=unconfined \
+            -w /sglang-checkout \
+            --name sglang_test \
+            sglang_test:ci
+
+      - name: Show Aiter version
+        run: |
+          docker exec sglang_test bash -c "pip show amd-aiter"
+
+      - name: Show /dev/shm size
+        run: |
+          docker exec sglang_test bash -c "df -h /dev/shm"
+
+      - name: Launch the server
+        timeout-minutes: 60
+        run: |
+          set -ex
+          model_name=${{ matrix.model }}
+          if [ "$model_name" == "Qwen3.5-397B-A17B" ]; then
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch $model_name /models/Qwen3.5-397B-A17B/ 8 60"
+          else
+            echo "Unknown model_name: ${model_name}"
+            exit 1
+          fi
+
+      - name: Run vision model evaluation
+        continue-on-error: true
+        timeout-minutes: 60
+        run: |
+          model_name=${{ matrix.model }}
+          if [ "$model_name" == "Qwen3.5-397B-A17B" ]; then
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation $model_name /models/Qwen3.5-397B-A17B/ 8"
+          else
+            echo "Unknown model_name: ${model_name}"
+            exit 1
+          fi
+
+      - name: Run vision model benchmark
+        continue-on-error: true
+        timeout-minutes: 60
+        run: |
+          model_name=${{ matrix.model }}
+          if [ "$model_name" == "Qwen3.5-397B-A17B" ]; then
+            docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh benchmark $model_name /models/Qwen3.5-397B-A17B/ 8"
+          else
+            echo "Unknown model_name: ${model_name}"
+            exit 1
+          fi
+
+      - name: Clean Up
+        if: always()
+        run: |
+          docker exec -u root sglang_test bash -c "rm -rf /sglang-checkout" 2>/dev/null || true
+          docker stop sglang_test 2>/dev/null || true
+          docker rm sglang_test 2>/dev/null || true
+          docker image rm sglang_test:ci 2>/dev/null || true
+          docker rmi -f $(docker images -f "dangling=true" -q) || true
+          docker image prune -f 2>/dev/null || true
+          docker builder prune -f 2>/dev/null || true
