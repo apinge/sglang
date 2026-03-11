@@ -129,6 +129,7 @@ if _is_cuda or _is_hip or _is_xpu:
 if _use_aiter:
     try:
         from aiter import biased_grouped_topk as aiter_biased_grouped_topk
+        from aiter import topk_softmax as aiter_topk_softmax
     except ImportError:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 
@@ -511,12 +512,24 @@ def fused_topk(
     topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
 
     if scoring_func == "softmax":
-        topk_softmax(
-            topk_weights,
-            topk_ids,
-            gating_output,
-            renormalize,
-        )
+        if _use_aiter:
+            token_expert_indices = torch.empty(
+                M, topk, dtype=torch.int32, device=hidden_states.device
+            )
+            aiter_topk_softmax(
+                topk_weights,
+                topk_ids,
+                token_expert_indices,
+                gating_output,
+                renormalize,
+            )
+        else:
+            topk_softmax(
+                topk_weights,
+                topk_ids,
+                gating_output,
+                renormalize,
+            )
     elif scoring_func == "sigmoid":
         topk_sigmoid(
             topk_weights,
