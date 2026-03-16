@@ -48,8 +48,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         if self.is_multimodal:
             config = config.text_config
 
-        # The MTP model is unquantized in the nvfp4 checkpoint.
-        if quant_config and quant_config.get_name() == "modelopt_fp4":
+        # Keep the MTP branch unquantized for FP4-style checkpoints (e.g. NVFP4/modelopt_fp4 or Quark/MXFP4).
+        if quant_config and quant_config.get_name() in ["modelopt_fp4", "quark"]:
             quant_config = None
 
         self.config = config
