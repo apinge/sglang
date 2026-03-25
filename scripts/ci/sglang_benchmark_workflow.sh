@@ -23,7 +23,7 @@ echo "Detect TIMEOUT ${TIMEOUT}"
 if [[ "${TYPE}" == "launch" ]]; then
     echo
     echo "========== LAUNCHING SERVER ========"
-    if [[ "${model_name}" == "Qwen3.5-397B-A17B" ]]; then
+    if [[ "${model_name}" == "Qwen3.5-397B-A17B" ]] || [[ "${model_name}" == "Qwen3.5-397B-A17B-FP8" ]]; then
         export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
         export SGLANG_USE_AITER=1
         export ROCM_QUICK_REDUCE_QUANTIZATION=INT4
@@ -34,6 +34,7 @@ if [[ "${TYPE}" == "launch" ]]; then
         echo "********** AOT Prebuild aiter kernel finished ... **********"
         cd /sglang-checkout
         python -m sglang.launch_server \
+            --model ${model_path} \
             --model-path "${model_path}" \
             --port 9000 \
             --tp-size ${TP} \
@@ -111,14 +112,13 @@ elif [[ "${TYPE}" == "evaluation" ]]; then
 elif [[ "${TYPE}" == "benchmark" ]]; then
     echo
     echo "========== STARTING PERFORMANCE BENCHMARK =========="
-    model="${model_path}"
     input_tokens=8000
     output_tokens=500
     num_prompts=32
     max_concurrency=1
     dataset_name="random"
 
-    echo "bench model: ${model}"
+    echo "bench model: ${model_name}"
     echo "input tokens: ${input_tokens}"
     echo "output tokens: ${output_tokens}"
     echo "max concurrency: ${max_concurrency}"
@@ -127,7 +127,7 @@ elif [[ "${TYPE}" == "benchmark" ]]; then
 
     python3 -m sglang.bench_serving \
         --backend sglang \
-        --model ${model} \
+        --model ${model_path} \
         --dataset-name ${dataset_name} \
         --host localhost \
         --port 9000 \
