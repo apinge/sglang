@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.fla.chunk_scaled_dot_kkt import (
     chunk_scaled_dot_kkt_fwd,
 )
 from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
+from sglang.srt.layers.attention.fla.fused_preprocessing import fused_preprocessing_fwd
 from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.fla.solve_tril import solve_tril
 from sglang.srt.layers.attention.fla.utils import (
@@ -21,6 +22,10 @@ from sglang.srt.layers.attention.fla.utils import (
     input_guard,
 )
 from sglang.srt.layers.attention.fla.wy_fast import recompute_w_u_fwd
+
+# when True, preprocessing uses the fused Triton kernel
+# Set this to False for debugging or performance tuning.
+USE_FUSION = True
 
 
 def chunk_gated_delta_rule_fwd(
@@ -34,20 +39,30 @@ def chunk_gated_delta_rule_fwd(
     initial_state_indices: torch.Tensor,
     cu_seqlens: Optional[torch.LongTensor] = None,
 ):
-    g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
-    # obtain WY representation. u is actually the new v.
-    A = chunk_scaled_dot_kkt_fwd(
-        k=k, beta=beta, g_cumsum=g, cu_seqlens=cu_seqlens, output_dtype=torch.float32
-    )
-    A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
-    w, u = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g_cumsum=g,
-        cu_seqlens=cu_seqlens,
-    )
+    if USE_FUSION:
+        g, w, u = fused_preprocessing_fwd(
+            k=k, v=v, beta=beta, g=g, cu_seqlens=cu_seqlens
+        )
+        A = None
+    else:
+        g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
+        # obtain WY representation. u is actually the new v.
+        A = chunk_scaled_dot_kkt_fwd(
+            k=k,
+            beta=beta,
+            g_cumsum=g,
+            cu_seqlens=cu_seqlens,
+            output_dtype=torch.float32,
+        )
+        A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
+        w, u = recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            g_cumsum=g,
+            cu_seqlens=cu_seqlens,
+        )
     h, v_new = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
