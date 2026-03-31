@@ -1,4 +1,4 @@
-# Applyed from https://github.com/a-sidorova/amd-workspace/blob/master/kernels/triton/gdn/prefill/fla/ops/fused_preprocessing.py
+# Adapted from https://github.com/a-sidorova/amd-workspace/blob/master/kernels/triton/gdn/prefill/fla/ops/fused_preprocessing.py
 from typing import Optional, Tuple
 
 import torch
