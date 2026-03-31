@@ -1745,9 +1745,9 @@ def batch_decode_jpeg_gpu(img_tensor_bytes_list: list, device="cuda:1"):
 
         cv2.ocl.setUseOpenCL(True)
         if not cv2.ocl.haveOpenCL():
-            logger.warning("OpenCL is not available, try opencv cpu for image decode")
-            return
-        logger.info("Use_opencv_ocl %s", cv2.ocl.useOpenCL())
+            logger.warning("OpenCL is not available, using opencv CPU for image decode")
+        else:
+            logger.info("Use_opencv_ocl %s", cv2.ocl.useOpenCL())
         results = [None] * len(img_tensor_bytes_list)
         with ThreadPoolExecutor(max_workers=len(img_tensor_bytes_list)) as executor:
             future_to_index = {
