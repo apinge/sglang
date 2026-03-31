@@ -118,6 +118,7 @@ class Fp8Config(QuantizationConfig):
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: List[int] = None,
         use_mxfp8: bool = False,
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
     ) -> None:
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
@@ -127,6 +128,7 @@ class Fp8Config(QuantizationConfig):
         self.activation_scheme = activation_scheme
         self.ignored_layers = ignored_layers or []
         self.use_mxfp8 = use_mxfp8
+        self.packed_modules_mapping = packed_modules_mapping or {}
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
@@ -177,6 +179,9 @@ class Fp8Config(QuantizationConfig):
                     layer.replace("model.", "") for layer in ignored_layers
                 ]
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
+        packed_modules_mapping = (
+            cls.get_from_keys_or(config, ["packed_modules_mapping"], {}) or {}
+        )
         if use_mxfp8 and weight_block_size is not None:
             logger.warning(
                 "MXFP8 ignoring incoming weight_block_size in config.json; it is fixed to [1, 32]."
@@ -188,6 +193,7 @@ class Fp8Config(QuantizationConfig):
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
             use_mxfp8=use_mxfp8,
+            packed_modules_mapping=packed_modules_mapping,
         )
 
     def get_quant_method(
@@ -198,7 +204,11 @@ class Fp8Config(QuantizationConfig):
         from sglang.srt.layers.radix_attention import RadixAttention
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(prefix, self.ignored_layers):
+            if is_layer_skipped(
+                prefix,
+                self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+            ):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):

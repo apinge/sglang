@@ -97,6 +97,13 @@ if _is_hip:
 
 cached_get_processor = lru_cache(get_processor)
 
+QWEN3_5_PACKED_MODULES_MAPPING = {
+    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+    "gate_up_proj": ["gate_proj", "up_proj"],
+    "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+    "in_proj_ba": ["in_proj_b", "in_proj_a"],
+}
+
 
 class Qwen3_5SparseMoeBlock(Qwen2MoeSparseMoeBlock):
     """Qwen3.5-specific MoE block with fused shared expert gating on HIP."""
@@ -694,6 +701,8 @@ ALL_DECODER_LAYER_TYPES = {
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
+    packed_modules_mapping = QWEN3_5_PACKED_MODULES_MAPPING
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -701,6 +710,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        if quant_config is not None and hasattr(quant_config, "packed_modules_mapping"):
+            quant_config.packed_modules_mapping = self.packed_modules_mapping
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
@@ -820,14 +831,11 @@ class Qwen3_5ForCausalLM(nn.Module):
         ]
 
         gdn_fused_proj_mapping = None
-        _load_fused_qkv = None
         if _use_fused_gdn_proj:
             from sglang.srt.models.qwen3_5_gdn_fused_proj import (
                 FUSED_PROJ_WEIGHT_MAPPING,
-                load_fused_qkv_weight,
             )
             gdn_fused_proj_mapping = FUSED_PROJ_WEIGHT_MAPPING
-            _load_fused_qkv = load_fused_qkv_weight
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
@@ -844,15 +852,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                 name = name.replace(".self_attn", "")
 
             if gdn_fused_proj_mapping is not None:
-                if ".linear_attn.in_proj_qkv." in name:
-                    mapped_name = name.replace("in_proj_qkv", "in_proj_fused")
-                    if mapped_name in params_dict:
-                        param = params_dict[mapped_name]
-                        weight_loader = getattr(param, "weight_loader")
-                        _load_fused_qkv(param, loaded_weight, weight_loader)
-                        loaded_params.add(mapped_name)
-                        continue
-
                 handled = False
                 for fused_name, ckpt_name, shard_id in gdn_fused_proj_mapping:
                     if ckpt_name not in name:
@@ -980,14 +979,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
         gdn_fused_proj_mapping = None
-        _load_fused_qkv = None
         if _use_fused_gdn_proj:
             from sglang.srt.models.qwen3_5_gdn_fused_proj import (
                 FUSED_PROJ_WEIGHT_MAPPING,
-                load_fused_qkv_weight,
             )
             gdn_fused_proj_mapping = FUSED_PROJ_WEIGHT_MAPPING
-            _load_fused_qkv = load_fused_qkv_weight
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -1002,16 +998,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 name = name.replace(".self_attn", "")
 
             if gdn_fused_proj_mapping is not None:
-                if ".linear_attn.in_proj_qkv." in name:
-                    mapped_name = name.replace("in_proj_qkv", "in_proj_fused")
-                    if not (mapped_name.endswith(ignore_suffixes) and mapped_name not in params_dict):
-                        if mapped_name in params_dict:
-                            param = params_dict[mapped_name]
-                            weight_loader = getattr(param, "weight_loader")
-                            _load_fused_qkv(param, loaded_weight, weight_loader)
-                            loaded_params.add(mapped_name)
-                            continue
-
                 handled = False
                 for fused_name, ckpt_name, shard_id in gdn_fused_proj_mapping:
                     if ckpt_name not in name:
@@ -1140,6 +1126,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
+    packed_modules_mapping = QWEN3_5_PACKED_MODULES_MAPPING
+
     def __init__(
         self,
         config: Qwen3_5Config,
@@ -1233,10 +1221,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
 
-    packed_modules_mapping = {
-        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        "gate_up_proj": ["gate_proj", "up_proj"]
-    }
+    packed_modules_mapping = QWEN3_5_PACKED_MODULES_MAPPING
     def __init__(
         self,
         config: Qwen3_5MoeConfig,
@@ -1327,14 +1312,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
         gdn_fused_proj_mapping = None
-        _load_fused_qkv = None
         if _use_fused_gdn_proj:
             from sglang.srt.models.qwen3_5_gdn_fused_proj import (
                 FUSED_PROJ_WEIGHT_MAPPING,
-                load_fused_qkv_weight,
             )
             gdn_fused_proj_mapping = FUSED_PROJ_WEIGHT_MAPPING
-            _load_fused_qkv = load_fused_qkv_weight
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -1347,16 +1329,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(".self_attn", "")
 
             if gdn_fused_proj_mapping is not None:
-                if ".linear_attn.in_proj_qkv." in name:
-                    mapped_name = name.replace("in_proj_qkv", "in_proj_fused")
-                    if not (mapped_name.endswith(ignore_suffixes) and mapped_name not in params_dict):
-                        if mapped_name in params_dict:
-                            param = params_dict[mapped_name]
-                            weight_loader = getattr(param, "weight_loader")
-                            _load_fused_qkv(param, loaded_weight, weight_loader)
-                            loaded_params.add(mapped_name)
-                            continue
-
                 handled = False
                 for fused_name, ckpt_name, shard_id in gdn_fused_proj_mapping:
                     if ckpt_name not in name:

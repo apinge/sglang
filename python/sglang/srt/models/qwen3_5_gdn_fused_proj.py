@@ -1,7 +1,7 @@
 """Fused GDN input projection for Qwen3.5.
 
 BF16: full fusion (qkv+z+b+a -> 1 GEMM).
-PTPC: partial fusion (qkv+z -> 1 FP8 GEMM, b+a -> 1 BF16 GEMM).
+FP8/PTPC: qkv+z -> 1 GEMM, b+a -> 1 GEMM.
 HIP/ROCm only.
 """
 
@@ -24,6 +24,10 @@ from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.parameter import (
+    BlockQuantScaleParameter,
+    PerTensorScaleParameter,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -32,28 +36,15 @@ from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
 from sglang.srt.utils import add_prefix, set_weight_attrs
 
 FUSED_PROJ_WEIGHT_MAPPING = [
-    ("in_proj_fused", "in_proj_z", 3),
-    ("in_proj_ba", "in_proj_b", 0),
-    ("in_proj_ba", "in_proj_a", 1),
-    ("in_proj_fused", "in_proj_b", 4),
-    ("in_proj_fused", "in_proj_a", 5),
+    ("in_proj_ba.", "in_proj_b.", 0),
+    ("in_proj_ba.", "in_proj_a.", 1),
+    ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
+    ("in_proj_qkvz.", "in_proj_z.", 3),
+    ("in_proj_fused.", "in_proj_qkv.", (0, 1, 2)),
+    ("in_proj_fused.", "in_proj_z.", 3),
+    ("in_proj_fused.", "in_proj_b.", 4),
+    ("in_proj_fused.", "in_proj_a.", 5),
 ]
-
-
-def load_fused_qkv_weight(param, loaded_weight, weight_loader):
-    """Split pre-merged in_proj_qkv into shards 0,1,2 of in_proj_fused."""
-    output_dim = getattr(param, "output_dim", None)
-    if output_dim is not None:
-        module = weight_loader.__self__
-        offset = 0
-        for shard_id in range(3):
-            size = module.output_sizes[shard_id]
-            shard_weight = loaded_weight.narrow(output_dim, offset, size)
-            weight_loader(param, shard_weight, shard_id)
-            offset += size
-    else:
-        for shard_id in range(3):
-            weight_loader(param, loaded_weight, shard_id)
 
 
 @triton.jit
@@ -262,13 +253,32 @@ class Qwen3_5GatedDeltaNetFusedProj(Qwen3_5GatedDeltaNet):
         self._partial_fuse = quant_config is not None
 
         if self._partial_fuse:
-            output_sizes = [self.key_dim, self.key_dim, self.value_dim, self.value_dim]
-            total_local = sum(s // self.attn_tp_size for s in output_sizes)
-            self._fused_pad_n = (
-                GEMM_N_ALIGN - total_local % GEMM_N_ALIGN
-            ) % GEMM_N_ALIGN
-            if self._fused_pad_n > 0:
-                output_sizes.append(self._fused_pad_n * self.attn_tp_size)
+            self.in_proj_qkvz = MergedColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_sizes=[
+                    self.key_dim,
+                    self.key_dim,
+                    self.value_dim,
+                    self.value_dim,
+                ],
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=add_prefix("in_proj_qkvz", prefix),
+            )
+            self._bind_packed_weight_loaders(self.in_proj_qkvz)
+
+            self.in_proj_ba = MergedColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_sizes=[self.num_v_heads, self.num_v_heads],
+                bias=False,
+                quant_config=quant_config,
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+                prefix=add_prefix("in_proj_ba", prefix),
+            )
+            self._bind_packed_weight_loaders(self.in_proj_ba)
         else:
             output_sizes = [
                 self.key_dim,
@@ -278,28 +288,17 @@ class Qwen3_5GatedDeltaNetFusedProj(Qwen3_5GatedDeltaNet):
                 self.num_v_heads,
                 self.num_v_heads,
             ]
-            self._fused_pad_n = 0
 
-        self.in_proj_fused = MergedColumnParallelLinear(
-            input_size=self.hidden_size,
-            output_sizes=output_sizes,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            prefix=add_prefix("in_proj_fused", prefix),
-        )
-
-        if self._partial_fuse:
-            self.in_proj_ba = MergedColumnParallelLinear(
+            self.in_proj_fused = MergedColumnParallelLinear(
                 input_size=self.hidden_size,
-                output_sizes=[self.num_v_heads, self.num_v_heads],
+                output_sizes=output_sizes,
                 bias=False,
-                quant_config=None,
+                quant_config=quant_config,
                 tp_rank=self.attn_tp_rank,
                 tp_size=self.attn_tp_size,
-                prefix=add_prefix("in_proj_ba", prefix),
+                prefix=add_prefix("in_proj_fused", prefix),
             )
+            self._bind_packed_weight_loaders(self.in_proj_fused)
 
         self.qkv_size_local = (
             self.key_dim // self.attn_tp_size * 2
@@ -371,6 +370,73 @@ class Qwen3_5GatedDeltaNetFusedProj(Qwen3_5GatedDeltaNet):
             prefix=add_prefix("out_proj", prefix),
         )
 
+    @staticmethod
+    def _override_weight_loader(param, loader):
+        if hasattr(param, "_weight_loader"):
+            param._weight_loader = loader
+            return
+        if hasattr(param, "weight_loader"):
+            param.weight_loader = loader
+            return
+        set_weight_attrs(param, {"weight_loader": loader})
+
+    def _bind_packed_weight_loaders(self, module):
+        for attr_name in ("weight", "weight_scale_inv", "weight_scale", "input_scale"):
+            param = getattr(module, attr_name, None)
+            if param is None:
+                continue
+            original_loader = getattr(param, "weight_loader", None)
+            if original_loader is None:
+                continue
+            wrapped_loader = self._make_packed_weight_loader(module, original_loader)
+            self._override_weight_loader(param, wrapped_loader)
+
+    @staticmethod
+    def _get_split_sizes_for_param(module, param, loaded_shard_id):
+        if isinstance(param, BlockQuantScaleParameter):
+            block_n, _ = module.quant_method.quant_config.weight_block_size
+            block_n = 1 if getattr(param, "format_ue8m0", False) else block_n
+            return [
+                (module.output_sizes[idx] + block_n - 1) // block_n
+                for idx in loaded_shard_id
+            ]
+
+        if isinstance(param, PerTensorScaleParameter):
+            return [1 for _ in loaded_shard_id]
+
+        return [module.output_sizes[idx] for idx in loaded_shard_id]
+
+    @classmethod
+    def _make_packed_weight_loader(cls, module, original_weight_loader):
+        def weight_loader(param, loaded_weight, loaded_shard_id=None):
+            if isinstance(loaded_shard_id, tuple):
+                split_sizes = cls._get_split_sizes_for_param(
+                    module, param, loaded_shard_id
+                )
+
+                if len(loaded_weight.shape) == 0:
+                    assert len(split_sizes) == 1 and split_sizes[0] == 1, (
+                        f"Unexpected scalar for tuple shard load: "
+                        f"{loaded_shard_id=}, {split_sizes=}"
+                    )
+                    chunks = [loaded_weight.reshape(1)]
+                else:
+                    split_dim = getattr(param, "output_dim", 0)
+                    chunks = loaded_weight.split(split_sizes, dim=split_dim)
+
+                assert len(chunks) == len(loaded_shard_id), (
+                    f"Chunk/shard mismatch: {len(chunks)=}, "
+                    f"{len(loaded_shard_id)=}, {split_sizes=}"
+                )
+
+                for idx, chunk in zip(loaded_shard_id, chunks):
+                    original_weight_loader(param, chunk, idx)
+                return
+
+            return original_weight_loader(param, loaded_weight, loaded_shard_id)
+
+        return weight_loader
+
     def _forward(
         self,
         hidden_states: torch.Tensor,
@@ -378,18 +444,18 @@ class Qwen3_5GatedDeltaNetFusedProj(Qwen3_5GatedDeltaNet):
     ):
         seq_len, _ = hidden_states.shape
 
-        fused_out, _ = self.in_proj_fused(hidden_states)
-
         if self._partial_fuse:
-            ba_out, _ = self.in_proj_ba(hidden_states)
+            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            projected_states_ba, _ = self.in_proj_ba(hidden_states)
             mixed_qkv, z, b, a = scatter_partial_fused(
-                fused_out,
-                ba_out,
+                projected_states_qkvz,
+                projected_states_ba,
                 self.qkv_size_local,
                 self.z_size_local,
                 self.b_size_local,
             )
         else:
+            fused_out, _ = self.in_proj_fused(hidden_states)
             if seq_len >= 4:
                 mixed_qkv, z, b, a = scatter_fused_proj(
                     fused_out,
