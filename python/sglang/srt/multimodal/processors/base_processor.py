@@ -25,6 +25,7 @@ from sglang.srt.utils import (
     is_xpu,
     load_audio,
     load_image_tensor,
+    batch_decode_jpeg_gpu,
     load_video,
     logger,
 )
@@ -411,6 +412,11 @@ class BaseMultimodalProcessor(ABC):
 
         If data is processor_output or precomputed embedding, return directly.
 
+        Static method that can be pickled for multiprocessing
+        For images:
+          - JPEG: returns (img_tensor_bytes, 'jpeg')
+          - Non-JPEG: returns (img_tensor, None)
+
         Static method that can be pickled for multiprocessing"""
         if isinstance(data, dict):
             data_format = data.get("format")
@@ -423,8 +429,10 @@ class BaseMultimodalProcessor(ABC):
                 return data
         try:
             if modality == Modality.IMAGE:
-                img_tensor, _ = load_image_tensor(data, discard_alpha_channel)
-                return img_tensor
+                # load_image_tensor automatically distinguishes between JPEG and non-JPEG
+                # JPEG returns: (img_tensor_bytes, 'jpeg')
+                # Non-JPEG returns: (img_tensor, None)
+                return load_image_tensor(data, discard_alpha_channel)
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
@@ -486,7 +494,10 @@ class BaseMultimodalProcessor(ABC):
         audio_sample_rate: Optional[int] = None,
     ) -> Tuple[List, List]:
         """
-        load multimodal data parallelly using iterators.
+        Load multimodal data parallelly using iterators.
+        For images, will return either:
+          - JPEG: (img_tensor_bytes, 'jpeg') for batch decoding
+          - Non-JPEG: (img_tensor, None) already decoded
         """
         futures = []
         task_info = []
@@ -733,6 +744,10 @@ class BaseMultimodalProcessor(ABC):
         videos: List[Any] = [None] * len(video_data) if video_data else []
         audios: List[Any] = [None] * len(audio_data) if audio_data else []
 
+        # Track JPEG images for batch decoding
+        jpeg_indices: List[int] = []  # indices into images list
+        jpeg_bytes_list: List[Any] = []  # preprocessed JPEG data
+
         for modality, idx, future in futures:
             try:
                 result = future.result()
@@ -747,15 +762,34 @@ class BaseMultimodalProcessor(ABC):
                 )
 
             if modality == Modality.IMAGE:
-                images[idx] = result
+                # Check if this is a JPEG tuple result for batch decoding
+                if isinstance(result, tuple) and len(result) == 2:
+                    img_data, format_type = result
+                    if format_type == "jpeg":
+                        # JPEG image - record position for batch decoding
+                        jpeg_indices.append(idx)
+                        jpeg_bytes_list.append(img_data)
+                        images[idx] = None  # Placeholder, will be replaced later
+                    else:
+                        # Non-JPEG image - already decoded, move to cuda directly
+                        images[idx] = img_data.to("cuda")
+                else:
+                    images[idx] = result
             elif modality == Modality.VIDEO:
                 videos[idx] = result
             elif modality == Modality.AUDIO:
                 audios[idx] = result
 
+        # Batch decode all JPEG images on GPU
+        if jpeg_bytes_list:
+            decoded_images = batch_decode_jpeg_gpu(jpeg_bytes_list, device="cuda:1")
+            for img_idx, decoded_img in zip(jpeg_indices, decoded_images):
+                images[img_idx] = decoded_img.to("cuda")
+
         logger.debug(
-            "[load_mm_data(simple)] loaded counts: images=%d, videos=%d, audios=%d",
+            "[load_mm_data(simple)] loaded counts: images=%d (jpeg_batch=%d), videos=%d, audios=%d",
             len(images),
+            len(jpeg_bytes_list),
             len(videos),
             len(audios),
         )
@@ -816,8 +850,46 @@ class BaseMultimodalProcessor(ABC):
             discard_alpha_channel=discard_alpha_channel,
             audio_sample_rate=audio_sample_rate,
         )
+        final_results = []
+        jpeg_indices = []  # Track which positions are JPEG images
+        jpeg_bytes_list = []  # Collect preprocessed JPEG data
+
+        for idx, (future, (modality, raw_data, frame_limit)) in enumerate(
+            zip(futures, task_info)
+        ):
+            result = future.result()
+
+            # Check if this is an image tuple result
+            if (
+                modality == Modality.IMAGE
+                and isinstance(result, tuple)
+                and len(result) == 2
+            ):
+                img_data, format_type = result
+
+                if format_type == "jpeg":
+                    # JPEG image - record position and preprocessed data
+                    jpeg_indices.append(idx)
+                    jpeg_bytes_list.append(img_data)
+                    final_results.append(None)  # Placeholder, will be replaced later
+                else:
+                    # Non-JPEG image - already decoded, move to cuda directly
+                    final_results.append(img_data.to("cuda"))
+            else:
+                # Non-image data or precomputed data
+                final_results.append(result)
+
+        # Batch decode all JPEG images
+        if jpeg_bytes_list:
+            decoded_images = batch_decode_jpeg_gpu(jpeg_bytes_list, device="cuda:1")
+
+            # Put decoded images back to their original positions
+            for img_idx, decoded_img in zip(jpeg_indices, decoded_images):
+                final_results[img_idx] = decoded_img.to("cuda")
+
+        # Create result iterators
         task_info_iter = iter(task_info)
-        futures_iter = iter(futures)
+        results_iter = iter(final_results)
 
         # Process results
         images, videos, audios = [], [], []
@@ -827,7 +899,9 @@ class BaseMultimodalProcessor(ABC):
             try:
                 if multimodal_tokens_pattern.match(text_part):
                     modality, raw_data, frame_limit = next(task_info_iter)
-                    result = next(futures_iter).result()
+                    result = next(
+                        results_iter
+                    )  # Get from results (already a complete tensor)
 
                     is_precomputed, new_imgs, new_vids, new_auds = (
                         self._process_loaded_mm_data(modality, raw_data, result)
