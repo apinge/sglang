@@ -24,8 +24,9 @@ from sglang.srt.layers.attention.fla.utils import (
 from sglang.srt.layers.attention.fla.wy_fast import recompute_w_u_fwd
 
 # when True, preprocessing uses the fused Triton kernel
-# Set this to False for debugging or performance tuning.
-USE_FUSION = True
+import os
+OPTFLAG = os.getenv("OPTFLAG","")
+USE_FUSION = True if "gdn_prefill_fusion" in OPTFLAG else False
 
 
 def chunk_gated_delta_rule_fwd(
