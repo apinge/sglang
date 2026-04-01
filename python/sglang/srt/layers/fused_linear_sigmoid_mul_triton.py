@@ -1,10 +1,3 @@
-# Copyright 2023-2024 SGLang Team
-# SPDX-License-Identifier: Apache-2.0
-"""Fused sigmoid(linear(x, W)) * y for shared expert gate: W is (1, H), no bias.
-
-Matches: F.sigmoid(F.linear(hidden, W)) * shared_output with W shape [1, hidden_size].
-"""
-
 from typing import Optional
 
 import torch
