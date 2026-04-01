@@ -79,6 +79,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_hip,
     make_layers,
     use_intel_amx_backend,
 )
@@ -86,8 +87,15 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
+
+fused_linear_sigmoid_mul_triton = None
+if _is_cuda or _is_hip:
+    from sglang.srt.layers.fused_linear_sigmoid_mul_triton import (
+        fused_linear_sigmoid_mul as fused_linear_sigmoid_mul_triton,
+    )
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -243,6 +251,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         self.shared_expert_gate.bias,
                         True,
                         shared_output,
+                    )
+                elif (
+                    fused_linear_sigmoid_mul_triton is not None
+                    and (hidden_states.is_cuda or hidden_states.device.type == "hip")
+                    and self.shared_expert_gate.bias is None
+                    and self.shared_expert_gate.weight.dim() == 2
+                    and self.shared_expert_gate.weight.shape[0] == 1
+                    and self.shared_expert_gate.weight.shape[1] == hidden_states.shape[1]
+                ):
+                    fused_linear_sigmoid_mul_triton(
+                        hidden_states,
+                        self.shared_expert_gate.weight,
+                        shared_output,
+                        out=shared_output,
                     )
                 else:
                     shared_output = (
