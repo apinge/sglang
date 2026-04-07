@@ -259,6 +259,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     and self.shared_expert_gate.weight.dim() == 2
                     and self.shared_expert_gate.weight.shape[0] == 1
                     and self.shared_expert_gate.weight.shape[1] == hidden_states.shape[1]
+                     # Triton fused kernel assumes row-major contiguous last dim; else torch path
+                    and hidden_states.is_contiguous()
+                    and shared_output.is_contiguous()
+                    and self.shared_expert_gate.weight.is_contiguous()
                 ):
                     fused_linear_sigmoid_mul_triton(
                         hidden_states,
