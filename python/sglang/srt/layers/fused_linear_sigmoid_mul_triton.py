@@ -61,10 +61,11 @@ def fused_linear_sigmoid_mul(
     assert hidden_states.dim() == 2 and weight.dim() == 2 and shared_output.dim() == 2
     n, h = shared_output.shape
     assert hidden_states.shape == (n, h)
-    assert weight.shape == (1, h), "shared expert gate weight must be (1, hidden_size), no bias"
+    assert weight.shape == (
+        1,
+        h,
+    ), "shared expert gate weight must be (1, hidden_size), no bias"
     assert weight.device == hidden_states.device == shared_output.device
-    _dev = hidden_states.device
-    assert _dev.type in ("cuda", "hip"), "fused_linear_sigmoid_mul expects CUDA or HIP device"
 
     if out is None:
         out = torch.empty_like(shared_output)
