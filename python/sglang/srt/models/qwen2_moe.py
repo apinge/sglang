@@ -270,7 +270,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     )
                 elif (
                     fused_linear_sigmoid_mul_triton is not None
-                    and (hidden_states.is_cuda or hidden_states.device.type == "hip")
+                    and hidden_states.is_cuda
                     and self.shared_expert_gate.bias is None
                     and self.shared_expert_gate.weight.dim() == 2
                     and self.shared_expert_gate.weight.shape[0] == 1
