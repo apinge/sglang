@@ -103,7 +103,6 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
 fused_linear_sigmoid_mul_triton = None
-# Only load Triton on CUDA/HIP hosts (see is_cuda_alike in utils); CPU skips import.
 if _is_cuda_alike:
     try:
         from sglang.srt.layers.fused_linear_sigmoid_mul_triton import (
