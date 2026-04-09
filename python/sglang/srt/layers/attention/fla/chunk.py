@@ -33,7 +33,7 @@ from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
 
-# When True, preprocessing uses the fused Triton kernel (see PR gdn-prefill / OPTFLAG).
+# When True, preprocessing uses the fused Triton kernel
 USE_GDN_PREFILL_FUSION = True
 
 
