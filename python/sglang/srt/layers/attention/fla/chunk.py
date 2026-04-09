@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.fla.chunk_scaled_dot_kkt import (
 from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
 from sglang.srt.layers.attention.fla.fused_cumsum_kkt import fused_cumsum_kkt
 from sglang.srt.layers.attention.fla.fused_merge_recompute import fused_merge_recompute
+from sglang.srt.layers.attention.fla.fused_preprocessing import fused_preprocessing_fwd
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.l2norm import fused_l2norm_qk, l2norm_fwd
 from sglang.srt.layers.attention.fla.solve_tril import (
@@ -32,6 +33,9 @@ from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
 
+# When True, preprocessing uses the fused Triton kernel (see PR gdn-prefill / OPTFLAG).
+USE_GDN_PREFILL_FUSION = True
+
 
 def chunk_gated_delta_rule_fwd(
     q: torch.Tensor,
@@ -47,7 +51,12 @@ def chunk_gated_delta_rule_fwd(
     B, T = q.shape[0], q.shape[1]
     Hv = g.shape[2]
 
-    if _is_hip and T >= 64:
+    if USE_GDN_PREFILL_FUSION:
+        g, w, u = fused_preprocessing_fwd(
+            k=k, v=v, beta=beta, g=g, cu_seqlens=cu_seqlens
+        )
+        A = None
+    else:
         g, A = fused_cumsum_kkt(g, k, beta, chunk_size=64, cu_seqlens=cu_seqlens)
         chunk_indices_16 = (
             prepare_chunk_indices(cu_seqlens, 16) if cu_seqlens is not None else None
