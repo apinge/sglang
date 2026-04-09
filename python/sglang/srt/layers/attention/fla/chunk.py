@@ -51,7 +51,7 @@ def chunk_gated_delta_rule_fwd(
     B, T = q.shape[0], q.shape[1]
     Hv = g.shape[2]
 
-    if USE_GDN_PREFILL_FUSION:
+    if USE_GDN_PREFILL_FUSION and T == 64:
         g, w, u = fused_preprocessing_fwd(
             k=k, v=v, beta=beta, g=g, cu_seqlens=cu_seqlens
         )
