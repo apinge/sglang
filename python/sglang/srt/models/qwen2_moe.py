@@ -96,6 +96,15 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter import silu_and_mul
 
+fused_linear_sigmoid_mul_triton = None
+if _is_hip:
+    try:
+        from sglang.srt.layers.fused_linear_sigmoid_mul_triton import (
+            fused_linear_sigmoid_mul as fused_linear_sigmoid_mul_triton,
+        )
+    except ImportError:
+        pass
+
 
 class Qwen2MoeMLP(nn.Module):
     def __init__(
@@ -261,6 +270,24 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         self.shared_expert_gate.bias,
                         True,
                         shared_output,
+                    )
+                elif (
+                    fused_linear_sigmoid_mul_triton is not None
+                    and hidden_states.is_cuda
+                    and self.shared_expert_gate.bias is None
+                    and self.shared_expert_gate.weight.dim() == 2
+                    and self.shared_expert_gate.weight.shape[0] == 1
+                    and self.shared_expert_gate.weight.shape[1]
+                    == hidden_states.shape[1]
+                    and hidden_states.is_contiguous()
+                    and shared_output.is_contiguous()
+                    and self.shared_expert_gate.weight.is_contiguous()
+                ):
+                    fused_linear_sigmoid_mul_triton(
+                        hidden_states,
+                        self.shared_expert_gate.weight,
+                        shared_output,
+                        out=shared_output,
                     )
                 else:
                     shared_output = (
