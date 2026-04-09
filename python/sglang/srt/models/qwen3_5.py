@@ -103,6 +103,15 @@ _is_amx_available = cpu_has_amx_support()
 if _is_hip:
     from sglang.srt.layers.elementwise import fused_sigmoid_mul, fused_sigmoid_mul_broadcast
 
+fused_linear_sigmoid_mul_triton = None
+if _is_hip:
+    try:
+        from sglang.srt.layers.fused_linear_sigmoid_mul_triton import (
+            fused_linear_sigmoid_mul as fused_linear_sigmoid_mul_triton,
+        )
+    except ImportError:
+        pass
+
 cached_get_processor = lru_cache(get_processor)
 
 QWEN3_5_PACKED_MODULES_MAPPING = {
@@ -120,7 +129,25 @@ class Qwen3_5SparseMoeBlock(Qwen2MoeSparseMoeBlock):
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None:
-                if _is_hip:
+                if (
+                    fused_linear_sigmoid_mul_triton is not None
+                    and hidden_states.is_cuda
+                    and self.shared_expert_gate.bias is None
+                    and self.shared_expert_gate.weight.dim() == 2
+                    and self.shared_expert_gate.weight.shape[0] == 1
+                    and self.shared_expert_gate.weight.shape[1]
+                    == hidden_states.shape[1]
+                    and hidden_states.is_contiguous()
+                    and shared_output.is_contiguous()
+                    and self.shared_expert_gate.weight.is_contiguous()
+                ):
+                    fused_linear_sigmoid_mul_triton(
+                        hidden_states,
+                        self.shared_expert_gate.weight,
+                        shared_output,
+                        out=shared_output,
+                    )
+                elif _is_hip:
                     gate_output = self.shared_expert_gate(hidden_states)
                     shared_output = fused_sigmoid_mul_broadcast(
                         gate_output, shared_output
