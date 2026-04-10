@@ -210,3 +210,21 @@ Vision model is evaluated on MMMU dataset. More information you can find in the 
     eval out saved to ./val_sglang.json
     Overall accuracy: 0.971
     ```
+
+## gsm8k Evaluation
+
+run the [run_lm_eval.sh](./run_lm_eval.sh)
+
+The result of TP4 on MI350 should be:
+```
+local-completions ({'base_url': 'http://localhost:9000/v1/completions', 'model': 'Qwen/Qwen3.5-397B-A17B', 'num_concurrent': 64, 'max_retries': 10, 'max_gen_toks': 2048}), gen_kwargs: ({}), limit: None, num_fewshot: 5, batch_size: auto
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9689|±  |0.0048|
+|     |       |strict-match    |     5|exact_match|↑  |0.9697|±  |0.0047|
+```
+
+# Additional Resources
+
+* [sglang: Qwen 3.5 Usage](https://github.com/sgl-project/sglang/blob/main/docs/basic_usage/qwen3_5.md)
+- [AMD Day 0 Support for Qwen 3.5 on AMD Instinct GPUs](https://www.amd.com/en/developer/resources/technical-articles/2026/day-0-support-for-qwen-3-5-on-amd-instinct-gpus.html)
