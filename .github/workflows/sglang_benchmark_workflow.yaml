@@ -1,0 +1,370 @@
+name: SGLang Qwen3.5 Workflow
+
+on:
+  pull_request:
+    branches:
+      - Qwen3.5_v0.5.9
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: "Which workload to run"
+        required: true
+        default: "accuracy"
+        type: choice
+        options:
+          - accuracy
+          - benchmark
+      benchmark_target:
+        description: "Which load tests to run when run_mode=benchmark"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - concurrency
+          - request_rate
+      model_list:
+        description: 'Model list to run on MI308 (JSON array format, default: ["offical_qwen3p5_397B_ptpc"])'
+        required: false
+        default: '["offical_qwen3p5_397B_ptpc"]'
+      image:
+        description: 'Image to use for the benchmark'
+        required: true
+        default: "rocm/ali-private:ubuntu22.04_rocm7.2.0.43_cp310_torch2.9.1_sglang_4d921e5_aiter_6fe675a_qwen3_5_20260327_v2"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ${{ github.event.inputs.image || 'rocm/ali-private:ubuntu22.04_rocm7.2.0.43_cp310_torch2.9.1_sglang_4d921e5_aiter_6fe675a_qwen3_5_20260327_v2' }}
+  MODEL_NAME: offical_qwen3p5_397B_ptpc
+  MODEL_PATH: /models/offical_qwen3p5_397B_ptpc
+  BENCHMARK_TARGET: ${{ github.event.inputs.benchmark_target || 'all' }}
+  SGLANG_BENCHMARK_PORT: "8080"
+  SGLANG_BENCHMARK_EXAMPLE_ROOT: /models/benchamark_example
+  SGLANG_BENCHMARK_RESULTS_DIR: benchmark_test_results
+  SGLANG_GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/zejunchen-zejun/sglang.git' }}
+  SGLANG_GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  qwen35:
+    runs-on: linux-sglang-mi308-8
+    timeout-minutes: 420
+    strategy:
+      fail-fast: false
+      matrix:
+        model: ${{ fromJson(github.event.inputs.model_list || '["offical_qwen3p5_397B_ptpc"]') }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Prepare SGLang image
+        run: |
+          set -euo pipefail
+
+          if docker image inspect "${{ env.IMAGE }}" >/dev/null 2>&1; then
+            echo "Using local image:"
+            docker image ls "${{ env.IMAGE }}"
+            exit 0
+          fi
+
+          echo "Local image not found, trying to pull: ${{ env.IMAGE }}"
+
+          if [ -n "${{ secrets.ALISHARED }}" ]; then
+            echo "${{ secrets.ALISHARED }}" | docker login -u alishared --password-stdin || true
+          fi
+
+          pulled=0
+          for i in {1..3}; do
+            if docker pull "${{ env.IMAGE }}"; then
+              pulled=1
+              break
+            fi
+
+            if [ "${i}" -lt 3 ]; then
+              echo "docker pull failed, retrying ($i/3)..."
+              sleep 5
+            fi
+          done
+
+          if [ "${pulled}" -ne 1 ]; then
+            echo "Failed to find local image and docker pull failed: ${{ env.IMAGE }}"
+            echo "Available local images:"
+            docker image ls --format '{{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.CreatedSince}}' | sort || true
+            exit 1
+          fi
+
+          echo "Pulled image:"
+          docker image ls "${{ env.IMAGE }}"
+
+      - name: Validate model path
+        run: |
+          set -euo pipefail
+
+          if [ "${{ matrix.model }}" != "${{ env.MODEL_NAME }}" ]; then
+            echo "Unknown model_name: ${{ matrix.model }}"
+            exit 1
+          fi
+
+          if [ ! -d "${{ env.MODEL_PATH }}" ]; then
+            echo "Expected model directory not found: ${{ env.MODEL_PATH }}"
+            ls -lah /models
+            exit 1
+          fi
+
+          ls -lah /models
+          du -sh "${{ env.MODEL_PATH }}"
+
+      - name: Validate benchmark scripts
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.run_mode == 'benchmark') }}
+        run: |
+          set -euo pipefail
+
+          case "${{ env.BENCHMARK_TARGET }}" in
+            all)
+              targets=(concurrency request_rate)
+              ;;
+            concurrency|request_rate)
+              targets=("${{ env.BENCHMARK_TARGET }}")
+              ;;
+            *)
+              echo "Unknown benchmark_target: ${{ env.BENCHMARK_TARGET }}"
+              exit 1
+              ;;
+          esac
+
+          for target in "${targets[@]}"; do
+            script_path="${{ env.SGLANG_BENCHMARK_EXAMPLE_ROOT }}/${target}/run.sh"
+            if [ ! -f "${script_path}" ]; then
+              echo "Expected benchmark script not found: ${script_path}"
+              exit 1
+            fi
+          done
+
+          ls -lah "${{ env.SGLANG_BENCHMARK_EXAMPLE_ROOT }}"
+
+      - name: Generate Dockerfile
+        run: |
+          cat <<'EOF' > Dockerfile.mod
+          FROM ${{ env.IMAGE }}
+          ENV GPU_ARCHS="gfx942"
+          ENV PYTORCH_ROCM_ARCH="gfx942"
+
+          RUN echo "=== Aiter version in base image ===" && pip show amd-aiter || true
+          RUN rm -rf /opt/aiter/aiter/jit/build
+          RUN rm -rf /opt/aiter/aiter/jit/*.so
+          RUN rm -rf ~/.aiter
+
+          RUN echo "=== sgl-kernel version before installation ===" && pip show sgl-kernel || true
+          RUN echo "=== sglang version before installation ===" && pip show sglang || true
+          RUN pip uninstall -y sgl-kernel sglang || true
+          RUN pip install "pybind11>=3.0.1" "transformers>=4.57.0" "oss2"
+          RUN git clone ${{ env.SGLANG_GITHUB_REPO_URL }} /sglang-checkout && \
+              cd /sglang-checkout && \
+              git checkout ${{ env.SGLANG_GITHUB_COMMIT_SHA }} && \
+              git rev-parse HEAD && \
+              pip install --upgrade pip && \
+              cd sgl-kernel && \
+              python3 setup_rocm.py install && \
+              cd .. && \
+              rm -rf python/pyproject.toml && \
+              mv python/pyproject_other.toml python/pyproject.toml && \
+              pip install -e "python[all_hip]"
+
+          RUN echo "=== sgl-kernel version after installation ===" && pip show sgl-kernel || true
+          RUN echo "=== sglang version after installation ===" && pip show sglang || true
+          EOF
+
+      - name: Show Dockerfile
+        run: |
+          cat Dockerfile.mod
+
+      - name: Build Docker image
+        run: |
+          docker build --pull=false --no-cache --network=host -t "sglang_test:ci" -f Dockerfile.mod .
+
+      - name: Start CI container
+        run: |
+          echo "Clean up containers..."
+          docker ps -aq -f name=sglang_test | xargs -r docker stop | xargs -r docker rm
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          echo "Starting container: sglang_test:ci"
+          docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
+            --ulimit nofile=65536:65536 \
+            --ipc=host --group-add video \
+            --shm-size 32g \
+            --network=host \
+            --privileged \
+            --cap-add=SYS_PTRACE \
+            -e SGLANG_VLM_CACHE_SIZE_MB=0 \
+            -e SGLANG_BENCHMARK_PORT=${{ env.SGLANG_BENCHMARK_PORT }} \
+            -e SGLANG_BENCHMARK_EXAMPLE_ROOT=${{ env.SGLANG_BENCHMARK_EXAMPLE_ROOT }} \
+            -e SGLANG_BENCHMARK_RESULTS_DIR=${{ env.SGLANG_BENCHMARK_RESULTS_DIR }} \
+            -v /models:/models:ro \
+            --security-opt seccomp=unconfined \
+            -w /sglang-checkout \
+            --name sglang_test \
+            sglang_test:ci
+
+      - name: Show installed versions
+        run: |
+          docker exec sglang_test bash -lc "pip show oss2 || true"
+          docker exec sglang_test bash -lc "pip show amd-aiter || true"
+          docker exec sglang_test bash -lc "pip show sgl-kernel || true"
+          docker exec sglang_test bash -lc "pip show sglang || true"
+
+      - name: Show model and shared memory status
+        run: |
+          docker exec sglang_test bash -lc "df -h /dev/shm"
+          docker exec sglang_test bash -lc "ls -lah /models"
+          docker exec sglang_test bash -lc "du -sh ${{ env.MODEL_PATH }}"
+
+      - name: Launch the server
+        timeout-minutes: 60
+        run: |
+          set -ex
+          model_name=${{ matrix.model }}
+          if [ "$model_name" == "${{ env.MODEL_NAME }}" ]; then
+            docker exec sglang_test bash -lc "bash scripts/ci/sglang_benchmark_workflow.sh launch ${model_name} ${{ env.MODEL_PATH }} 8 1 45"
+          else
+            echo "Unknown model_name: ${model_name}"
+            exit 1
+          fi
+
+      - name: Run GSM8K accuracy evaluation
+        if: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.run_mode == 'accuracy') }}
+        timeout-minutes: 45
+        run: |
+          set -ex
+          model_name=${{ matrix.model }}
+          if [ "$model_name" == "${{ env.MODEL_NAME }}" ]; then
+            docker exec sglang_test bash -lc "bash scripts/ci/sglang_benchmark_workflow.sh evaluation ${model_name} ${{ env.MODEL_PATH }} 8 1"
+          else
+            echo "Unknown model_name: ${model_name}"
+            exit 1
+          fi
+
+      - name: Collect GSM8K accuracy summary
+        if: ${{ success() && (github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && github.event.inputs.run_mode == 'accuracy')) }}
+        run: |
+          rm -rf accuracy_test_results
+          docker cp sglang_test:/sglang-checkout/accuracy_test_results ./accuracy_test_results
+          python3 <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          result_files = sorted(
+              pathlib.Path("accuracy_test_results").glob("*_gsm8k_results.json"),
+              key=lambda p: p.stat().st_mtime,
+              reverse=True,
+          )
+          if not result_files:
+              print("ERROR: No GSM8K results JSON file found in accuracy_test_results/", file=sys.stderr)
+              raise SystemExit(2)
+
+          result_file = result_files[0]
+          data = json.loads(result_file.read_text())
+          score = data["results"]["gsm8k"]["exact_match,flexible-extract"]
+
+          print(f"RESULT_FILE: {result_file}")
+          print(f"GSM8K flexible extract score: {score}")
+
+          summary_path = pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary_path.open("a", encoding="utf-8") as f:
+              f.write("### GSM8K Accuracy Summary\n")
+              f.write(f"- Result file: `{result_file}`\n")
+              f.write(f"- Score: `{score:.4f}`\n")
+          PY
+
+      - name: Run selected load tests
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.run_mode == 'benchmark') }}
+        timeout-minutes: 300
+        run: |
+          set -ex
+          model_name=${{ matrix.model }}
+          if [ "$model_name" == "${{ env.MODEL_NAME }}" ]; then
+            case "${{ env.BENCHMARK_TARGET }}" in
+              all)
+                docker exec sglang_test bash -lc "bash scripts/ci/sglang_benchmark_workflow.sh concurrency ${model_name} ${{ env.MODEL_PATH }} 8 1 45"
+                docker exec sglang_test bash -lc "bash scripts/ci/sglang_benchmark_workflow.sh request_rate ${model_name} ${{ env.MODEL_PATH }} 8 1 45"
+                ;;
+              concurrency|request_rate)
+                docker exec sglang_test bash -lc "bash scripts/ci/sglang_benchmark_workflow.sh ${{ env.BENCHMARK_TARGET }} ${model_name} ${{ env.MODEL_PATH }} 8 1 45"
+                ;;
+              *)
+                echo "Unknown benchmark_target: ${{ env.BENCHMARK_TARGET }}"
+                exit 1
+                ;;
+            esac
+          else
+            echo "Unknown model_name: ${model_name}"
+            exit 1
+          fi
+
+      - name: Collect benchmark summary
+        if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.run_mode == 'benchmark')) }}
+        run: |
+          python3 <<'PY'
+          import os
+          import pathlib
+          import shutil
+          import subprocess
+
+          results_dir = pathlib.Path(os.environ["SGLANG_BENCHMARK_RESULTS_DIR"])
+          if results_dir.exists():
+              shutil.rmtree(results_dir)
+
+          subprocess.run(
+              [
+                  "docker",
+                  "cp",
+                  f"sglang_test:/sglang-checkout/{results_dir}",
+                  str(results_dir),
+              ],
+              check=False,
+          )
+
+          if not results_dir.exists():
+              print(f"No benchmark results copied from container: {results_dir}")
+              raise SystemExit(0)
+
+          log_files = sorted(results_dir.glob("*.log"))
+          if not log_files:
+              print(f"No benchmark logs found in {results_dir}")
+              raise SystemExit(0)
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if not summary_path:
+              for log_file in log_files:
+                  print(f"Collected benchmark log: {log_file}")
+              raise SystemExit(0)
+
+          with open(summary_path, "a", encoding="utf-8") as f:
+              f.write("### Qwen3.5 Load Test Summary\n")
+              f.write(f"- Target: `{os.environ['BENCHMARK_TARGET']}`\n")
+              for log_file in log_files:
+                  f.write(f"- Log: `{log_file}`\n")
+                  f.write("```text\n")
+                  tail_lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()[-20:]
+                  if tail_lines:
+                      f.write("\n".join(tail_lines))
+                      f.write("\n")
+                  f.write("```\n")
+          PY
+
+      - name: Clean up
+        if: always()
+        run: |
+          docker rm -f sglang_test || true
