@@ -217,7 +217,7 @@ if [[ "${TYPE}" == "launch" ]]; then
     --port "${PORT}" \
     --model-path "${model}" \
     --tp-size "${TP}" \
-    --attention-backend triton \
+    --attention-backend aiter \
     --reasoning-parser qwen3 \
     --tool-call-parser qwen3_coder \
     --enable-multimodal \
