@@ -187,6 +187,74 @@ prepare_external_benchmark_environment() {
   done
 }
 
+rewrite_external_benchmark_runtime_config() {
+  local benchmark_type=${1}
+  local work_dir=${2}
+
+  python3 - "${benchmark_type}" "${work_dir}" "${PORT}" <<'PY'
+from pathlib import Path
+import sys
+
+benchmark_type = sys.argv[1]
+work_dir = Path(sys.argv[2])
+port = sys.argv[3]
+
+if benchmark_type != "request_rate" or port == "8080":
+    raise SystemExit(0)
+
+patterns = [
+    ("--host 127.0.0.1 --port 8080", f"--host 127.0.0.1 --port {port}"),
+    ("http://127.0.0.1:8080", f"http://127.0.0.1:{port}"),
+    ("https://127.0.0.1:8080", f"https://127.0.0.1:{port}"),
+    ("127.0.0.1:8080", f"127.0.0.1:{port}"),
+    ("localhost:8080", f"localhost:{port}"),
+    ("--port 8080", f"--port {port}"),
+    ("port=8080", f"port={port}"),
+    ("port = 8080", f"port = {port}"),
+    ('"port": 8080', f'"port": {port}'),
+]
+
+modified_files = []
+candidate_suffixes = {
+    ".py",
+    ".sh",
+    ".yaml",
+    ".yml",
+    ".json",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".txt",
+}
+
+for path in work_dir.rglob("*"):
+    if not path.is_file():
+        continue
+    if path.suffix and path.suffix not in candidate_suffixes:
+        continue
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        continue
+
+    new_text = text
+    for old, new in patterns:
+        new_text = new_text.replace(old, new)
+
+    if new_text != text:
+        path.write_text(new_text, encoding="utf-8")
+        modified_files.append(str(path.relative_to(work_dir)))
+
+print(
+    f"Rewrote request_rate benchmark runtime config to use port {port} "
+    f"in {len(modified_files)} file(s)."
+)
+for file_name in modified_files:
+    print(f"  - {file_name}")
+PY
+}
+
 verify_external_benchmark_log() {
   local log_path=${1}
   python3 - "${log_path}" <<'PY'
@@ -233,6 +301,7 @@ run_external_benchmark() {
   cp -a "${source_dir}/." "${work_dir}/"
   chmod -R u+w "${work_dir}"
   prepare_external_benchmark_environment
+  rewrite_external_benchmark_runtime_config "${benchmark_type}" "${work_dir}"
 
   (
     cd "${work_dir}"
