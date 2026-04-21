@@ -5,7 +5,8 @@ on:
     branches:
       - Qwen3.5_v0.5.9
   schedule:
-    - cron: "0 2 * * *"
+    # Daily at 22:00 Beijing time (14:00 UTC)
+    - cron: "0 14 * * *"
   workflow_dispatch:
     inputs:
       run_mode:
