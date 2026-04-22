@@ -91,7 +91,8 @@ from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
-from torchvision.io import decode_jpeg
+from torchvision.io import ImageReadMode, decode_image, decode_jpeg, read_image
+from torchvision.transforms.v2 import functional as F
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -1678,6 +1679,215 @@ def load_image(
     else:
         raise ValueError(f"Invalid image: {image_file}")
     return image, image_size
+
+
+def _is_jpeg(data):
+    """
+    Detect if data is in JPEG format.
+
+    Args:
+        data: bytes or torch.Tensor
+
+    Returns:
+        bool: Whether the data is in JPEG format.
+    """
+    if isinstance(data, torch.Tensor):
+        if len(data) < 3:
+            return False
+        return data[0] == 0xFF and data[1] == 0xD8 and data[2] == 0xFF
+    elif isinstance(data, (bytes, bytearray)):
+        if len(data) < 3:
+            return False
+        return data[0] == 0xFF and data[1] == 0xD8 and data[2] == 0xFF
+    return False
+
+
+def decode_single_image_opencl(tensor_bytes):
+    import cv2
+
+    np_arr = tensor_bytes.numpy()
+    bgr_numpy = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    rgb_numpy = cv2.cvtColor(bgr_numpy, cv2.COLOR_BGR2RGB)
+    rgb_tensor = torch.from_numpy(rgb_numpy).permute(2, 0, 1)
+    return rgb_tensor
+
+
+def batch_decode_jpeg_gpu(img_tensor_bytes_list: list, device="cuda:1"):
+    """
+    Batch decode multiple JPEG images.
+
+    Args:
+        img_tensor_bytes_list: List of encoded JPEG byte data.
+        device: Target GPU device.
+
+    Returns:
+        List of decoded image tensors.
+    """
+    if not img_tensor_bytes_list:
+        return []
+
+    start = time.time()
+    try:
+        decoded_images = decode_jpeg(
+            img_tensor_bytes_list, mode=ImageReadMode.RGB, device=device
+        )
+        total = (time.time() - start) * 1000
+        logger.info(
+            "rocjpeg decode %d images in %.2f ms, avg: %.2f ms",
+            len(img_tensor_bytes_list),
+            total,
+            total / len(img_tensor_bytes_list),
+        )
+        return decoded_images
+    except Exception:
+        import cv2
+        from concurrent.futures import ThreadPoolExecutor
+
+        cv2.ocl.setUseOpenCL(True)
+        if not cv2.ocl.haveOpenCL():
+            logger.warning("OpenCL is not available, try opencv cpu for image decode")
+            return
+        logger.info("Use_opencv_ocl %s", cv2.ocl.useOpenCL())
+        results = [None] * len(img_tensor_bytes_list)
+        with ThreadPoolExecutor(max_workers=len(img_tensor_bytes_list)) as executor:
+            future_to_index = {
+                executor.submit(decode_single_image_opencl, img_bytes): idx
+                for idx, img_bytes in enumerate(img_tensor_bytes_list)
+            }
+            for future in future_to_index:
+                index = future_to_index[future]
+                try:
+                    result = future.result()
+                    results[index] = result
+                except Exception as e:
+                    logger.error("Image at index %d failed to decode: %s", index, e)
+                    results[index] = None
+
+        total = (time.time() - start) * 1000
+        logger.warning(
+            "opencv-ocl decode %d images in %.2f ms, avg: %.2f ms",
+            len(img_tensor_bytes_list),
+            total,
+            total / len(img_tensor_bytes_list),
+        )
+        return results
+
+
+def load_image_tensor(
+    image_file: Union[Image.Image, str, ImageData, bytes],
+    discard_alpha_channel: bool = True,
+) -> tuple[Image.Image, tuple[int, int]]:
+    """
+    Load image, return preprocessed result for JPEG format.
+
+    For JPEG, return encoded bytes for batch decoding. For non-JPEG, decode
+    directly and return the image tensor.
+    """
+
+    if isinstance(image_file, ImageData):
+        image_file = image_file.url
+
+    image = image_size = None
+
+    if isinstance(image_file, Image.Image):
+        image = image_file
+        image_size = (image.width, image.height)
+        img_tensor = F.pil_to_tensor(image)
+        return img_tensor, None
+
+    elif isinstance(image_file, bytes):
+        img_tensor_bytes = torch.frombuffer(bytearray(image_file), dtype=torch.uint8)
+
+        if _is_jpeg(img_tensor_bytes):
+            return img_tensor_bytes, "jpeg"
+        else:
+            try:
+                img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
+            except Exception:
+                image = Image.open(BytesIO(image_file))
+                if discard_alpha_channel and image.mode != "RGB":
+                    image = image.convert("RGB")
+                img_tensor = F.pil_to_tensor(image)
+            return img_tensor, None
+
+    elif image_file.startswith("http://") or image_file.startswith("https://"):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+        response = requests.get(image_file, stream=True, timeout=timeout)
+        try:
+            response.raise_for_status()
+            img_bytes = response.content
+            img_tensor_bytes = torch.frombuffer(bytearray(img_bytes), dtype=torch.uint8)
+
+            if _is_jpeg(img_tensor_bytes):
+                return img_tensor_bytes, "jpeg"
+            else:
+                try:
+                    img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
+                except Exception:
+                    image = Image.open(BytesIO(img_bytes))
+                    if discard_alpha_channel and image.mode != "RGB":
+                        image = image.convert("RGB")
+                    img_tensor = F.pil_to_tensor(image)
+                return img_tensor, None
+        finally:
+            response.close()
+
+    elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
+        is_jpeg = image_file.lower().endswith(("jpg", "jpeg"))
+
+        if is_jpeg:
+            from torchvision.io import read_file
+
+            img_tensor_bytes = read_file(image_file)
+            return img_tensor_bytes, "jpeg"
+        else:
+            try:
+                img_tensor = read_image(image_file, mode=ImageReadMode.RGB)
+            except Exception:
+                image = Image.open(image_file)
+                if discard_alpha_channel and image.mode != "RGB":
+                    image = image.convert("RGB")
+                img_tensor = F.pil_to_tensor(image)
+            return img_tensor, None
+
+    elif image_file.startswith("data:"):
+        mime_type = image_file.split(";")[0].split(":")[1]
+        is_jpeg = "jpeg" in mime_type.lower() or "jpg" in mime_type.lower()
+
+        base64_str = image_file.split(",")[1]
+        img_bytes = pybase64.b64decode(base64_str, validate=True)
+        img_tensor_bytes = torch.frombuffer(bytearray(img_bytes), dtype=torch.uint8)
+
+        if is_jpeg:
+            return img_tensor_bytes, "jpeg"
+        else:
+            try:
+                img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
+            except Exception:
+                image = Image.open(BytesIO(img_bytes))
+                if discard_alpha_channel and image.mode != "RGB":
+                    image = image.convert("RGB")
+                img_tensor = F.pil_to_tensor(image)
+
+            return img_tensor, None
+
+    elif isinstance(image_file, str):
+        img_bytes = pybase64.b64decode(image_file, validate=True)
+        img_tensor_bytes = torch.frombuffer(bytearray(img_bytes), dtype=torch.uint8)
+
+        if _is_jpeg(img_tensor_bytes):
+            return img_tensor_bytes, "jpeg"
+        else:
+            try:
+                img_tensor = decode_image(img_tensor_bytes, mode=ImageReadMode.RGB)
+            except Exception:
+                image = Image.open(BytesIO(img_bytes))
+                if discard_alpha_channel and image.mode != "RGB":
+                    image = image.convert("RGB")
+                img_tensor = F.pil_to_tensor(image)
+            return img_tensor, None
+    else:
+        raise ValueError(f"Invalid image: {image_file}")
 
 
 def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
