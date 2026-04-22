@@ -951,6 +951,14 @@ def _is_jpeg(data):
         return data[0] == 0xFF and data[1] == 0xD8 and data[2] == 0xFF
     return False
 
+def decode_single_image_opencl(tensor_bytes):
+    import cv2
+    np_arr = tensor_bytes.numpy()
+    bgr_numpy = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    rgb_numpy = cv2.cvtColor(bgr_numpy, cv2.COLOR_BGR2RGB) #BGR -> RGB
+    rgb_tensor = torch.from_numpy(rgb_numpy).permute(2, 0, 1) #H,W,C -> C,H,W 
+    return rgb_tensor
+
 
 def batch_decode_jpeg_gpu(img_tensor_bytes_list: list, device="cuda:1"):
     """
@@ -965,15 +973,50 @@ def batch_decode_jpeg_gpu(img_tensor_bytes_list: list, device="cuda:1"):
     """
     if not img_tensor_bytes_list:
         return []
+    import logging
+    logger = logging.getLogger(__name__)
+    import time
+    start = time.time()
+    try:
+        from torchvision.io import decode_jpeg
 
-    from torchvision.io import decode_jpeg
-
-    # Batch decode
-    decoded_images = decode_jpeg(
-        img_tensor_bytes_list, mode=ImageReadMode.RGB, device=device
-    )
-
-    return decoded_images
+        # Batch decode
+        decoded_images = decode_jpeg(
+            img_tensor_bytes_list, mode=ImageReadMode.RGB, device=device
+        )
+        end = time.time()
+        total = (end-start)*1000
+        logger.info(f"rocjpeg decode {len(img_tensor_bytes_list)} images in {total}ms, avg:{total/len(img_tensor_bytes_list)} ms")
+        return decoded_images
+    except Exception as e:
+        import cv2
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        cv2.ocl.setUseOpenCL(True)
+        if not cv2.ocl.haveOpenCL():
+            logger.warning("OpenCL is not available, try opencv cpu for image decode")
+            return
+        logger.info(f"Use_opencv_ocl {cv2.ocl.useOpenCL()}")
+        results = [None] * len(img_tensor_bytes_list)
+        with ThreadPoolExecutor(max_workers=len(img_tensor_bytes_list)) as executor:
+            future_to_index = {
+                executor.submit(decode_single_image_opencl, img_bytes): idx
+                for idx, img_bytes in enumerate(img_tensor_bytes_list)
+            }
+            for future in future_to_index:
+                index = future_to_index[future]
+                try:
+                    result = future.result()
+                    results[index] = result
+                except Exception as e:
+                    #skip the decode failed image, make sure other images in batch can be processed.
+                    logger.error(f"Image at index {index} failed to decode: {e}")
+                    results[index] = None
+            
+        end = time.time()
+        total = (end-start)*1000
+        logger.warning(f"opencv-ocl decode {len(img_tensor_bytes_list)} images in {total}ms, avg:{total/len(img_tensor_bytes_list)} ms")
+        return results
 
 
 def load_image_tensor(
