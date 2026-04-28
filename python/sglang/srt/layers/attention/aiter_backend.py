@@ -5,7 +5,6 @@ end to end attention solution with aiter kernels
 """
 
 import logging
-import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional
@@ -93,6 +92,7 @@ class ForwardMetadata:
     run_graph: Optional[bool] = True
 
 
+global_workspace_buffer = None
 
 _AITER_PARTITION_SIZE_ROCM = 256 # 256 512 1024 for paged_attention_ragged_nhd
 
