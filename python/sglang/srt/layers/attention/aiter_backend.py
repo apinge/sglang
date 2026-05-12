@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
+import triton.language as tl
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
 
 try:
     from aiter import (
+        dtypes,
         flash_attn_varlen_func,
         get_mla_metadata_info_v1,
         get_mla_metadata_v1,
@@ -51,6 +53,13 @@ from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
+def _pa_decode_gluon_available() -> bool:
+    try:
+        aiter_ops = getattr(torch.ops, "aiter", None)
+        return aiter_ops is not None and hasattr(aiter_ops, "pa_decode_gluon")
+    except Exception:
+        return False
+
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
 
@@ -66,6 +75,107 @@ _use_fp8_prefill_attn = (
 # fake non-ps, intra_batch_mode needs to be True for non-ps-mode
 fast_mode = False
 intra_batch_mode = True if _use_mla_ps_kernel else False
+
+
+@triton.jit
+def reshape_and_cache_shuffle_kernel(
+    key_ptr,
+    value_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    slot_mapping_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
+    x,
+    k_stride0,
+    v_stride0,
+    block_size,
+    head_size,
+    num_kv_heads,
+    BLOCK_SIZE: tl.constexpr,
+    QUANT: tl.constexpr,
+):
+    tid = tl.program_id(0)
+    head_id = tl.program_id(1)
+    offset = tl.arange(0, BLOCK_SIZE)
+    src_offset_k = tid * k_stride0 + head_id * head_size
+    src_offset_v = tid * v_stride0 + head_id * head_size
+    slot_id = tl.load(slot_mapping_ptr + tid)
+    if slot_id < 0:
+        return
+    block_id = slot_id // block_size
+    block_offset = slot_id % block_size
+    dst_offset = (
+        block_id * num_kv_heads * head_size * block_size
+        + head_id * head_size * block_size
+    )
+    dst_k_shuffle_offset = (
+        dst_offset + offset // x * block_size * x + block_offset * x + offset % x
+    )
+    dst_v_shuffle_offset = (
+        dst_offset + block_offset // x * head_size * x + offset * x + block_offset % x
+    )
+    k_val = tl.load(key_ptr + src_offset_k + offset)
+    v_val = tl.load(value_ptr + src_offset_v + offset)
+    if QUANT:
+        k_scale = tl.load(k_scale_ptr)
+        v_scale = tl.load(v_scale_ptr)
+        k_dtype = key_cache_ptr.type.element_ty
+        v_dtype = value_cache_ptr.type.element_ty
+        k_val = (k_val.to(tl.float32) / k_scale).to(k_dtype)
+        v_val = (v_val.to(tl.float32) / v_scale).to(v_dtype)
+    tl.store(key_cache_ptr + dst_k_shuffle_offset, k_val)
+    tl.store(value_cache_ptr + dst_v_shuffle_offset, v_val)
+
+
+def reshape_and_cache_shuffle_triton(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str,
+    k_scales: torch.Tensor,
+    v_scales: torch.Tensor,
+):
+    num_tokens = slot_mapping.shape[0]
+    _, num_kv_heads, head_size = key.shape
+    num_blocks, block_size, _, _ = key_cache.shape
+    x = 16 // key_cache.element_size()
+    k_cache_template = torch.empty(
+        [num_blocks, num_kv_heads, head_size // x, block_size, x],
+        dtype=key_cache.dtype,
+        device="meta",
+    )
+    v_cache_template = torch.empty(
+        [num_blocks, num_kv_heads, block_size // x, head_size, x],
+        dtype=value_cache.dtype,
+        device="meta",
+    )
+    new_key_cache = key_cache.view_as(k_cache_template)
+    new_value_cache = value_cache.view_as(v_cache_template)
+    QUANT = kv_cache_dtype.startswith("fp8")
+    grid = (
+        num_tokens,
+        num_kv_heads,
+    )
+    reshape_and_cache_shuffle_kernel[grid](
+        key,
+        value,
+        new_key_cache,
+        new_value_cache,
+        slot_mapping,
+        k_scales,
+        v_scales,
+        x,
+        key.stride(0),
+        value.stride(0),
+        block_size,
+        head_size,
+        num_kv_heads,
+        BLOCK_SIZE=head_size,
+        QUANT=QUANT,
+    )
 
 
 class WrapperDispatch(Enum):
@@ -92,6 +202,9 @@ class ForwardMetadata:
     custom_mask: Optional[torch.Tensor] = None
     mask_indptr: Optional[torch.Tensor] = None
     max_extend_len: Optional[int] = None
+    # Non-MLA page_size>1  + pa_decode_gluon: physical block table per seq
+    page_table: Optional[torch.Tensor] = None
+    kv_lens: Optional[torch.Tensor] = None
 
 
 global_workspace_buffer = None
@@ -198,6 +311,57 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.uint8,
                 device=self.device,
             )
+        ## pa_decode_gluon: physical block table per seq
+        self.decode_using_pa_gluon = False
+        if (
+            not self.use_mla
+            and (self.page_size%64==0 or 64%self.page_size==0)
+            and _pa_decode_gluon_available()
+            and get_bool_env_var("SGLANG_AITER_GLUON_PS", "False")
+        ):
+            self.decode_using_pa_gluon = True
+            self.seq_lens_for_page_table = torch.zeros(
+                (max_bs,), dtype=torch.int32, device=model_runner.device
+            )
+            self.page_table = torch.zeros(
+                (max_bs, self.max_context_len // self.page_size),
+                dtype=torch.int32,
+                device=model_runner.device,
+            )
+            self.strided_indices = torch.arange(
+                0, self.max_context_len, self.page_size, device=model_runner.device
+            )
+            # Workspace for torch.ops.aiter.pa_decode_gluon (see op_tests/triton_tests/test_pa_decode_gluon.py)
+            self.gluon_context_partition_size = 256
+            query_group_size = max(1, self.num_head // self.num_kv_head)
+            props = torch.cuda.get_device_properties(self.device)
+            num_sm = props.multi_processor_count * 2  # match aiter get_recommended_splits occupancy
+            max_part_ps = min(
+                16,
+                triton.cdiv(num_sm, max(1, self.num_kv_head)),
+            )
+            max_part_linear = triton.cdiv(
+                self.max_context_len, self.gluon_context_partition_size
+            )
+            self.gluon_max_context_partition_num = max(max_part_ps, max_part_linear)
+            gshape = (
+                max_bs,
+                self.num_kv_head,
+                self.gluon_max_context_partition_num,
+                query_group_size,
+            )
+            self.gluon_exp_sums = torch.empty(
+                *gshape, dtype=torch.float32, device=self.device
+            )
+            self.gluon_max_logits = torch.empty(
+                *gshape, dtype=torch.float32, device=self.device
+            )
+            self.gluon_temporary_output = torch.empty(
+                *gshape,
+                self.head_dim,
+                dtype=self.input_dtype,
+                device=self.device,
+            )
 
         self.scale = float(1.0 / (self.head_dim**0.5))
         self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(
@@ -297,7 +461,40 @@ class AiterAttnBackend(AttentionBackend):
             reduce_final_map,
             reduce_partial_map,
         )
-
+    def set_kv_buffer_with_layout_shuffle(
+        self,
+        cache_loc,
+        k,
+        v,
+        k_buffer,
+        v_buffer,
+        k_scale,
+        v_scale,
+        block_size,
+    ):
+        num_slots, num_kv_heads, head_dim = k_buffer.shape
+        num_blocks = num_slots // block_size
+        num_slots_with_block = num_blocks * block_size
+        k_buffer = k_buffer[:num_slots_with_block].view(
+            num_blocks, block_size, num_kv_heads, head_dim
+        )
+        v_buffer = v_buffer[:num_slots_with_block].view(
+            num_blocks, block_size, num_kv_heads, head_dim
+        )
+        kv_cache_dtype = "auto"
+        if k_buffer.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            kv_cache_dtype = "fp8"
+        reshape_and_cache_shuffle_triton(
+            k,
+            v,
+            k_buffer,
+            v_buffer,
+            cache_loc,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+        )
+    
     def make_mla_meta_data(
         self,
         qo_indptr,
@@ -503,23 +700,62 @@ class AiterAttnBackend(AttentionBackend):
                         max_split_per_batch=num_kv_splits,
                         intra_batch_mode=intra_batch_mode,
                     )
-
-            self.forward_metadata = ForwardMetadata(
-                kv_indptr,
-                kv_indices,
-                qo_indptr,
-                kv_last_page_len,
-                max_q_len,
-                None,
-                work_metadata=work_metadata,
-                work_info_set=work_info_set,
-                work_indptr=work_indptr,
-                reduce_indptr=reduce_indptr,
-                reduce_final_map=reduce_final_map,
-                reduce_partial_map=reduce_partial_map,
-                num_kv_splits=num_kv_splits,
-                run_graph=False,
-            )
+            if self.decode_using_pa_gluon and spec_info is None and not self.use_mla:
+                seq_lens_cpu = forward_batch.seq_lens_cpu
+                if seq_lens_cpu is None:
+                    seq_lens_cpu = forward_batch.seq_lens.cpu()
+                page_table_persistent = self.page_table
+                seq_lens_persistent = self.seq_lens_for_page_table
+                seq_lens_persistent.fill_(0)
+                page_table_persistent.fill_(0)
+                seq_lens_persistent[:bs].copy_(
+                    forward_batch.seq_lens, non_blocking=True
+                )
+                max_seq_pages = (
+                    seq_lens_cpu.max().item() + self.page_size - 1
+                ) // self.page_size + 1
+                page_table_src = self.req_to_token[
+                    forward_batch.req_pool_indices[:, None],
+                    self.strided_indices[:max_seq_pages][None, :],
+                ]
+                page_table_persistent[:bs, :max_seq_pages].copy_(
+                    page_table_src // self.page_size, non_blocking=True
+                )
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    None,
+                    work_metadata=work_metadata,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    num_kv_splits=num_kv_splits,
+                    run_graph=False,
+                    page_table=page_table_persistent[:bs, :].contiguous(),
+                    kv_lens=seq_lens_persistent[:bs],
+                )
+            else:
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    None,
+                    work_metadata=work_metadata,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    num_kv_splits=num_kv_splits,
+                    run_graph=False,
+                )
 
         elif forward_batch.forward_mode.is_draft_extend():
             if self.use_mla:
@@ -941,22 +1177,44 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_final_map = self.reduce_final_map
                     reduce_partial_map = self.reduce_partial_map
 
-            self.forward_metadata = ForwardMetadata(
-                kv_indptr,
-                kv_indices,
-                qo_indptr,
-                kv_last_page_len,
-                max_q_len,
-                kv_indptr[-1].item(),
-                work_metadata=work_metadata,
-                work_info_set=work_info_set,
-                work_indptr=work_indptr,
-                reduce_indptr=reduce_indptr,
-                reduce_final_map=reduce_final_map,
-                reduce_partial_map=reduce_partial_map,
-                num_kv_splits=num_kv_splits,
-                # num_kv_splits_indptr=num_kv_splits_indptr,
-            )
+            if self.decode_using_pa_gluon and spec_info is None and not self.use_mla:
+                page_table_slice = self.page_table[:bs, :]
+                self.seq_lens_for_page_table[:bs].copy_(seq_lens, non_blocking=True)
+                seq_lens_persistent = self.seq_lens_for_page_table[:bs]
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    kv_indptr[-1].item(),
+                    work_metadata=work_metadata,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    num_kv_splits=num_kv_splits,
+                    page_table=page_table_slice.contiguous(),
+                    kv_lens=seq_lens_persistent,
+                )
+            else:
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    kv_indptr[-1].item(),
+                    work_metadata=work_metadata,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    num_kv_splits=num_kv_splits,
+                    # num_kv_splits_indptr=num_kv_splits_indptr,
+                )
 
         elif forward_mode.is_target_verify():
             if self.use_mla:
@@ -1189,6 +1447,39 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
                 kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
 
+            if (
+                self.decode_using_pa_gluon
+                and spec_info is None
+                and not self.use_mla
+                and seq_lens_cpu is not None
+            ):
+                page_table_persistent = self.page_table
+                seq_lens_persistent = self.seq_lens_for_page_table
+                seq_lens_persistent.fill_(0)
+                page_table_persistent.fill_(0)
+                seq_lens_persistent[:bs].copy_(seq_lens[:bs], non_blocking=True)
+                max_seq_pages = (
+                    int(seq_lens_cpu[:bs].max().item()) + self.page_size - 1
+                ) // self.page_size + 1
+                page_table_src = self.req_to_token[
+                    req_pool_indices[:bs, None],
+                    self.strided_indices[:max_seq_pages][None, :],
+                ]
+                page_table_persistent[:bs, :max_seq_pages].copy_(
+                    page_table_src // self.page_size, non_blocking=True
+                )
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    None,
+                    None,
+                    1,
+                    None,
+                    run_graph=True,
+                    page_table=page_table_persistent[:bs, :].contiguous(),
+                    kv_lens=seq_lens_persistent[:bs],
+                )
+    
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
             qo_indptr = self.qo_indptr[: bs + 1]
@@ -1271,6 +1562,20 @@ class AiterAttnBackend(AttentionBackend):
             if save_kv_cache:
                 if self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                elif self.decode_using_pa_gluon:
+                    k_buf, v_buf = forward_batch.token_to_kv_pool.get_kv_buffer(
+                        layer.layer_id
+                    )
+                    self.set_kv_buffer_with_layout_shuffle(
+                        cache_loc,
+                        k,
+                        v,
+                        k_buf,
+                        v_buf,
+                        layer.k_scale,
+                        layer.v_scale,
+                        self.page_size,
+                    )
                 else:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
@@ -1616,6 +1921,34 @@ class AiterAttnBackend(AttentionBackend):
                 raise ValueError(
                     f"Invalid forward mode for MLA prefill: {forward_batch.forward_mode=}"
                 )
+        elif self.decode_using_pa_gluon:
+            seqlens_in_batch = forward_batch.seq_lens
+            cu_seqlens_q = torch.nn.functional.pad(
+                    torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+                )
+            if (
+                    dtypes is not None
+                    and q.dtype != k.dtype
+                    and k.dtype == dtypes.fp8
+             ):
+                q = q.to(dtypes.fp8)
+            o = flash_attn_varlen_func(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v.contiguous().view(-1, layer.tp_v_head_num, layer.head_dim),
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_q,
+                    max_seqlen_q=self.forward_metadata.max_q_len,
+                    max_seqlen_k=self.forward_metadata.max_kv_len,
+                    min_seqlen_q=0,
+                    dropout_p=0.0,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    window_size=(-1, -1, 0),
+                    sink_ptr=None,
+                )
+            return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
         else:
             if (
                 forward_batch.forward_mode.is_target_verify()
@@ -1700,10 +2033,25 @@ class AiterAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q, dtype=self.input_dtype)
 
-        if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+        if save_kv_cache:      
+            if self.decode_using_pa_gluon:
+                k_buf, v_buf = forward_batch.token_to_kv_pool.get_kv_buffer(
+                    layer.layer_id
+                )
+                self.set_kv_buffer_with_layout_shuffle(
+                    forward_batch.out_cache_loc,
+                    k,
+                    v,
+                    k_buf,
+                    v_buf,
+                    layer.k_scale,
+                    layer.v_scale,
+                    self.page_size,
+                )
+            else:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v
+                )
 
         if self.use_mla:
             k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -1763,35 +2111,117 @@ class AiterAttnBackend(AttentionBackend):
             k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
+            if self.decode_using_pa_gluon:
+                batch_size = q.shape[0]
+                block_size = self.page_size
+                num_slots, num_kv_heads, head_size = k_cache.shape
+                num_blocks = num_slots // block_size
+                k_cache = k_cache[: num_blocks * block_size].view(
+                    num_blocks, block_size, num_kv_heads, head_size
+                )
+                v_cache = v_cache[: num_blocks * block_size].view(
+                    num_blocks, block_size, num_kv_heads, head_size
+                )
+                x = 16 // k_cache.element_size()
+                new_key_cache = k_cache.view(
+                    num_blocks, num_kv_heads, head_size // x, block_size, x
+                )
+                new_value_cache = v_cache.view(
+                    num_blocks, num_kv_heads, block_size // x, head_size, x
+                )
+                md = self.forward_metadata
+                q_flat = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+                out_flat = o.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+                block_tables = md.page_table
+                context_lengths = md.kv_lens
+                query_scale = None
+                key_scale = None
+                value_scale = None
+                if self.kv_cache_dtype == fp8_dtype:
+                    if dtypes is None:
+                        raise RuntimeError(
+                            "aiter dtypes required for FP8 KV with pa_decode_gluon"
+                        )
+                    compute_type = dtypes.fp8
+                    key_scale = self.k_scale
+                    value_scale = self.v_scale
+                    if q_flat.dtype == dtypes.fp8:
+                        query_scale = (
+                            layer.k_scale
+                            if isinstance(layer.k_scale, torch.Tensor)
+                            else torch.ones(
+                                1, dtype=torch.float32, device=q.device
+                            )
+                        )
+                elif dtypes is not None and q_flat.dtype == dtypes.fp8:
+                    compute_type = dtypes.fp8
+                    query_scale = (
+                        layer.k_scale
+                        if isinstance(layer.k_scale, torch.Tensor)
+                        else torch.ones(1, dtype=torch.float32, device=q.device)
+                    )
+                elif q_flat.dtype in (torch.float16, torch.bfloat16):
+                    compute_type = q_flat.dtype
+                else:
+                    compute_type = self.input_dtype
 
-            # TODO kkhuang-amd need to remove it when paged_attention_ragged support fp8-kv
-            if self.kv_cache_dtype == fp8_dtype:
-                dtype = q.dtype
+                sw = getattr(layer, "sliding_window_size", None)
+                sliding_window = (
+                    int(sw) if sw is not None and int(sw) > 0 else 0
+                )
 
-                k_cache = k_cache.to(dtype)
-                v_cache = v_cache.to(dtype)
+                torch.ops.aiter.pa_decode_gluon(
+                    out_flat,
+                    q_flat,
+                    new_key_cache,
+                    new_value_cache,
+                    context_lengths,
+                    block_tables,
+                    layer.scaling,
+                    1,
+                    self.gluon_max_context_partition_num,
+                    self.gluon_context_partition_size,
+                    compute_type,
+                    query_scale,
+                    key_scale,
+                    value_scale,
+                    exp_sums=self.gluon_exp_sums[:batch_size],
+                    max_logits=self.gluon_max_logits[:batch_size],
+                    temporary_output=self.gluon_temporary_output[:batch_size],
+                    alibi_slopes=None,
+                    sinks=None,
+                    sliding_window=sliding_window,
+                    ps=False,
+                )
+            else:
+                # TODO kkhuang-amd need to remove it when paged_attention_ragged support fp8-kv
+                if self.kv_cache_dtype == fp8_dtype:
+                    dtype = q.dtype
 
-            paged_attention_ragged(
-                o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                self.workspace_buffer,
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
-                v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
-                self.scale,
-                self.forward_metadata.kv_indptr,
-                self.forward_metadata.kv_indices,
-                self.kv_last_page_len,
-                1,
-                self.max_num_partitions,
-                None,
-                "auto",
-                "NHD",
-                self.logits_soft_cap,
-                self.k_scale,
-                self.v_scale,
-                None,
-                _AITER_PARTITION_SIZE_ROCM,
-            )
+                    k_cache = k_cache.to(dtype)
+                    v_cache = v_cache.to(dtype)
+
+                paged_attention_ragged(
+                    o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    self.workspace_buffer,
+                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
+                    self.scale,
+                    self.forward_metadata.kv_indptr,
+                    self.forward_metadata.kv_indices,
+                    self.kv_last_page_len,
+                    1,
+                    self.max_num_partitions,
+                    None,
+                    "auto",
+                    "NHD",
+                    self.logits_soft_cap,
+                    self.k_scale,
+                    self.v_scale,
+                    None,
+                    _AITER_PARTITION_SIZE_ROCM,
+                )
 
         return o
 
