@@ -5,6 +5,7 @@ end to end attention solution with aiter kernels
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional
@@ -97,6 +98,12 @@ class ForwardMetadata:
 global_workspace_buffer = None
 
 _AITER_PARTITION_SIZE_ROCM = 256
+
+
+def _get_aiter_paged_ragged_kv_cache_dtype(kv_cache_dtype) -> str:
+    if kv_cache_dtype != fp8_dtype:
+        return "auto"
+    return "fp8_e4m3"
 
 
 class AiterAttnBackend(AttentionBackend):
@@ -1272,8 +1279,15 @@ class AiterAttnBackend(AttentionBackend):
                 if self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
                 else:
+                    layer_k_scale = getattr(layer, "k_scale", None)
+                    layer_v_scale = getattr(layer, "v_scale", None)
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                        layer_k_scale if layer_k_scale is not None else self.k_scale,
+                        layer_v_scale if layer_v_scale is not None else self.v_scale,
                     )
 
         if self.use_mla:
@@ -1656,11 +1670,26 @@ class AiterAttnBackend(AttentionBackend):
 
             bs0 = forward_batch.batch_size + 1
 
-            # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
+            q_descale = None
+            k_descale = None
+            v_descale = None
             if self.kv_cache_dtype == fp8_dtype:
-                dtype = q.dtype
-                k_cache = k_cache.to(dtype)
-                v_cache = v_cache.to(dtype)
+                q = q.to(fp8_dtype)
+                k_descale = (
+                    getattr(layer, "k_scale", None)
+                    if getattr(layer, "k_scale", None) is not None
+                    else self.k_scale
+                )
+                v_descale = (
+                    getattr(layer, "v_scale", None)
+                    if getattr(layer, "v_scale", None) is not None
+                    else self.v_scale
+                )
+                q_descale = (
+                    self.k_scale
+                    if self.k_scale.shape == k_descale.shape
+                    else torch.ones_like(k_descale, dtype=torch.float32)
+                )
 
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -1676,6 +1705,9 @@ class AiterAttnBackend(AttentionBackend):
                 alibi_slopes=None,
                 return_lse=False,
                 return_attn_probs=False,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
             )
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -1701,9 +1733,21 @@ class AiterAttnBackend(AttentionBackend):
             o = torch.empty_like(q, dtype=self.input_dtype)
 
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            if self.use_mla:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v
+                )
+            else:
+                layer_k_scale = getattr(layer, "k_scale", None)
+                layer_v_scale = getattr(layer, "v_scale", None)
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k,
+                    v,
+                    layer_k_scale if layer_k_scale is not None else self.k_scale,
+                    layer_v_scale if layer_v_scale is not None else self.v_scale,
+                )
 
         if self.use_mla:
             k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -1764,12 +1808,34 @@ class AiterAttnBackend(AttentionBackend):
                 layer.layer_id
             )
 
-            # TODO kkhuang-amd need to remove it when paged_attention_ragged support fp8-kv
-            if self.kv_cache_dtype == fp8_dtype:
-                dtype = q.dtype
-
-                k_cache = k_cache.to(dtype)
-                v_cache = v_cache.to(dtype)
+            use_direct_fp8_ragged = (
+                self.kv_cache_dtype == fp8_dtype
+                and os.getenv("SGLANG_DISABLE_AITER_DIRECT_FP8_DECODE", "0") != "1"
+            )
+            if use_direct_fp8_ragged:
+                ragged_kv_cache_dtype = "fp8_e4m3"
+                ragged_k_scale = self.k_scale
+                ragged_v_scale = self.v_scale
+                layer_k_scale = getattr(layer, "k_scale", None)
+                layer_v_scale = getattr(layer, "v_scale", None)
+                ragged_k_scale = layer_k_scale if layer_k_scale is not None else self.k_scale
+                ragged_v_scale = layer_v_scale if layer_v_scale is not None else self.v_scale
+            else:
+                if self.kv_cache_dtype == fp8_dtype:
+                    dtype = q.dtype
+                    k_cache = k_cache.to(dtype)
+                    v_cache = v_cache.to(dtype)
+                    layer_k_scale = getattr(layer, "k_scale", None)
+                    layer_v_scale = getattr(layer, "v_scale", None)
+                    k_cache = k_cache * (
+                        layer_k_scale if layer_k_scale is not None else self.k_scale
+                    )
+                    v_cache = v_cache * (
+                        layer_v_scale if layer_v_scale is not None else self.v_scale
+                    )
+                ragged_kv_cache_dtype = "auto"
+                ragged_k_scale = self.k_scale
+                ragged_v_scale = self.v_scale
 
             paged_attention_ragged(
                 o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -1784,11 +1850,11 @@ class AiterAttnBackend(AttentionBackend):
                 1,
                 self.max_num_partitions,
                 None,
-                "auto",
+                ragged_kv_cache_dtype,
                 "NHD",
                 self.logits_soft_cap,
-                self.k_scale,
-                self.v_scale,
+                ragged_k_scale,
+                ragged_v_scale,
                 None,
                 _AITER_PARTITION_SIZE_ROCM,
             )

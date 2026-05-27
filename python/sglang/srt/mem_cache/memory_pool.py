@@ -27,6 +27,7 @@ KVCache actually holds the physical kv cache.
 import abc
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -744,6 +745,13 @@ class MHATokenToKVPool(KVCache):
             self._init_kv_copy_and_warmup()
         else:
             self._kv_copy_config = None
+        self._fused_fp8_set_kv_buffer = None
+        if (
+            _is_hip
+            and self.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+            and os.getenv("SGLANG_DISABLE_AITER_FUSED_FP8_KV_WRITE", "0") != "1"
+        ):
+            self._init_fused_fp8_kv_write()
 
         self._finalize_allocation_log(size)
 
@@ -796,6 +804,41 @@ class MHATokenToKVPool(KVCache):
             BYTES_PER_TILE=self._kv_copy_config["bytes_per_tile"],
             num_warps=self._kv_copy_config["num_warps"],
             num_stages=2,
+        )
+
+    def _init_fused_fp8_kv_write(self):
+        from sglang.srt.layers.attention.triton_ops.aiter_fp8_kv_kernel import (
+            fused_fp8_set_kv_buffer,
+        )
+
+        self._fused_fp8_set_kv_buffer = fused_fp8_set_kv_buffer
+        if not self.k_buffer or not self.v_buffer:
+            return
+
+        dummy_k = torch.empty(
+            (1, self.head_num, self.head_dim),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        dummy_v = torch.empty(
+            (1, self.head_num, self.v_head_dim),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        dummy_loc = torch.zeros((1,), dtype=torch.int64, device=self.device)
+        dummy_scale = torch.ones((1,), dtype=torch.float32, device=self.device)
+        fused_fp8_set_kv_buffer(
+            dummy_k,
+            dummy_v,
+            self.k_buffer[0].view(self.dtype)
+            if self.store_dtype != self.dtype
+            else self.k_buffer[0],
+            self.v_buffer[0].view(self.dtype)
+            if self.store_dtype != self.dtype
+            else self.v_buffer[0],
+            dummy_loc,
+            dummy_scale,
+            dummy_scale,
         )
 
     def _create_buffers(self):
@@ -962,6 +1005,38 @@ class MHATokenToKVPool(KVCache):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+        if (
+            _is_hip
+            and self.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+            and self._fused_fp8_set_kv_buffer is not None
+            and cache_k.dtype != self.dtype
+            and isinstance(k_scale, torch.Tensor)
+            and isinstance(v_scale, torch.Tensor)
+            and k_scale.device == cache_k.device
+            and v_scale.device == cache_v.device
+            and k_scale.dtype == torch.float32
+            and v_scale.dtype == torch.float32
+            and cache_k.ndim == 3
+            and cache_v.ndim == 3
+            and self.k_buffer[layer_id - self.start_layer].ndim == 3
+            and self.v_buffer[layer_id - self.start_layer].ndim == 3
+        ):
+            k_buffer = self.k_buffer[layer_id - self.start_layer]
+            v_buffer = self.v_buffer[layer_id - self.start_layer]
+            if self.store_dtype != self.dtype:
+                k_buffer = k_buffer.view(self.dtype)
+                v_buffer = v_buffer.view(self.dtype)
+            self._fused_fp8_set_kv_buffer(
+                cache_k,
+                cache_v,
+                k_buffer,
+                v_buffer,
+                loc,
+                k_scale,
+                v_scale,
+            )
+            return
+
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
