@@ -69,6 +69,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -104,9 +105,13 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
 _is_hip_altstream = get_bool_env_var("SGLANG_ALT_STREAM", "False")
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_hip:
-    from sglang.srt.layers.elementwise import fused_sigmoid_mul, fused_sigmoid_mul_broadcast
+    from sglang.srt.layers.elementwise import (
+        fused_sigmoid_mul,
+        fused_sigmoid_mul_broadcast,
+    )
 
 fused_linear_sigmoid_mul_triton = None
 if _is_hip:
@@ -131,6 +136,26 @@ QWEN3_5_PACKED_MODULES_MAPPING = {
 class Qwen3_5SparseMoeBlock(Qwen2MoeSparseMoeBlock):
     """Qwen3.5-specific MoE block with fused shared expert gating on HIP."""
 
+    def __init__(
+        self,
+        layer_id: int,
+        config,
+        quant_config: Optional[QuantizationConfig] = None,
+        alt_stream: Optional[torch.cuda.Stream] = None,
+        prefix: str = "",
+        is_nextn: bool = False,
+        support_shared_expert_fusion: bool = True,
+    ):
+        super().__init__(
+            layer_id=layer_id,
+            config=config,
+            quant_config=quant_config,
+            alt_stream=alt_stream,
+            prefix=prefix,
+            is_nextn=is_nextn,
+            support_shared_expert_fusion=support_shared_expert_fusion,
+        )
+
     def _forward_shared_experts(self, hidden_states):
         # ``hidden_states`` is plain bf16; downstream FP8 sub-modules
         # (gate_up_proj) re-quant on their own.
@@ -146,8 +171,7 @@ class Qwen3_5SparseMoeBlock(Qwen2MoeSparseMoeBlock):
                     and self.shared_expert_gate.bias is None
                     and self.shared_expert_gate.weight.dim() == 2
                     and self.shared_expert_gate.weight.shape[0] == 1
-                    and self.shared_expert_gate.weight.shape[1]
-                    == bf16_view.shape[1]
+                    and self.shared_expert_gate.weight.shape[1] == bf16_view.shape[1]
                     and bf16_view.is_contiguous()
                     and shared_output.is_contiguous()
                     and self.shared_expert_gate.weight.is_contiguous()
@@ -167,8 +191,7 @@ class Qwen3_5SparseMoeBlock(Qwen2MoeSparseMoeBlock):
                     import torch.nn.functional as F
 
                     shared_output = (
-                        F.sigmoid(self.shared_expert_gate(bf16_view))
-                        * shared_output
+                        F.sigmoid(self.shared_expert_gate(bf16_view)) * shared_output
                     )
         return shared_output
 
@@ -263,8 +286,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self._bind_packed_weight_loaders(self.in_proj_ba)
 
         self._qkv_size_local = (
-            self.key_dim // self.attn_tp_size * 2
-            + self.value_dim // self.attn_tp_size
+            self.key_dim // self.attn_tp_size * 2 + self.value_dim // self.attn_tp_size
         )
         self._z_size_local = self.value_dim // self.attn_tp_size
         self._ba_size_local = self.num_v_heads // self.attn_tp_size
@@ -426,7 +448,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             return original_weight_loader(param, loaded_weight, loaded_shard_id)
 
         return weight_loader
-
 
     def fix_query_key_value_ordering(
         self,
@@ -607,6 +628,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
+                is_nextn=False,
+                support_shared_expert_fusion=True,
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -665,10 +688,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 
         # Fully Connected
         is_sparse_mlp = isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
-        hidden_states, residual = (
-            self.layer_communicator.prepare_mlp_with_norm_fusion(
-                hidden_states, residual, forward_batch
-            )
+        hidden_states, residual = self.layer_communicator.prepare_mlp_with_norm_fusion(
+            hidden_states, residual, forward_batch
         )
 
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
@@ -813,6 +834,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                is_nextn=False,
+                support_shared_expert_fusion=True,
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -850,7 +873,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply Q/K normalization with optional alt_stream overlap."""
-        if self.alt_stream is not None and get_is_capture_mode() and get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False"):
+        if (
+            self.alt_stream is not None
+            and get_is_capture_mode()
+            and get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False")
+        ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             q_by_head = q.reshape(-1, self.head_dim)
@@ -923,10 +950,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         # Fully Connected
         is_sparse_mlp = isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
-        hidden_states, residual = (
-            self.layer_communicator.prepare_mlp_with_norm_fusion(
-                hidden_states, residual, forward_batch
-            )
+        hidden_states, residual = self.layer_communicator.prepare_mlp_with_norm_fusion(
+            hidden_states, residual, forward_batch
         )
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
@@ -1484,6 +1509,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
 
     packed_modules_mapping = QWEN3_5_PACKED_MODULES_MAPPING
+
     def __init__(
         self,
         config: Qwen3_5MoeConfig,
@@ -1498,6 +1524,20 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.is_mrope_enabled = "mrope_section" in rope_config
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+
+        self.num_fused_shared_experts = 0
+        if _use_aiter:
+            self.num_fused_shared_experts = self._get_num_fused_shared_experts()
+        self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
+
+    def _get_num_fused_shared_experts(self):
+        if not (
+            hasattr(self.model, "layers")
+            and len(self.model.layers) > 0
+            and hasattr(self.model.layers[0].mlp, "num_fused_shared_experts")
+        ):
+            return 0
+        return self.model.layers[0].mlp.num_fused_shared_experts
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -1545,7 +1585,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=(
+                self.config.num_experts
+                if not self.enable_shared_expert_fusion
+                else self.config.num_experts + self.num_fused_shared_experts
+            ),
         )
 
         # Skip loading extra parameters for GPTQ/modelopt models.
@@ -1568,6 +1612,34 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         num_experts = self.config.num_experts
 
+        if self.enable_shared_expert_fusion:
+            fused_expert_params_mapping += [
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts}.gate_up_proj.",
+                    num_experts,
+                    "w1",
+                ),
+                (
+                    "experts.w2_",
+                    f"experts.{num_experts}.down_proj.",
+                    num_experts,
+                    "w2",
+                ),
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts}.gate_proj.",
+                    num_experts,
+                    "w1",
+                ),
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts}.up_proj.",
+                    num_experts,
+                    "w3",
+                ),
+            ]
+
         def load_fused_expert_weights(
             name: str,
             params_dict: dict,
@@ -1575,6 +1647,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             shard_id: str,
             num_experts: int,
         ):
+            if name not in params_dict:
+                return False
             param = params_dict[name]
             weight_loader = param.weight_loader
             # let ep moe layer to gracefully handle expert_ids that do not belong to local moe rank
@@ -1599,6 +1673,21 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
 
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self, "start_layer")
+                and (layer_id < self.start_layer or layer_id >= self.end_layer)
+            ):
+                continue
+
+            if self.enable_shared_expert_fusion and "mlp.shared_expert." in name:
+                name = name.replace(
+                    "mlp.shared_expert.",
+                    f"mlp.experts.{num_experts}.",
+                )
+
+            is_fused_expert = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if name.endswith("experts.gate_up_proj") or name.endswith(
                     "experts.down_proj"
@@ -1670,6 +1759,35 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 loaded_weight,
                                 shard_id,
                                 num_experts,
+                            )
+                    elif self.enable_shared_expert_fusion and expert_id == num_experts:
+                        param = params_dict[name_mapped]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        if f"{num_experts}.gate_up_proj" in name:
+                            loaded_weight = loaded_weight.chunk(2, dim=-2)
+                            weight_loader(
+                                param,
+                                loaded_weight[0],
+                                name_mapped,
+                                "w1",
+                                expert_id,
+                            )
+                            weight_loader(
+                                param,
+                                loaded_weight[1],
+                                name_mapped,
+                                "w3",
+                                expert_id,
+                            )
+                        else:
+                            weight_loader(
+                                param,
+                                loaded_weight,
+                                name_mapped,
+                                shard_id,
+                                expert_id,
                             )
                     else:
                         # Skip loading extra parameters for GPTQ models.
