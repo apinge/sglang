@@ -321,6 +321,12 @@ class MambaPool:
             )
             self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
             self.num_mamba_layers = num_mamba_layers
+            # Per-slot SSM layout: 0=KV (prefill/extend), 1=VK (HIP/flydsl decode).
+            # Pool-owned so it stays in sync with SSM rows on alloc/copy_from/fork_from;
+            # the GDN decode backend shares this tensor for its KV<->VK transpose.
+            self.state_layout = torch.zeros(
+                self.size + 1, dtype=torch.int8, device=self.device
+            )
 
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
@@ -342,6 +348,8 @@ class MambaPool:
         for i in range(len(self.mamba_cache.conv)):
             self.mamba_cache.conv[i][:, select_index] = 0
         self.mamba_cache.temporal[:, select_index] = 0
+        # Zeroed state is layout-agnostic; reset recycled slots to KV.
+        self.state_layout[select_index] = 0
 
         return select_index
 
@@ -363,6 +371,9 @@ class MambaPool:
         self.mamba_cache.temporal[:, dst_index] = self.mamba_cache.temporal[
             :, src_index
         ]
+        # Carry the layout bit with the rows; otherwise prefix-cache reuse leaves a
+        # stale bit and the KV<->VK transpose corrupts the SSM state.
+        self.state_layout[dst_index] = self.state_layout[src_index]
         return
 
     def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:

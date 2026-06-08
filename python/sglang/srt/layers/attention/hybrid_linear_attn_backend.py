@@ -1045,10 +1045,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     self._num_mamba_layers = full_temporal.shape[0]
                     self._num_v_heads_per_layer = full_temporal.shape[2]
                     total_slots = full_temporal.shape[1]
-                    self._slot_layout = torch.zeros(
-                        total_slots,
-                        dtype=torch.int8,
-                        device=full_temporal.device,
+                    # Share the pool-owned bitmap (single source of truth) so
+                    # prefix-cache reuse can't desync the KV<->VK layout.
+                    self._slot_layout = mamba_pool.state_layout
+                    assert self._slot_layout.shape[0] == total_slots, (
+                        f"mamba_pool.state_layout size {self._slot_layout.shape[0]} "
+                        f"!= temporal slots {total_slots}"
                     )
                     rank0_log(
                         f"{selected_vk_backend.upper()} GDN decode loaded "
@@ -2195,6 +2197,11 @@ class HybridLinearAttnBackend(AttentionBackend):
             :, src_state_indices, last_steps
         ].to(conv_states.dtype, copy=False)
 
+        # Scattered verify states are KV; keep the bitmap in sync (no-op without VK path).
+        slot_layout = getattr(self.linear_attn_backend, "_slot_layout", None)
+        if slot_layout is not None:
+            slot_layout[dst_state_indices] = 0  # LAYOUT_KV
+
         # Track indices used for tracking mamba states for prefix cache
         if mamba_track_indices is not None:
             assert mamba_steps_to_track is not None
@@ -2215,3 +2222,6 @@ class HybridLinearAttnBackend(AttentionBackend):
             conv_states[:, dst_track_indices, :] = intermediate_conv_window_cache[
                 :, src_track_indices, track_steps
             ].to(conv_states.dtype, copy=False)
+
+            if slot_layout is not None:
+                slot_layout[dst_track_indices] = 0  # LAYOUT_KV
