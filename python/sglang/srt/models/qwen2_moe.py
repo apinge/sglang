@@ -57,10 +57,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.moe.shared_expert_topk_fusion import (
-    append_shared_to_topk,
-    get_shared_expert_gate_weights,
-)
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopK,
@@ -315,9 +311,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ) -> Optional[torch.Tensor]:
         if not self.enable_shared_expert_fusion or self.shared_expert_gate is None:
             return None
-        return get_shared_expert_gate_weights(
-            self.shared_expert_gate, hidden_states
-        )
+        shared_out = self.shared_expert_gate(hidden_states)
+        shared_logits = shared_out[0] if isinstance(shared_out, tuple) else shared_out
+        return F.sigmoid(shared_logits)
 
     def _append_shared_to_topk_output(
         self,
@@ -329,12 +325,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         shared_weights = self._get_shared_expert_weights(hidden_states)
         if shared_weights is None:
             return topk_output
-        fused_topk_ids, fused_topk_weights = append_shared_to_topk(
-            topk_output.topk_ids,
-            topk_output.topk_weights,
-            shared_weights,
-            self.num_experts,
-            self.num_fused_shared_experts,
+        M = topk_output.topk_ids.shape[0]
+        shared_expert_id = self.num_experts
+        shared_ids = torch.full(
+            (M, self.num_fused_shared_experts),
+            shared_expert_id,
+            dtype=topk_output.topk_ids.dtype,
+            device=topk_output.topk_ids.device,
+        )
+        shared_weights = shared_weights.expand(M, self.num_fused_shared_experts).to(
+            topk_output.topk_weights.dtype
+        )
+        fused_topk_ids = torch.cat([topk_output.topk_ids, shared_ids], dim=-1)
+        fused_topk_weights = torch.cat(
+            [topk_output.topk_weights, shared_weights], dim=-1
         )
         return StandardTopKOutput(
             topk_weights=fused_topk_weights,
