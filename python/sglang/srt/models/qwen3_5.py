@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 from sglang.jit_kernel.triton.gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
+    fused_qkvzba_split_reshape_cat_contiguous_v3,
     scatter_fused_proj,
 )
 
@@ -557,8 +558,26 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self.head_k_dim,
                 self.head_v_dim,
             )
+        elif (
+            self.num_v_heads // self.num_k_heads == 3
+            and not is_cpu()
+            and not is_npu()
+            and proj_qkvz.is_contiguous()
+            and proj_ba.is_contiguous()
+            and self.head_k_dim == 128
+            and self.head_v_dim == 128
+        ):
+            # Fused split for Qwen3.5-27B v_per_group=3.
+            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous_v3(
+                proj_qkvz,
+                proj_ba,
+                self.num_k_heads // self.attn_tp_size,
+                self.num_v_heads // self.attn_tp_size,
+                self.head_k_dim,
+                self.head_v_dim,
+            )
         else:
-            # Fallback for v_per_group=3 (Qwen3.5-27B); needs stride-aware GDN kernels.
+            # Generic fallback for CPU/NPU or unsupported head group shapes.
             query, key, value, z, b, a = self.fix_query_key_value_ordering(
                 proj_qkvz, proj_ba
             )
@@ -577,9 +596,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
         z_shape_og = z.shape
-        # reshape input data into 2D tensor
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
+        # Keep gated RMSNorm and output projection in 2D. Use view on the
+        # contiguous 397B fast path, but fall back to reshape for 27B's
+        # stride-aware fallback path where z can span multiple storage regions.
+        core_attn_out = (
+            core_attn_out.view(-1, core_attn_out.shape[-1])
+            if core_attn_out.is_contiguous()
+            else core_attn_out.reshape(-1, core_attn_out.shape[-1])
+        )
+        z = z.view(-1, z.shape[-1]) if z.is_contiguous() else z.reshape(-1, z.shape[-1])
 
         # Add padding for DP-Attn
         if core_attn_out.shape != z.shape:
@@ -588,8 +613,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out = core_attn_out_pad
 
         core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+        core_attn_out = core_attn_out.reshape(z_shape_og[0], -1)
 
         output, _ = self.out_proj(core_attn_out)
         return output

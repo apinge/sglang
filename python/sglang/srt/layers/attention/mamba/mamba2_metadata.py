@@ -40,6 +40,9 @@ class ForwardMetadata:
 
     is_target_verify: bool = False
     draft_token_num: int = 1
+    has_mamba_track_mask: bool = False
+    mamba_track_mask_indices: Optional[torch.Tensor] = None
+    conv_states_mask_indices: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)
@@ -164,6 +167,7 @@ class Mamba2Metadata(ForwardMetadata):
             retrieve_next_token=forward_metadata.retrieve_next_token,
             retrieve_next_sibling=forward_metadata.retrieve_next_sibling,
             retrieve_parent_token=forward_metadata.retrieve_parent_token,
+            has_mamba_track_mask=forward_metadata.has_mamba_track_mask,
             num_decodes=len(seq_lens),
             num_prefills=0,
             num_prefill_tokens=0,
@@ -232,6 +236,7 @@ class Mamba2Metadata(ForwardMetadata):
             retrieve_next_token=forward_metadata.retrieve_next_token,
             retrieve_next_sibling=forward_metadata.retrieve_next_sibling,
             retrieve_parent_token=forward_metadata.retrieve_parent_token,
+            has_mamba_track_mask=forward_metadata.has_mamba_track_mask,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,

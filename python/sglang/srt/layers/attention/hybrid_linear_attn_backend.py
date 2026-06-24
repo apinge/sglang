@@ -13,7 +13,6 @@ from sglang.srt.layers.attention.gdn_decode_backend_selector import (
     get_local_gdn_head_shape,
     select_vk_gdn_decode_backend,
     supports_hip_gdn_decode_runtime,
-    sync_gdn_slot_layout_after_copy,
     target_gdn_state_layout,
 )
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
@@ -258,6 +257,113 @@ def sync_gdn_slot_layout_after_masked_copy(
     )
 
 
+@triton.jit
+def copy_h_to_ssm_track_kernel(
+    h_ptr,
+    ssm_states_ptr,
+    src_indices_ptr,
+    dst_indices_ptr,
+    slot_layout_ptr,
+    h_stride_0,
+    ssm_stride_0,
+    row_numel: tl.constexpr,
+    layout_kv: tl.constexpr,
+    HAS_LAYOUT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pair_idx = tl.program_id(0)
+    tile_idx = tl.program_id(1)
+    offsets = tile_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < row_numel
+
+    src_idx = tl.load(src_indices_ptr + pair_idx)
+    dst_idx = tl.load(dst_indices_ptr + pair_idx)
+
+    data = tl.load(h_ptr + src_idx * h_stride_0 + offsets, mask=mask, other=0.0)
+    tl.store(ssm_states_ptr + dst_idx * ssm_stride_0 + offsets, data, mask=mask)
+
+    if HAS_LAYOUT and tile_idx == 0:
+        tl.store(slot_layout_ptr + dst_idx, layout_kv)
+
+
+@triton.jit
+def copy_ssm_to_ssm_track_kernel(
+    ssm_states_ptr,
+    src_indices_ptr,
+    dst_indices_ptr,
+    slot_layout_ptr,
+    ssm_stride_0,
+    row_numel: tl.constexpr,
+    HAS_LAYOUT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pair_idx = tl.program_id(0)
+    tile_idx = tl.program_id(1)
+    offsets = tile_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < row_numel
+
+    src_idx = tl.load(src_indices_ptr + pair_idx)
+    dst_idx = tl.load(dst_indices_ptr + pair_idx)
+
+    data = tl.load(ssm_states_ptr + src_idx * ssm_stride_0 + offsets, mask=mask, other=0.0)
+    tl.store(ssm_states_ptr + dst_idx * ssm_stride_0 + offsets, data, mask=mask)
+
+    if HAS_LAYOUT and tile_idx == 0:
+        layout = tl.load(slot_layout_ptr + src_idx)
+        tl.store(slot_layout_ptr + dst_idx, layout)
+
+
+def copy_h_to_ssm_track(
+    h: torch.Tensor,
+    ssm_states: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    slot_layout: Optional[torch.Tensor],
+    layout_kv: int,
+) -> None:
+    if src_indices.numel() == 0:
+        return
+    row_numel = ssm_states[0].numel()
+    block_size = 1024
+    grid = (src_indices.numel(), triton.cdiv(row_numel, block_size))
+    copy_h_to_ssm_track_kernel[grid](
+        h,
+        ssm_states,
+        src_indices,
+        dst_indices,
+        slot_layout if slot_layout is not None else ssm_states,
+        h.stride(0),
+        ssm_states.stride(0),
+        row_numel,
+        layout_kv,
+        slot_layout is not None,
+        block_size,
+    )
+
+
+def copy_ssm_to_ssm_track(
+    ssm_states: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    slot_layout: Optional[torch.Tensor],
+) -> None:
+    if src_indices.numel() == 0:
+        return
+    row_numel = ssm_states[0].numel()
+    block_size = 1024
+    grid = (src_indices.numel(), triton.cdiv(row_numel, block_size))
+    copy_ssm_to_ssm_track_kernel[grid](
+        ssm_states,
+        src_indices,
+        dst_indices,
+        slot_layout if slot_layout is not None else ssm_states,
+        ssm_states.stride(0),
+        row_numel,
+        slot_layout is not None,
+        block_size,
+    )
+
+
 class MambaAttnBackendBase(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
@@ -289,6 +395,10 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
         )
+        has_mamba_track_mask = bool(
+            forward_batch.mamba_track_mask is not None
+            and forward_batch.mamba_track_mask.any()
+        )
 
         if forward_batch.forward_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
@@ -319,10 +429,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.extend_start_loc[-1]
                     + forward_batch.extend_seq_lens[-1]
                 )
-                if (
-                    forward_batch.mamba_track_mask is not None
-                    and forward_batch.mamba_track_mask.any()
-                ):
+                if has_mamba_track_mask:
                     track_conv_indices = self._init_track_conv_indices(
                         query_start_loc, forward_batch
                     )
@@ -347,6 +454,7 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_h_dst=track_ssm_h_dst,
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
+            has_mamba_track_mask=has_mamba_track_mask,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -705,28 +813,23 @@ class MambaAttnBackendBase(AttentionBackend):
         Note: Conv state tracking for extend is handled separately via gather operations
         using indices computed by `_init_track_conv_indices`.
         """
-        if (
-            forward_batch.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask.any()
-        ):
-            h = h.squeeze(0)
-
+        if forward_metadata.has_mamba_track_mask:
             if forward_metadata.track_ssm_h_src.numel() > 0:
-                ssm_states[forward_metadata.track_ssm_h_dst] = h[
-                    forward_metadata.track_ssm_h_src
-                ].to(ssm_states.dtype, copy=False)
-                if self._slot_layout is not None:
-                    self._slot_layout[forward_metadata.track_ssm_h_dst.long()] = (
-                        self._layout_kv
-                    )
-            if forward_metadata.track_ssm_final_src.numel() > 0:
-                ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
-                    forward_metadata.track_ssm_final_src
-                ]
-                sync_gdn_slot_layout_after_copy(
+                h = h.squeeze(0)
+                copy_h_to_ssm_track(
+                    h,
+                    ssm_states,
+                    forward_metadata.track_ssm_h_src,
+                    forward_metadata.track_ssm_h_dst,
                     self._slot_layout,
+                    self._layout_kv,
+                )
+            if forward_metadata.track_ssm_final_src.numel() > 0:
+                copy_ssm_to_ssm_track(
+                    ssm_states,
                     forward_metadata.track_ssm_final_src,
                     forward_metadata.track_ssm_final_dst,
+                    self._slot_layout,
                 )
 
 
@@ -1117,6 +1220,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        if self.forward_metadata.has_mamba_track_mask:
+            self.forward_metadata.mamba_track_mask_indices = (
+                forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+            )
+            self.forward_metadata.conv_states_mask_indices = (
+                forward_batch.mamba_track_indices[
+                    self.forward_metadata.mamba_track_mask_indices
+                ]
+            )
         forward_mode = forward_batch.forward_mode
         self._vk_decode_active_batch_size = None
         # EXTEND/TARGET_VERIFY use KV; selected VK decode backends switch to VK lazily.
@@ -1408,19 +1520,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
-            if (
-                forward_batch.mamba_track_mask is not None
-                and forward_batch.mamba_track_mask.any()
-            ):
-                conv_dst = forward_batch.mamba_track_indices
+            if forward_metadata.has_mamba_track_mask:
                 # Gather all slices at once: [:, track_conv_indices] -> [d, num_masked, slice_len]
                 # track_conv_indices is already filtered and clamped in _init_track_conv_indices
                 mixed_qkv_to_track = mixed_qkv[
                     :, forward_metadata.track_conv_indices
                 ].transpose(0, 1)
-                # Apply mask and assign to destinations
-                mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-                conv_states[conv_dst[mask_indices]] = mixed_qkv_to_track
+                conv_states[forward_metadata.conv_states_mask_indices] = (
+                    mixed_qkv_to_track
+                )
 
             if _is_hip:
                 query, key, value = causal_conv1d_fn_split_qkv(

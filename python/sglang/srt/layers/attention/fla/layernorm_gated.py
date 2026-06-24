@@ -286,17 +286,21 @@ def rms_norm_gated(
     """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
 
     x_shape_og = x.shape
-    # reshape input data into 2D tensor
-    x = x.reshape(-1, x.shape[-1])
+    is_2d_input = x.dim() == 2
+    # Keep 2D inputs in 2D; flatten higher-rank callers.
+    if not is_2d_input:
+        x = x.reshape(-1, x.shape[-1])
     if x.stride(-1) != 1:
         x = x.contiguous()
     if z is not None:
         assert z.shape == x_shape_og
-        z = z.reshape(-1, z.shape[-1])
+        if not is_2d_input:
+            z = z.reshape(-1, z.shape[-1])
         if z.stride(-1) != 1:
             z = z.contiguous()
-    weight = weight.contiguous()
-    if bias is not None:
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+    if bias is not None and not bias.is_contiguous():
         bias = bias.contiguous()
     if _is_npu:
         assert activation == "swish", "NPU only supports swish activation"
@@ -311,7 +315,7 @@ def rms_norm_gated(
         is_rms_norm=is_rms_norm,
         activation=activation,
     )
-    return y.reshape(x_shape_og)
+    return y if is_2d_input else y.reshape(x_shape_og)
 
 
 class LayerNormFn(torch.autograd.Function):
