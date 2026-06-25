@@ -78,7 +78,7 @@ def concat_and_cast_mha_k_triton(
         k_nope.stride(1),
         k_rope.stride(0),
         nope_dim,
-        triton.next_power_of_2(nope_dim),
+        256,  # next_power_of_2(192) hardcoded to eliminate CPU overhead
         rope_dim,
     )
 
