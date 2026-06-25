@@ -22,7 +22,8 @@ def concat_and_cast_mha_k_kernel(
 
     k_head_ptr = k_ptr + pid_loc * k_stride0 + head_range[:, None] * k_stride1
 
-    nope_offs = tl.arange(0, nope_dim)
+    nope_offs = tl.arange(0, triton.next_power_of_2(nope_dim))
+    nope_mask = nope_offs[None, :] < nope_dim
 
     src_nope_ptr = (
         k_nope_ptr
@@ -32,8 +33,8 @@ def concat_and_cast_mha_k_kernel(
     )
     dst_nope_ptr = k_head_ptr + nope_offs[None, :]
 
-    src_nope = tl.load(src_nope_ptr)
-    tl.store(dst_nope_ptr, src_nope)
+    src_nope = tl.load(src_nope_ptr, mask=nope_mask, other=0.0)
+    tl.store(dst_nope_ptr, src_nope, mask=nope_mask)
 
     rope_offs = tl.arange(0, rope_dim)
     src_rope_ptr = k_rope_ptr + pid_loc * rope_stride0 + rope_offs[None, :]
