@@ -15,6 +15,7 @@ def concat_and_cast_mha_k_kernel(
     nope_stride1: tl.constexpr,
     rope_stride0: tl.constexpr,
     nope_dim: tl.constexpr,
+    nope_dim_padded: tl.constexpr,
     rope_dim: tl.constexpr,
 ):
     pid_loc = tl.program_id(0)
@@ -22,7 +23,7 @@ def concat_and_cast_mha_k_kernel(
 
     k_head_ptr = k_ptr + pid_loc * k_stride0 + head_range[:, None] * k_stride1
 
-    nope_offs = tl.arange(0, triton.next_power_of_2(nope_dim))
+    nope_offs = tl.arange(0, nope_dim_padded)
     nope_mask = nope_offs[None, :] < nope_dim
 
     src_nope_ptr = (
@@ -77,6 +78,7 @@ def concat_and_cast_mha_k_triton(
         k_nope.stride(1),
         k_rope.stride(0),
         nope_dim,
+        triton.next_power_of_2(nope_dim),
         rope_dim,
     )
 
