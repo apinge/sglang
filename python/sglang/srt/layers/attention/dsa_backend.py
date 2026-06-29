@@ -2179,10 +2179,16 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
 
+        # mla_reduce_v1 only supports bf16/fp16 output; q may arrive as fp8
+        # from fused_qk_rope_cat_and_cache_mla, so allocate o in bf16.
+        out_dtype = torch.bfloat16
         if layer.head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+            o = q.new_empty(
+                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+                dtype=out_dtype,
+            )
         else:
-            o = torch.empty_like(q)
+            o = torch.empty_like(q, dtype=out_dtype)
 
         if self.need_pad_heads:
             q_kernel = q.view(
@@ -2193,7 +2199,8 @@ class DeepseekSparseAttnBackend(
                     q.shape[0],
                     layer.tp_q_head_num * self.head_repeat_factor,
                     layer.v_head_dim,
-                )
+                ),
+                dtype=out_dtype,
             )
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -2203,22 +2210,29 @@ class DeepseekSparseAttnBackend(
         kv_scale = None
         aiter_persistent_kwargs = {}
         if kv_cache.dtype == fp8_dtype:
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
+            q_scale = layer.k_scale if layer.k_scale is not None else torch.ones((), dtype=torch.float32, device=q_kernel.device)
+            kv_scale = q_scale
 
-        kv_indptr = self.kv_indptr
-
+        # Sparse kv_indices: extract valid page addresses from page_table_1.
+        # kv_indptr for sparse indices (used only for extraction, not for kernel).
+        sparse_kv_indptr = self.kv_indptr
         non_minus1_mask = page_table_1 != -1
         non_minus1_counts = non_minus1_mask.sum(dim=1)
-        kv_indptr[1 : bs + 1] = torch.cumsum(non_minus1_counts, dim=0)
+        sparse_kv_indptr[1 : bs + 1] = torch.cumsum(non_minus1_counts, dim=0)
 
         kv_indices = self.kv_indices
-        get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, bs)
+        get_valid_kv_indices(page_table_1, sparse_kv_indptr, kv_indices, bs)
+
+        # Full kv_indptr: cumulative seq_lens (same as aiter test_mla_sparse.py).
+        # Persist metadata and kernel both use full kv_indptr; only kv_indices
+        # is sparse (topk-selected page addresses).
+        full_kv_indptr = metadata.cu_seqlens_k[: bs + 1]
 
         kv_last_page_lens = metadata.cu_seqlens_q
         if kv_cache.dtype == fp8_dtype:
             aiter_persistent_kwargs = self._prepare_aiter_dsa_decode_metadata(
                 metadata.cu_seqlens_q,
-                kv_indptr,
+                full_kv_indptr,
                 bs,
                 metadata.max_seq_len_q,
                 q_kernel.dtype,
@@ -2231,7 +2245,7 @@ class DeepseekSparseAttnBackend(
             kv_cache.view(-1, 1, 1, layer.head_dim),
             o_kernel,
             metadata.cu_seqlens_q,
-            kv_indptr,
+            full_kv_indptr,
             kv_indices,
             kv_last_page_lens,
             metadata.max_seq_len_q,
@@ -2281,7 +2295,8 @@ class DeepseekSparseAttnBackend(
         kv_scale = None
         aiter_persistent_kwargs = {}
         if kv_cache.dtype == fp8_dtype:
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
+            q_scale = layer.k_scale if layer.k_scale is not None else torch.ones((), dtype=torch.float32, device=q_kernel.device)
+            kv_scale = q_scale
 
         non_minus1_mask = page_table_1 != -1
         non_minus1_counts = non_minus1_mask.sum(dim=1)
