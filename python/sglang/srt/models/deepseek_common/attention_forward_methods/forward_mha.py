@@ -169,14 +169,15 @@ class DeepseekMHAForwardMixin:
                     q = self.q_b_proj(q_lora)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                _ = self.indexer(
-                    x=hidden_states,
-                    q_lora=q_lora,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=self.layer_id,
-                    return_indices=False,
-                )
+                if self.indexer is not None:
+                    _ = self.indexer(
+                        x=hidden_states,
+                        q_lora=q_lora,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        layer_id=self.layer_id,
+                        return_indices=False,
+                    )
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
                 # MXFP4: fused RMSNorm + quant
                 q, _, _, _ = fused_rms_mxfp4_quant(
@@ -586,8 +587,17 @@ class DeepseekMHAForwardMixin:
             k = k_nope.new_empty(*k_shape, dtype=attn_dtype)
             concat_and_cast_mha_k_triton(k, k_nope, k_pe)
         elif _is_hip and self.current_attention_backend == "aiter":
-            k = k_nope.new_empty(*k_shape)
-            concat_and_cast_mha_k_triton(k, k_nope, k_pe)
+            if (
+                next_power_of_2(self.num_local_heads) == self.num_local_heads
+                and next_power_of_2(self.qk_nope_head_dim) == self.qk_nope_head_dim
+                and next_power_of_2(self.qk_rope_head_dim) == self.qk_rope_head_dim
+            ):
+                k = k_nope.new_empty(*k_shape)
+                concat_and_cast_mha_k_triton(k, k_nope, k_pe)
+            else:
+                k = k_nope.new_empty(*k_shape)
+                k[..., : self.qk_nope_head_dim] = k_nope
+                k[..., self.qk_nope_head_dim :] = k_pe
         else:
             k = k_nope.new_empty(*k_shape)
             k[..., : self.qk_nope_head_dim] = k_nope

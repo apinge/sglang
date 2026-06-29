@@ -130,6 +130,9 @@ class HfModelConfigParser(ModelConfigParserBase):
             for key in (
                 "qk_rope_head_dim",
                 "index_topk_freq",
+                "indexer_types",
+                "index_skip_topk_offset",
+                "index_share_for_mtp_iteration",
             ):
                 if key in raw_config:
                     setattr(config, key, raw_config[key])

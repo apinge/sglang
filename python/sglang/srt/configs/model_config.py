@@ -181,6 +181,24 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     """Return whether a DSA layer reuses the previous layer's top-k indices."""
     assert is_deepseek_dsa(config)
 
+    # GLM-5.2 MTP layer reuses cached topk.
+    num_hidden_layers = getattr(config, "num_hidden_layers", None)
+    if (
+        num_hidden_layers is not None
+        and layer_id >= num_hidden_layers
+        and getattr(config, "index_share_for_mtp_iteration", False)
+    ):
+        return True
+
+    # GLM-5.2 IndexShare: per-layer schedule from config, authoritative
+    # when present. "shared" layers reuse the prior "full" layer's topk.
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is not None:
+        return (
+            0 <= layer_id < len(indexer_types)
+            and indexer_types[layer_id] == "shared"
+        )
+
     pattern = getattr(config, "index_topk_pattern", None)
     if pattern is not None:
         return layer_id < len(pattern) and pattern[layer_id] == "S"
@@ -198,6 +216,14 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
         return max(layer_id - offset + 1, 0) % freq != 0
 
     return max(layer_id - 1, 0) % freq != 0
+
+
+def dsa_indexer_weights_shared(config: PretrainedConfig, layer_id: int) -> bool:
+    """Return True if this layer's indexer weights are shared (no own weights)."""
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is None:
+        return False
+    return 0 <= layer_id < len(indexer_types) and indexer_types[layer_id] == "shared"
 
 
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
