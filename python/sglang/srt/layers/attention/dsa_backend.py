@@ -2271,10 +2271,15 @@ class DeepseekSparseAttnBackend(
         num_tokens = q_all.shape[0]
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
 
+        # mla_reduce_v1 only supports bf16/fp16 output; q may be fp8.
+        out_dtype = torch.bfloat16
         if layer.head_dim != layer.v_head_dim:
-            o = q.new_empty((num_tokens, layer.tp_q_head_num * layer.v_head_dim))
+            o = q.new_empty(
+                (num_tokens, layer.tp_q_head_num * layer.v_head_dim),
+                dtype=out_dtype,
+            )
         else:
-            o = torch.empty_like(q)
+            o = torch.empty_like(q, dtype=out_dtype)
 
         if self.need_pad_heads:
             q_kernel = q.view(
@@ -2285,7 +2290,8 @@ class DeepseekSparseAttnBackend(
                     num_tokens,
                     layer.tp_q_head_num * self.head_repeat_factor,
                     layer.v_head_dim,
-                )
+                ),
+                dtype=out_dtype,
             )
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -2293,43 +2299,35 @@ class DeepseekSparseAttnBackend(
 
         q_scale = None
         kv_scale = None
-        aiter_persistent_kwargs = {}
         if kv_cache.dtype == fp8_dtype:
             q_scale = layer.k_scale if layer.k_scale is not None else torch.ones((), dtype=torch.float32, device=q_kernel.device)
             kv_scale = q_scale
+            # Non-persist ASM kernel requires q and kv to have matching dtype;
+            # q may arrive as bf16 (e.g. during warmup), cast to fp8.
+            if q_kernel.dtype != fp8_dtype:
+                q_kernel = q_kernel.to(fp8_dtype)
 
+        # Sparse kv_indices from page_table_1.
         non_minus1_mask = page_table_1 != -1
         non_minus1_counts = non_minus1_mask.sum(dim=1)
 
         kv_indptr = torch.zeros(num_tokens + 1, dtype=torch.int32, device=self.device)
         kv_indptr[1:] = torch.cumsum(non_minus1_counts, dim=0)
 
-        # Allocate kv_indices with upper-bound size (num_tokens * topk)
         topk = page_table_1.shape[1]
         kv_indices = torch.zeros(
             num_tokens * topk, dtype=torch.int32, device=self.device
         )
-
-        # Use get_valid_kv_indices kernel to extract valid indices
         get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, num_tokens)
 
-        # Build cu_seqlens_q for extend: each token is treated as seq_len_q=1
         cu_seqlens_q = torch.arange(
             0, num_tokens + 1, dtype=torch.int32, device=self.device
         )
         kv_last_page_lens = cu_seqlens_q
-        if kv_cache.dtype == fp8_dtype:
-            aiter_persistent_kwargs = self._prepare_aiter_dsa_decode_metadata(
-                cu_seqlens_q,
-                kv_indptr,
-                num_tokens,
-                1,
-                q_kernel.dtype,
-                kv_cache.dtype,
-            )
-            kv_last_page_lens = aiter_persistent_kwargs.pop("kv_last_page_lens")
 
-        # TODO support more forward_mode
+        # ATOM's sparse prefill (_forward_prefill_mla) uses mla_decode_fwd
+        # without persist metadata (non-persist), with sparse kv_indptr.
+        # Prefill treats each token as independent decode (max_q_len=1).
         mla_decode_fwd(
             q_kernel,
             kv_cache.view(-1, 1, 1, layer.head_dim),
@@ -2338,12 +2336,11 @@ class DeepseekSparseAttnBackend(
             kv_indptr,
             kv_indices,
             kv_last_page_lens,
-            1,  # max_seq_len_q = 1 for per-token attention
+            1,
             sm_scale=layer.scaling,
             logit_cap=layer.logit_cap,
             q_scale=q_scale,
             kv_scale=kv_scale,
-            **aiter_persistent_kwargs,
         )
 
         if self.need_pad_heads:
