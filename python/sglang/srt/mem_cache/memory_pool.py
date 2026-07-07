@@ -322,7 +322,7 @@ class MambaPool:
             self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
             self.num_mamba_layers = num_mamba_layers
             # Per-slot SSM layout: 0=KV (prefill/extend), 1=VK (HIP/flydsl decode).
-            # Pool-owned so it stays in sync with SSM rows on alloc/copy_from/fork_from;
+            # Pool-owned so it stays in sync with SSM rows on alloc/copy_from;
             # the GDN decode backend shares this tensor for its KV<->VK transpose.
             self.state_layout = torch.zeros(
                 self.size + 1, dtype=torch.int8, device=self.device
@@ -344,14 +344,23 @@ class MambaPool:
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-        # clear at alloc time, fill allocated slots with zeros
-        for i in range(len(self.mamba_cache.conv)):
-            self.mamba_cache.conv[i][:, select_index] = 0
-        self.mamba_cache.temporal[:, select_index] = 0
-        # Zeroed state is layout-agnostic; reset recycled slots to KV.
-        self.state_layout[select_index] = 0
-
         return select_index
+
+    def clear_slots(self, indices: torch.Tensor):
+        """Zero out mamba state at the given pool indices. Must run on forward stream."""
+        need_size = len(indices)
+        for i in range(len(self.mamba_cache.conv)):
+            t = self.mamba_cache.conv[i]
+            z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
+                t.shape[0], need_size, *t.shape[2:]
+            )
+            t[:, indices] = z
+        t = self.mamba_cache.temporal
+        z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
+            t.shape[0], need_size, *t.shape[2:]
+        )
+        t[:, indices] = z
+        self.state_layout[indices] = 0
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -363,25 +372,17 @@ class MambaPool:
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
 
-    def copy_from(self, src_index: torch.Tensor, dst_index: torch.Tensor):
+    def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         for i in range(len(self.mamba_cache.conv)):
-            self.mamba_cache.conv[i][:, dst_index] = self.mamba_cache.conv[i][
-                :, src_index
+            self.mamba_cache.conv[i][:, dst_indices] = self.mamba_cache.conv[i][
+                :, src_indices
             ]
-        self.mamba_cache.temporal[:, dst_index] = self.mamba_cache.temporal[
-            :, src_index
+        self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
+            :, src_indices
         ]
         # Carry the layout bit with the rows; otherwise prefix-cache reuse leaves a
         # stale bit and the KV<->VK transpose corrupts the SSM state.
-        self.state_layout[dst_index] = self.state_layout[src_index]
-        return
-
-    def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
-        dst_index = self.alloc(1)
-        if dst_index == None:
-            return None
-        self.copy_from(src_index, dst_index)
-        return dst_index
+        self.state_layout[dst_indices] = self.state_layout[src_indices]
 
     def get_contiguous_buf_infos(self):
         """
@@ -503,7 +504,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
                 torch.zeros(
                     (size, self.mamba_ping_pong_track_buffer_size),
-                    dtype=torch.int32,
+                    dtype=torch.int64,
                     device=self.device,
                 )
             )
@@ -515,20 +516,19 @@ class HybridReqToTokenPool(ReqToTokenPool):
         if select_index is None:
             return None
 
-        mamba_index = []
-        mamba_ping_pong_track_buffer_list = []
+        mamba_indices: list[torch.Tensor] = []
+        mamba_ping_pong_track_buffers: list[torch.Tensor] = []
         for req in reqs:
-            mid = None
-            if req.mamba_pool_idx is not None:  # for radix cache
-                mid = req.mamba_pool_idx
+            if req.mamba_pool_idx is not None:  # for radix cache / continuing chunked
+                pass
             else:
                 mid = self.mamba_pool.alloc(1)
                 assert (
                     mid is not None
                 ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_pool.available_size()=}, {len(reqs)=}"
-                mid = mid[0]
-                req.mamba_pool_idx = mid
-            mamba_index.append(mid)
+                req.mamba_pool_idx = mid[0]
+                req.mamba_needs_clear = True
+            mamba_indices.append(req.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.mamba_ping_pong_track_buffer is None:
                     req.mamba_ping_pong_track_buffer = self.mamba_pool.alloc(
@@ -538,26 +538,20 @@ class HybridReqToTokenPool(ReqToTokenPool):
                         req.mamba_ping_pong_track_buffer is not None
                     ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
                     req.mamba_next_track_idx = 0
-                mamba_ping_pong_track_buffer_list.append(
-                    req.mamba_ping_pong_track_buffer.tolist()
-                )
+                mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
         assert len(select_index) == len(
-            mamba_index
+            mamba_indices
         ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
         if self.enable_mamba_extra_buffer:
             assert len(select_index) == len(
-                mamba_ping_pong_track_buffer_list
+                mamba_ping_pong_track_buffers
             ), f"Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
-        self.req_index_to_mamba_index_mapping[select_index] = torch.tensor(
-            mamba_index, dtype=torch.int32, device=self.device
-        )
+        mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
+        self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
+            ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
             self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
-                torch.tensor(
-                    mamba_ping_pong_track_buffer_list,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
+                ping_pong_tensor
             )
         return select_index
 
