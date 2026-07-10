@@ -230,6 +230,18 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        pre_quantized = None
+        if (
+            isinstance(x, tuple)
+            and len(x) == 3
+            and isinstance(x[0], torch.Tensor)
+            and isinstance(x[1], torch.Tensor)
+            and isinstance(x[2], torch.Tensor)
+        ):
+            bf16_view, fp8_view, scale_view = x
+            pre_quantized = (fp8_view, scale_view)
+            x = bf16_view
+
         if self.weight_block_size is not None:
             return self.w8a8_block_fp8_linear(
                 input=x,
@@ -249,6 +261,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 bias=bias,
                 use_per_token_if_dynamic=True,
                 compressed_tensor_quant=True,
+                pre_quantized=pre_quantized,
             )
         else:
             return apply_fp8_linear(
@@ -259,4 +272,5 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 bias=bias,
                 use_per_token_if_dynamic=True,
                 compressed_tensor_quant=True,
+                pre_quantized=pre_quantized,
             )

@@ -34,6 +34,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
 )
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
@@ -76,6 +77,10 @@ _is_sm100_supported = _is_cuda and is_sm100_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
+
+if _use_aiter:
+    from aiter import rmsnorm2d_fwd_with_add_dynamicquant as _fused_add_rms_norm_quant
+    from aiter import rmsnorm2d_fwd_with_dynamicquant as _fused_rms_norm_quant
 
 if _use_aiter and _is_gfx95_supported:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -495,6 +500,26 @@ class LayerCommunicator:
                             res1=None,
                             output_unquantized_inp1=False,
                         )
+                    elif _use_aiter and quant_format == "fp8_per_token":
+                        out_fp8 = torch.empty(
+                            hidden_states.shape,
+                            dtype=fp8_dtype,
+                            device=hidden_states.device,
+                        )
+                        out_scale = torch.empty(
+                            hidden_states.shape[0],
+                            1,
+                            dtype=torch.float32,
+                            device=hidden_states.device,
+                        )
+                        _fused_rms_norm_quant(
+                            out_fp8,
+                            hidden_states,
+                            out_scale,
+                            self.input_layernorm.weight,
+                            self.input_layernorm.variance_epsilon,
+                        )
+                        hidden_states = (hidden_states, out_fp8, out_scale)
 
                     else:
                         hidden_states = self.input_layernorm(hidden_states)
@@ -527,6 +552,32 @@ class LayerCommunicator:
                             res1=residual,
                             output_unquantized_inp1=False,
                         )
+                    elif _use_aiter and quant_format == "fp8_per_token":
+                        out_fp8 = torch.empty(
+                            hidden_states.shape,
+                            dtype=fp8_dtype,
+                            device=hidden_states.device,
+                        )
+                        residual_out = torch.empty_like(hidden_states)
+                        out_scale = torch.empty(
+                            hidden_states.shape[0],
+                            1,
+                            dtype=torch.float32,
+                            device=hidden_states.device,
+                        )
+                        if post_residual_addition is not None:
+                            residual = residual + post_residual_addition
+                        _fused_add_rms_norm_quant(
+                            out_fp8,
+                            hidden_states,
+                            residual,
+                            residual_out,
+                            out_scale,
+                            self.input_layernorm.weight,
+                            self.input_layernorm.variance_epsilon,
+                        )
+                        residual = residual_out
+                        hidden_states = (residual_out, out_fp8, out_scale)
                     else:
                         hidden_states, residual = self.input_layernorm(
                             hidden_states,

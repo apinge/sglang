@@ -1305,11 +1305,15 @@ def apply_fp8_ptpc_linear(
     use_per_token_if_dynamic: bool = False,
     pad_output: Optional[bool] = None,
     compressed_tensor_quant: bool = False,
+    pre_quantized: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
 
-    q_input, x_scale = aiter.per_token_quant_hip(input_2d, quant_dtype=aiter.dtypes.fp8)
+    if pre_quantized is not None:
+        q_input, x_scale = pre_quantized
+    else:
+        q_input, x_scale = aiter.per_token_quant_hip(input_2d, quant_dtype=aiter.dtypes.fp8)
 
     # per_tensor_weights = (weight_scale.numel() == 1) and weight_scale.dim() < 2
     # per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2

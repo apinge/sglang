@@ -893,6 +893,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         self.alt_stream = alt_stream
 
+        self._fuse_rmsnorm_quant = (
+            _use_aiter
+            and not is_dp_attention_enabled()
+            and attn_quant_config is not None
+            and hasattr(attn_quant_config, "get_name")
+            and "compressed" in attn_quant_config.get_name()
+        )
+
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -961,8 +969,15 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs,
     ):
+        _fuse_quant = (
+            self._fuse_rmsnorm_quant
+            and not forward_batch.forward_mode.is_idle()
+        )
         hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+            hidden_states,
+            residual,
+            forward_batch,
+            quant_format="fp8_per_token" if _fuse_quant else "",
         )
 
         if not forward_batch.forward_mode.is_idle():
