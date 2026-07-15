@@ -24,6 +24,7 @@ class DSATopKBackend(Enum):
     SGL_KERNEL = "sgl-kernel"
     TORCH = "torch"
     FLASHINFER = "flashinfer"
+    AITER = "aiter"
 
     def is_sgl_kernel(self) -> bool:
         return self == DSATopKBackend.SGL_KERNEL
@@ -33,6 +34,9 @@ class DSATopKBackend(Enum):
 
     def is_flashinfer(self) -> bool:
         return self == DSATopKBackend.FLASHINFER
+
+    def is_aiter(self) -> bool:
+        return self == DSATopKBackend.AITER
 
     def topk_func(
         self,
@@ -45,6 +49,8 @@ class DSATopKBackend(Enum):
             from sgl_kernel import fast_topk_v2
 
             return fast_topk_v2(score, lengths, topk, row_starts=row_starts)
+        if self.is_aiter():
+            return _topk_aiter(score, lengths, topk, row_starts=row_starts)
         if self.is_torch():
             return _topk_unfused(
                 score,
@@ -206,6 +212,54 @@ def _topk_unfused(
 
     return topk_indices
 
+
+def _topk_aiter(
+    score: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    row_starts: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Per-row top-k via aiter's ROCm radix kernel (``top_k_per_row_prefill``).
+
+    Returns ``(batch_size, topk)`` int32 row-LOCAL indices, ``-1`` padded --
+    the same contract as ``_topk_unfused``. The aiter kernel treats each row as
+    the window ``score[row, row_starts[row] : row_ends[row]]`` and emits ABSOLUTE
+    column indices (``local + row_start``); we subtract ``row_starts`` to return
+    the row-local indices the DSA indexer expects.
+    """
+    from aiter import top_k_per_row_prefill
+
+    batch_size, max_score_len = score.shape
+    topk_indices = score.new_full((batch_size, topk), -1, dtype=torch.int32)
+    if batch_size == 0 or topk == 0 or max_score_len == 0:
+        return topk_indices
+
+    score = score.to(torch.float32)
+    lengths = lengths.to(dtype=torch.int32, device=score.device)
+    if row_starts is None:
+        row_starts = torch.zeros_like(lengths)
+    else:
+        row_starts = row_starts.to(dtype=torch.int32, device=score.device)
+    row_ends = row_starts + lengths
+
+    top_k_per_row_prefill(
+        score,
+        row_starts,
+        row_ends,
+        topk_indices,
+        None,  # values (unused)
+        batch_size,
+        score.stride(0),
+        score.stride(1),
+        k=topk,
+    )
+
+    # aiter emits absolute column indices; convert to row-local, keep -1 padding.
+    valid = topk_indices != -1
+    topk_indices = torch.where(
+        valid, topk_indices - row_starts.unsqueeze(1), topk_indices
+    )
+    return topk_indices
 
 def _build_flashinfer_paged_args(
     attn_metadata,

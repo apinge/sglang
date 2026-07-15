@@ -1662,13 +1662,26 @@ class DeepseekSparseAttnBackend(
                     mask, topk_indices + topk_indices_offset, topk_indices
                 )
             elif topk_transform_method == TopkTransformMethod.PAGED:
-                assert metadata.dsa_extend_seq_lens_list is not None
-                page_table_1 = transform_index_page_table_prefill(
-                    page_table=metadata.page_table_1,
-                    topk_indices=topk_indices,
-                    extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
-                    page_size=1,
-                )
+                if metadata.page_table_1.shape[0] == topk_indices.shape[0]:
+                    # Target-verify / draft-extend-v2 expand each request into one
+                    # page-table row per draft query (page_table is
+                    # repeat_interleaved to bs*num_draft rows), so rows align 1:1
+                    # with topk_indices -- the decode transform applies directly.
+                    # The ragged prefill transform's extend_lens segmentation
+                    # (len == batch_size) would mismatch page_table.shape[0] here.
+                    page_table_1 = transform_index_page_table_decode(
+                        page_table=metadata.page_table_1,
+                        topk_indices=topk_indices,
+                        page_size=1,
+                    )
+                else:
+                    assert metadata.dsa_extend_seq_lens_list is not None
+                    page_table_1 = transform_index_page_table_prefill(
+                        page_table=metadata.page_table_1,
+                        topk_indices=topk_indices,
+                        extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
+                        page_size=1,
+                    )
 
         # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
