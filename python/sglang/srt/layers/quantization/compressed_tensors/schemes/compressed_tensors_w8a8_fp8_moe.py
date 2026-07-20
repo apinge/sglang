@@ -4,6 +4,7 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 from compressed_tensors.quantization import QuantizationStrategy
 
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
@@ -27,7 +28,12 @@ from sglang.srt.layers.quantization.utils import (
     swap_w13_to_w31,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_int_env_var,
+    is_hip,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -314,18 +320,72 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             )
 
         if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
+            padding_size = get_int_env_var("AITER_MOE_PADDING_SIZE")
+            N = layer.w2_weight.shape[-1]
+            if padding_size:
+                pad_size = (padding_size - (N % padding_size)) % padding_size
+            else:
+                pad_size = 0
+
             with torch.no_grad():
-                # Pre-shuffle weights
-                layer.w13_weight = torch.nn.Parameter(
-                    shuffle_weight(layer.w13_weight.data, (16, 16)),
-                    requires_grad=False,
-                )
-                torch.cuda.empty_cache()
-                layer.w2_weight = torch.nn.Parameter(
-                    shuffle_weight(layer.w2_weight.data, (16, 16)),
-                    requires_grad=False,
-                )
-                torch.cuda.empty_cache()
+                if pad_size:
+                    part1_s = layer.w13_weight_scale.data[:, :N, :]
+                    part2_s = layer.w13_weight_scale.data[:, N:, :]
+                    part1_sp = F.pad(
+                        part1_s,
+                        (0, 0, 0, pad_size, 0, 0),
+                        mode="constant",
+                        value=0,
+                    )
+                    part2_sp = F.pad(
+                        part2_s,
+                        (0, 0, 0, pad_size, 0, 0),
+                        mode="constant",
+                        value=0,
+                    )
+                    layer.w13_weight_scale = torch.nn.Parameter(
+                        torch.cat([part1_sp, part2_sp], dim=1),
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
+
+                    part1_w = layer.w13_weight.data[:, :N, :]
+                    part2_w = layer.w13_weight.data[:, N:, :]
+                    part1_wp = F.pad(
+                        part1_w, (0, 0, 0, pad_size, 0, 0), mode="constant", value=0
+                    )
+                    part2_wp = F.pad(
+                        part2_w, (0, 0, 0, pad_size, 0, 0), mode="constant", value=0
+                    )
+                    padded_w13 = torch.cat([part1_wp, part2_wp], dim=1)
+                    layer.w13_weight = torch.nn.Parameter(
+                        shuffle_weight(padded_w13, (16, 16)),
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
+
+                    padded_w2 = F.pad(
+                        layer.w2_weight.data,
+                        (0, pad_size, 0, 0, 0, 0),
+                        "constant",
+                        0,
+                    )
+                    layer.w2_weight = torch.nn.Parameter(
+                        shuffle_weight(padded_w2, (16, 16)),
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
+                else:
+                    layer.w13_weight = torch.nn.Parameter(
+                        shuffle_weight(layer.w13_weight.data, (16, 16)),
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
+                    layer.w2_weight = torch.nn.Parameter(
+                        shuffle_weight(layer.w2_weight.data, (16, 16)),
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
 
         if (
             self.weight_quant.strategy == QuantizationStrategy.BLOCK

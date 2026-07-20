@@ -4264,7 +4264,7 @@ class ServerArgs:
             view, model_arch
         ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
         assert (
-            is_cuda() or is_musa() or is_npu()
+            is_cuda() or is_musa() or is_npu() or is_hip()
         ), "extra_buffer needs CUDA/MUSA/NPU (FLA)."
         if view.speculative_num_draft_tokens is not None:
             assert (
