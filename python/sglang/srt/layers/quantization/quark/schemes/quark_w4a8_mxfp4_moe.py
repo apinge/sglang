@@ -36,7 +36,7 @@ __all__ = ["QuarkW4A8MXFp4MoE"]
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
-    from aiter.ops.shuffle import (
+    from sglang.srt.layers.quantization.aiter_shuffle_compat import (
         shuffle_scale,
         shuffle_scale_a16w4,
         shuffle_weight,
