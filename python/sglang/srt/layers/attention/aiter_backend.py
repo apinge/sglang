@@ -1775,9 +1775,15 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 else:
                     custom_mask = self.cuda_graph_custom_mask
-                    custom_mask[: spec_info.custom_mask.shape[0]] = (
-                        spec_info.custom_mask
-                    )
+                    if (
+                        spec_info is not None
+                        and getattr(spec_info, "custom_mask", None) is not None
+                    ):
+                        custom_mask[: spec_info.custom_mask.shape[0]] = (
+                            spec_info.custom_mask
+                        )
+                    else:
+                        custom_mask = None
                     seq_mask_len = max_q_len * (seq_lens + max_q_len)
                     mask_indptr = self.mask_indptr[: bs + 1]
                     mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
@@ -2267,6 +2273,13 @@ class AiterAttnBackend(AttentionBackend):
                     )
                     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+                if layer.k_scale is not None and layer.v_scale is not None:
+                    k_extend_descale = layer.k_scale_float
+                    v_extend_descale = layer.v_scale_float
+                else:
+                    k_extend_descale = 1.0
+                    v_extend_descale = 1.0
+
                 self.extend_attention_fwd(
                     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k.contiguous(),
@@ -2281,8 +2294,8 @@ class AiterAttnBackend(AttentionBackend):
                     True,  # causal
                     self.forward_metadata.mask_indptr,
                     self.forward_metadata.max_extend_len,
-                    1.0,  # k_scale
-                    1.0,  # v_scale
+                    k_extend_descale,
+                    v_extend_descale,
                     layer.scaling,
                     logit_cap=layer.logit_cap,
                 )
