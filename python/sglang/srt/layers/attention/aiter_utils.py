@@ -69,9 +69,10 @@ def forward_extend_vectorized_5d(
        SHUFFLE 5D pool via ``launch_gather_shuffle_5d_to_linear``
        (triton inverse of the SHUFFLE writer) into a contiguous
        ``(T, H, D)`` buffer in the cache's ``store_dtype``, then run the
-       same LINEAR prefill. fp8-store layers are forwarded to aiter as
-       raw fp8 with the per-tensor descales — aiter's LINEAR-mode kernel
-       supports fp8 K/V/Q natively, so no host-side dequant is needed.
+       same LINEAR prefill. fp8-store layers are dequantized to the
+       backend input dtype before calling aiter's LINEAR-mode kernel; this
+       avoids the old aiter fp8 prefill variant, which has shown GPU memory
+       faults in the DFlash 5D verify path.
 
     The fallback exists because aiter's paged ``mha_batch_prefill_func``
     lacks a compiled kernel for our
@@ -81,6 +82,12 @@ def forward_extend_vectorized_5d(
     Returns the ``(T, H_q * D_v)`` attention output, ready to be
     returned from ``AiterAttnBackend.forward_extend``.
     """
+    qo_indptr = backend.forward_metadata.qo_indptr
+    if qo_indptr is None:
+        qo_indptr = backend.qo_indptr[:bs0]
+    else:
+        qo_indptr = qo_indptr[:bs0]
+
     # Path 1: fresh-prompt shortcut.
     extend_no_prefix = forward_batch.extend_prefix_lens_cpu is not None and not any(
         forward_batch.extend_prefix_lens_cpu
@@ -92,13 +99,13 @@ def forward_extend_vectorized_5d(
         kv_indices_lin = torch.arange(
             total_tokens, dtype=torch.int32, device=k_lin.device
         )
-        kv_indptr_lin = backend.qo_indptr[:bs0]
+        kv_indptr_lin = qo_indptr
         max_q = int(backend.forward_metadata.max_q_len)
         o = mha_batch_prefill_func(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             k_lin,
             v_lin,
-            backend.qo_indptr[:bs0],
+            qo_indptr,
             kv_indptr_lin,
             kv_indices_lin,
             max_q,
@@ -129,7 +136,10 @@ def forward_extend_vectorized_5d(
         and layer.sliding_window_size > -1
         and backend.forward_metadata.swa_page_table is not None
     )
-    total_kv = int(forward_batch.seq_lens_sum)
+    if backend.forward_metadata.kv_indptr is not None:
+        total_kv = int(backend.forward_metadata.kv_indptr[-1].item())
+    else:
+        total_kv = int(forward_batch.seq_lens_sum)
     if is_swa_layer:
         slot_ids = backend.forward_metadata.swa_page_table[:total_kv]
     else:
@@ -141,6 +151,11 @@ def forward_extend_vectorized_5d(
     if hasattr(pool, "layers_mapping"):
         sub_layer_id, sub_is_swa = pool.layers_mapping[layer.layer_id]
         sub_pool = pool.swa_kv_pool if sub_is_swa else pool.full_kv_pool
+    elif hasattr(pool, "full_attention_layer_id_mapping") and hasattr(
+        pool, "full_kv_pool"
+    ):
+        sub_layer_id = pool.full_attention_layer_id_mapping[layer.layer_id]
+        sub_pool = pool.full_kv_pool
     else:
         sub_pool = pool
         sub_layer_id = layer.layer_id
@@ -157,19 +172,18 @@ def forward_extend_vectorized_5d(
         k_lin = k_lin.view(sub_pool.dtype)
         v_lin = v_lin.view(sub_pool.dtype)
 
-    # For fp8 K/V we hand the raw fp8 tensors and the layer's per-tensor
-    # descales straight to aiter.
+    # Keep LINEAR prefill on bf16 for old aiter. Its fp8 prefill variant is
+    # fragile on the DFlash 5D gather path; dequantizing the compact gathered
+    # K/V is slower but keeps this fallback deterministic and contained.
     if sub_pool.dtype == fp8_dtype:
-        q_local = q.to(fp8_dtype)
-        q_descale_local = (
-            layer.k_scale if layer.k_scale is not None else backend.k_scale
-        )
-        k_descale_local = (
-            layer.k_scale if layer.k_scale is not None else backend.k_scale
-        )
-        v_descale_local = (
-            layer.v_scale if layer.v_scale is not None else backend.v_scale
-        )
+        k_scale = layer.k_scale if layer.k_scale is not None else backend.k_scale
+        v_scale = layer.v_scale if layer.v_scale is not None else backend.v_scale
+        k_lin = (k_lin.to(backend.input_dtype) * k_scale).to(backend.input_dtype)
+        v_lin = (v_lin.to(backend.input_dtype) * v_scale).to(backend.input_dtype)
+        q_local = q
+        q_descale_local = None
+        k_descale_local = None
+        v_descale_local = None
     else:
         q_local = q
         q_descale_local = None
@@ -185,7 +199,7 @@ def forward_extend_vectorized_5d(
         q_local.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
         k_lin,
         v_lin,
-        backend.qo_indptr[:bs0],
+        qo_indptr,
         kv_indptr_lin,
         kv_indices_lin,
         max_q,
@@ -298,6 +312,7 @@ def forward_decode_vectorized_5d(
         max_context_partition_num=max_part_num,
         context_partition_size=ctx_part,
         compute_type=backend.input_dtype,
+        query_scale=None,
         key_scale=key_scale,
         value_scale=value_scale,
         exp_sums=exp_sums,

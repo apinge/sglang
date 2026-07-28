@@ -638,6 +638,17 @@ class ModelRunnerKVCacheMixin:
         mha_pool_class = (
             PageMajorMHATokenToKVPool if enable_page_major else MHATokenToKVPool
         )
+        draft_mha_kv_cache_layout = None
+        if (
+            self.is_draft_worker
+            and not enable_page_major
+            and self.server_args.speculative_draft_attention_backend not in ("aiter",)
+            and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
+        ):
+            # SGLANG_AITER_KV_CACHE_LAYOUT is process-global. Keep it for the
+            # target AITER/pa_gluon backend, but draft workers can be forced to
+            # Triton/FlashInfer; those kernels do not consume SHUFFLE 5D buffers.
+            draft_mha_kv_cache_layout = "nhd"
 
         if is_dsv4_model:
             swa_page_size = self.page_size
@@ -1038,6 +1049,7 @@ class ModelRunnerKVCacheMixin:
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
                         ),
+                        kv_cache_layout=draft_mha_kv_cache_layout,
                     )
 
         # Initialize token_to_kv_pool_allocator
