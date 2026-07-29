@@ -41,6 +41,8 @@ concurrency:
 
 env:
   SGLANG_BENCHMARK_PORT: "8080"
+  HOST_MODELS_ROOT: /raids/models
+  CONTAINER_MODELS_ROOT: /models
   SGLANG_BENCHMARK_EXAMPLE_ROOT: /models/benchamark_example
   SGLANG_BENCHMARK_RESULTS_DIR: benchmark_test_results
   SGLANG_GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/apinge/sglang.git' }}
@@ -136,23 +138,25 @@ jobs:
         run: |
           set -euo pipefail
 
+          host_models_root="${{ env.HOST_MODELS_ROOT }}"
+          container_models_root="${{ env.CONTAINER_MODELS_ROOT }}"
           model_name='${{ matrix.model }}'
           workflow_image='${{ github.event.inputs.image || '' }}'
           case "${model_name}" in
             offical_qwen3p5_397B_ptpc)
-              model_path="/models/offical_qwen3p5_397B_ptpc"
+              model_dir="offical_qwen3p5_397B_ptpc"
               model_image="rocm/ali-private:ubuntu22.04_rocm7.2.0.43_cp310_torch2.9.1_sglang_3038fa5_aiter_ea051b0_qwen3_5_20260710_v2"
               model_tp="8"
               model_vlm_cache_size_mb="0"
               ;;
             Qwen3.5-27B-PTPC-compressor)
-              model_path="/models/Qwen3.5-27B-PTPC-compressor"
+              model_dir="Qwen3.5-27B-PTPC-compressor"
               model_image="rocm/ali-private:ubuntu22.04_rocm7.2.0.43_cp310_torch2.9.1_sglang_3038fa5_aiter_ea051b0_qwen3_5_20260710_v2"
               model_tp="1"
               model_vlm_cache_size_mb="8192"
               ;;
             Qwen3.5-35B-A3B-PTPC-compressor)
-              model_path="/models/Qwen3.5-35B-A3B-PTPC-FP8"
+              model_dir="Qwen3.5-35B-A3B-PTPC-FP8"
               model_image="rocm/ali-private:ubuntu22.04_rocm7.2.0.43_cp310_torch2.9.1_sglang_3038fa5_aiter_ea051b0_qwen3_5_20260710_v2"
               model_tp="4"
               model_vlm_cache_size_mb="8192"
@@ -163,17 +167,24 @@ jobs:
               ;;
           esac
 
+          model_path_host="${host_models_root}/${model_dir}"
+          model_path="${container_models_root}/${model_dir}"
+
           if [ -n "${workflow_image}" ]; then
             model_image="${workflow_image}"
           fi
 
           echo "MODEL_NAME=${model_name}" >> "${GITHUB_ENV}"
+          echo "MODEL_DIR=${model_dir}" >> "${GITHUB_ENV}"
           echo "MODEL_PATH=${model_path}" >> "${GITHUB_ENV}"
+          echo "MODEL_PATH_HOST=${model_path_host}" >> "${GITHUB_ENV}"
           echo "MODEL_IMAGE=${model_image}" >> "${GITHUB_ENV}"
           echo "MODEL_TP=${model_tp}" >> "${GITHUB_ENV}"
           echo "MODEL_VLM_CACHE_SIZE_MB=${model_vlm_cache_size_mb}" >> "${GITHUB_ENV}"
           echo "Resolved model_name: ${model_name}"
-          echo "Resolved model_path: ${model_path}"
+          echo "Resolved model_dir: ${model_dir}"
+          echo "Resolved model_path (container): ${model_path}"
+          echo "Resolved model_path (host): ${model_path_host}"
           echo "Resolved model_image: ${model_image}"
           echo "Resolved model_tp: ${model_tp}"
           echo "Resolved model_vlm_cache_size_mb: ${model_vlm_cache_size_mb}"
@@ -238,32 +249,35 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -z "${MODEL_NAME:-}" ] || [ -z "${MODEL_PATH:-}" ] || [ -z "${MODEL_IMAGE:-}" ] || [ -z "${MODEL_TP:-}" ] || [ -z "${MODEL_VLM_CACHE_SIZE_MB:-}" ]; then
+          if [ -z "${MODEL_NAME:-}" ] || [ -z "${MODEL_PATH:-}" ] || [ -z "${MODEL_PATH_HOST:-}" ] || [ -z "${MODEL_IMAGE:-}" ] || [ -z "${MODEL_TP:-}" ] || [ -z "${MODEL_VLM_CACHE_SIZE_MB:-}" ]; then
             echo "Model config is not set correctly."
             exit 1
           fi
 
-          if [ ! -d "${MODEL_PATH}" ]; then
-            echo "Expected model directory not found: ${MODEL_PATH}"
-            ls -lah /models
+          if [ ! -d "${MODEL_PATH_HOST}" ]; then
+            echo "Expected model directory not found on host: ${MODEL_PATH_HOST}"
+            echo "Container path will be: ${MODEL_PATH}"
+            ls -lah "${{ env.HOST_MODELS_ROOT }}"
             exit 1
           fi
 
-          ls -lah /models
-          du -sh "${MODEL_PATH}"
+          ls -lah "${{ env.HOST_MODELS_ROOT }}"
+          du -sh "${MODEL_PATH_HOST}"
 
       - name: Validate benchmark scripts
         if: ${{ matrix.job_mode == 'benchmark' }}
         run: |
           set -euo pipefail
 
-          script_path="${{ env.SGLANG_BENCHMARK_EXAMPLE_ROOT }}/${BENCHMARK_TARGET}/run.sh"
+          benchmark_example_host="${{ env.HOST_MODELS_ROOT }}/benchamark_example"
+          script_path="${benchmark_example_host}/${BENCHMARK_TARGET}/run.sh"
           if [ ! -f "${script_path}" ]; then
-            echo "Expected benchmark script not found: ${script_path}"
+            echo "Expected benchmark script not found on host: ${script_path}"
+            echo "Container path will be: ${{ env.SGLANG_BENCHMARK_EXAMPLE_ROOT }}/${BENCHMARK_TARGET}/run.sh"
             exit 1
           fi
 
-          ls -lah "${{ env.SGLANG_BENCHMARK_EXAMPLE_ROOT }}"
+          ls -lah "${benchmark_example_host}"
 
       - name: Generate Dockerfile
         run: |
@@ -328,7 +342,7 @@ jobs:
             -e SGLANG_BENCHMARK_PORT=${{ env.SGLANG_BENCHMARK_PORT }} \
             -e SGLANG_BENCHMARK_EXAMPLE_ROOT=${{ env.SGLANG_BENCHMARK_EXAMPLE_ROOT }} \
             -e SGLANG_BENCHMARK_RESULTS_DIR=${{ env.SGLANG_BENCHMARK_RESULTS_DIR }} \
-            -v /raids/models:/models:ro \
+            -v ${{ env.HOST_MODELS_ROOT }}:${{ env.CONTAINER_MODELS_ROOT }}:ro \
             --security-opt seccomp=unconfined \
             -w /sglang-checkout \
             --name "${CONTAINER_NAME}" \
@@ -344,7 +358,7 @@ jobs:
       - name: Show model and shared memory status
         run: |
           docker exec "${CONTAINER_NAME}" bash -lc "df -h /dev/shm"
-          docker exec "${CONTAINER_NAME}" bash -lc "ls -lah /models"
+          docker exec "${CONTAINER_NAME}" bash -lc "ls -lah ${{ env.CONTAINER_MODELS_ROOT }}"
           docker exec "${CONTAINER_NAME}" bash -lc "du -sh \"${MODEL_PATH}\""
 
       - name: Launch the server
