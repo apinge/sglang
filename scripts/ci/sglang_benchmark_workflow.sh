@@ -10,12 +10,26 @@ EP=${5:-1}
 TIMEOUT=${6:-45}
 PORT=${SGLANG_BENCHMARK_PORT:-8080}
 GSM8K_NUM_QUESTIONS=${SGLANG_BENCHMARK_GSM8K_NUM_QUESTIONS:-200}
-GSM8K_PARALLEL=${SGLANG_BENCHMARK_GSM8K_PARALLEL:-128}
+GSM8K_PARALLEL=${SGLANG_BENCHMARK_GSM8K_PARALLEL:-64}
 GSM8K_MAX_NEW_TOKENS=${SGLANG_BENCHMARK_GSM8K_MAX_NEW_TOKENS:-4096}
+GSM8K_TOKENIZER_PATH=${SGLANG_BENCHMARK_GSM8K_TOKENIZER_PATH:-}
 ACCURACY_RESULTS_DIR=${SGLANG_BENCHMARK_ACCURACY_RESULTS_DIR:-accuracy_test_results}
 SERVER_LOG=${SGLANG_BENCHMARK_SERVER_LOG:-/tmp/sglang_qwen35_server.log}
+SERVER_PORT_FILE="${SERVER_LOG}.port"
 BENCHMARK_RESULTS_DIR=${SGLANG_BENCHMARK_RESULTS_DIR:-benchmark_test_results}
 BENCHMARK_EXAMPLE_ROOT=${SGLANG_BENCHMARK_EXAMPLE_ROOT:-/models/benchamark_example}
+PURE_TEXT_INPUT_TOKENS=${SGLANG_BENCHMARK_PURE_TEXT_INPUT_TOKENS:-8000}
+PURE_TEXT_OUTPUT_TOKENS=${SGLANG_BENCHMARK_PURE_TEXT_OUTPUT_TOKENS:-500}
+PURE_TEXT_NUM_PROMPTS=${SGLANG_BENCHMARK_PURE_TEXT_NUM_PROMPTS:-32}
+PURE_TEXT_MAX_CONCURRENCY=${SGLANG_BENCHMARK_PURE_TEXT_MAX_CONCURRENCY:-1}
+
+if [[ -z "${SGLANG_BENCHMARK_PORT:-}" && -f "${SERVER_PORT_FILE}" ]]; then
+  PORT=$(<"${SERVER_PORT_FILE}")
+fi
+
+is_397b_model() {
+  [[ "${MODEL_NAME}" == "offical_qwen3p5_397B_ptpc" || "${MODEL_NAME}" == "Qwen3.5-397B-A17B-PTPC-FP8" ]]
+}
 
 export SGLANG_DISABLE_CUDNN_CHECK=1
 export SGLANG_USE_CUDA_IPC_TRANSPORT=1
@@ -24,26 +38,30 @@ export SGLANG_USE_AITER=1
 export SGLANG_ROCM_USE_AITER_LINEAR_SHUFFLE=1
 export SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB=1
 export SGLANG_USE_AITER_NEW_CA=false
-export USE_HIP_LINEAR_ATTN="${USE_HIP_LINEAR_ATTN:-1}"
 export SGLANG_USE_IPC_POOL_HANDLE_CACHE="${SGLANG_USE_IPC_POOL_HANDLE_CACHE:-1}"
 export HIP_GDN_SORT_IDX_BS="${HIP_GDN_SORT_IDX_BS:-32768}"
+export TVM_FFI_DISABLE_TORCH_C_DLPACK="${TVM_FFI_DISABLE_TORCH_C_DLPACK:-1}"
 
 # Model-specific aiter tuning (from the validated launch references).
 if [[ "${MODEL_NAME}" == "Qwen3.5-27B-PTPC-compressor" ]]; then
   export AITER_QUICK_REDUCE_QUANTIZATION="${AITER_QUICK_REDUCE_QUANTIZATION:-INT8}"
   export SGLANG_DISABLE_AITER_FUSED_AR_RMSNORM="${SGLANG_DISABLE_AITER_FUSED_AR_RMSNORM:-1}"
+  export USE_HIP_LINEAR_ATTN="${USE_HIP_LINEAR_ATTN:-1}"
 elif [[ "${MODEL_NAME}" == "Qwen3.5-35B-A3B-PTPC-compressor" ]]; then
-  export AITER_QUICK_REDUCE_QUANTIZATION="${AITER_QUICK_REDUCE_QUANTIZATION:-INT6}"
   export USE_AITER_COMM="${USE_AITER_COMM:-1}"
   export AITER_MOE_SMALL_BATCH="${AITER_MOE_SMALL_BATCH:-1}"
-  export TVM_FFI_DISABLE_TORCH_C_DLPACK="${TVM_FFI_DISABLE_TORCH_C_DLPACK:-1}"
-  export USE_HIP_LINEAR_ATTN=0
-elif [[ "${MODEL_NAME}" == "offical_qwen3p5_397B_ptpc" ]]; then
-  export AITER_QUICK_REDUCE_QUANTIZATION="${AITER_QUICK_REDUCE_QUANTIZATION:-INT6}"
+  unset USE_HIP_LINEAR_ATTN 2>/dev/null || true
+  unset AITER_QUICK_REDUCE_QUANTIZATION 2>/dev/null || true
+elif is_397b_model; then
   export USE_AITER_COMM="${USE_AITER_COMM:-1}"
+  export AITER_MOE_SMALL_BATCH="${AITER_MOE_SMALL_BATCH:-1}"
+  export USE_HIP_LINEAR_ATTN="${USE_HIP_LINEAR_ATTN:-1}"
+  export AITER_MOE_PADDING_SIZE="${AITER_MOE_PADDING_SIZE:-192}"
+  unset AITER_QUICK_REDUCE_QUANTIZATION 2>/dev/null || true
+else
+  export AITER_QUICK_REDUCE_QUANTIZATION="${AITER_QUICK_REDUCE_QUANTIZATION:-INT6}"
+  export USE_HIP_LINEAR_ATTN="${USE_HIP_LINEAR_ATTN:-1}"
 fi
-# Fallback quick-reduce level for any other model.
-export AITER_QUICK_REDUCE_QUANTIZATION="${AITER_QUICK_REDUCE_QUANTIZATION:-INT6}"
 
 echo "Detect TYPE: ${TYPE}"
 echo "Detect model_name: ${MODEL_NAME}"
@@ -100,16 +118,31 @@ print_launch_recipe() {
   echo "export USE_HIP_LINEAR_ATTN=${USE_HIP_LINEAR_ATTN:-}"
   echo "export SGLANG_USE_IPC_POOL_HANDLE_CACHE=${SGLANG_USE_IPC_POOL_HANDLE_CACHE}"
   echo "export HIP_GDN_SORT_IDX_BS=${HIP_GDN_SORT_IDX_BS}"
-  echo "export AITER_QUICK_REDUCE_QUANTIZATION=${AITER_QUICK_REDUCE_QUANTIZATION}"
+  echo "export AITER_QUICK_REDUCE_QUANTIZATION=${AITER_QUICK_REDUCE_QUANTIZATION:-}"
   if [[ -n "${USE_AITER_COMM:-}" ]]; then
     echo "export USE_AITER_COMM=${USE_AITER_COMM}"
+  fi
+  if [[ -n "${AITER_MOE_SMALL_BATCH:-}" ]]; then
+    echo "export AITER_MOE_SMALL_BATCH=${AITER_MOE_SMALL_BATCH}"
+  fi
+  if [[ -n "${AITER_MOE_PADDING_SIZE:-}" ]]; then
+    echo "export AITER_MOE_PADDING_SIZE=${AITER_MOE_PADDING_SIZE}"
   fi
   if [[ -n "${SGLANG_DISABLE_AITER_FUSED_AR_RMSNORM:-}" ]]; then
     echo "export SGLANG_DISABLE_AITER_FUSED_AR_RMSNORM=${SGLANG_DISABLE_AITER_FUSED_AR_RMSNORM}"
   fi
+  if [[ -n "${TVM_FFI_DISABLE_TORCH_C_DLPACK:-}" ]]; then
+    echo "export TVM_FFI_DISABLE_TORCH_C_DLPACK=${TVM_FFI_DISABLE_TORCH_C_DLPACK}"
+  fi
 
   echo
   echo "setup server for TP${TP}:"
+  local chunked_prefill_size=32768
+  local max_prefill_tokens=32768
+  if is_397b_model; then
+    chunked_prefill_size=65536
+    max_prefill_tokens=65536
+  fi
   cat <<EOF
 nohup python3 -m sglang.launch_server \\
   --port ${PORT} \\
@@ -120,11 +153,15 @@ nohup python3 -m sglang.launch_server \\
   --tool-call-parser qwen3_coder \\
   --enable-multimodal \\
   --trust-remote-code \\
-  --chunked-prefill-size 32768 \\
+  --chunked-prefill-size ${chunked_prefill_size} \\
   --mem-fraction-static 0.9 \\
-  --max-prefill-tokens 32768 \\
+  --max-prefill-tokens ${max_prefill_tokens} \\
   --max-running-requests 128 \\
-  --cuda-graph-max-bs 128 \\
+EOF
+  if [[ "${MODEL_NAME}" != "Qwen3.5-35B-A3B-PTPC-compressor" ]] && ! is_397b_model; then
+    echo "  --cuda-graph-max-bs 128 \\"
+  fi
+  cat <<EOF
   --kv-cache-dtype fp8_e4m3 \\
   --disable-radix-cache \\
   --mm-attention-backend aiter_attn \\
@@ -401,6 +438,51 @@ run_external_benchmark() {
   verify_external_benchmark_log "${log_path}"
 }
 
+ensure_server_ready() {
+  if curl -sf "http://localhost:${PORT}/v1/models" >/dev/null; then
+    return 0
+  fi
+
+  echo "SGLang server is not reachable on port ${PORT}."
+  if [[ -f "${SERVER_PORT_FILE}" ]]; then
+    saved_port=$(<"${SERVER_PORT_FILE}")
+    if [[ "${saved_port}" != "${PORT}" ]]; then
+      echo "Hint: the last successful launch used port ${saved_port}. Re-run with:"
+      echo "  export SGLANG_BENCHMARK_PORT=${saved_port}"
+    fi
+  fi
+  return 1
+}
+
+run_pure_text_benchmark() {
+  local log_path="${BENCHMARK_RESULTS_DIR}/pure_text_benchmark_${MODEL_NAME}_TP${TP}_EP${EP}.log"
+
+  echo
+  echo "========== STARTING PURE TEXT BENCHMARK =========="
+  ensure_server_ready
+
+  mkdir -p "${BENCHMARK_RESULTS_DIR}"
+  echo "bench model: ${MODEL_PATH}"
+  echo "input tokens: ${PURE_TEXT_INPUT_TOKENS}"
+  echo "output tokens: ${PURE_TEXT_OUTPUT_TOKENS}"
+  echo "max concurrency: ${PURE_TEXT_MAX_CONCURRENCY}"
+  echo "num prompts: ${PURE_TEXT_NUM_PROMPTS}"
+  echo "dataset-name: random"
+
+  python3 -m sglang.bench_serving \
+    --backend sglang \
+    --model "${MODEL_PATH}" \
+    --dataset-name random \
+    --host localhost \
+    --port "${PORT}" \
+    --num-prompts "${PURE_TEXT_NUM_PROMPTS}" \
+    --random-input "${PURE_TEXT_INPUT_TOKENS}" \
+    --random-output "${PURE_TEXT_OUTPUT_TOKENS}" \
+    --random-range-ratio 1.0 \
+    --max-concurrency "${PURE_TEXT_MAX_CONCURRENCY}" \
+    | tee "${log_path}"
+}
+
 if [[ "${TYPE}" == "launch" ]]; then
   echo
   echo "========== LAUNCHING SERVER =========="
@@ -415,6 +497,13 @@ if [[ "${TYPE}" == "launch" ]]; then
   model="${MODEL_PATH}"
   attention_backend="aiter"
 
+  chunked_prefill_size=32768
+  max_prefill_tokens=32768
+  if is_397b_model; then
+    chunked_prefill_size=65536
+    max_prefill_tokens=65536
+  fi
+
   launch_args=(
     --port "${PORT}"
     --model-path "${model}"
@@ -424,16 +513,16 @@ if [[ "${TYPE}" == "launch" ]]; then
     --tool-call-parser qwen3_coder
     --enable-multimodal
     --trust-remote-code
-    --chunked-prefill-size 32768
+    --chunked-prefill-size "${chunked_prefill_size}"
     --mem-fraction-static 0.9
-    --max-prefill-tokens 32768
+    --max-prefill-tokens "${max_prefill_tokens}"
     --max-running-requests 128
     --kv-cache-dtype fp8_e4m3
     --disable-radix-cache
     --mm-attention-backend aiter_attn
   )
 
-  if [[ "${MODEL_NAME}" != "Qwen3.5-35B-A3B-PTPC-compressor" ]]; then
+  if [[ "${MODEL_NAME}" != "Qwen3.5-35B-A3B-PTPC-compressor" ]] && ! is_397b_model; then
     launch_args+=(--cuda-graph-max-bs 128)
   fi
 
@@ -453,10 +542,12 @@ if [[ "${TYPE}" == "launch" ]]; then
   fi
 
   smoke_test_server
+  echo "${PORT}" > "${SERVER_PORT_FILE}"
 
 elif [[ "${TYPE}" == "evaluation" ]]; then
   echo
   echo "========== STARTING GSM8K ACCURACY EVALUATION =========="
+  ensure_server_ready
   mkdir -p "${ACCURACY_RESULTS_DIR}"
   result_jsonl="${ACCURACY_RESULTS_DIR}/${MODEL_NAME}_gsm8k_result.jsonl"
   raw_result_file="${ACCURACY_RESULTS_DIR}/${MODEL_NAME}_gsm8k_raw_results.jsonl"
@@ -472,9 +563,16 @@ elif [[ "${TYPE}" == "evaluation" ]]; then
     --raw-result-file "${raw_result_file}"
   )
 
-  if [[ "${MODEL_NAME}" != "offical_qwen3p5_397B_ptpc" ]]; then
+  if ! is_397b_model; then
     benchmark_args+=(
       --max-new-tokens "${GSM8K_MAX_NEW_TOKENS}"
+    )
+  fi
+
+  gsm8k_tokenizer_path="${GSM8K_TOKENIZER_PATH:-${MODEL_PATH}}"
+  if [[ -n "${gsm8k_tokenizer_path}" && -d "${gsm8k_tokenizer_path}" ]]; then
+    benchmark_args+=(
+      --tokenizer-path "${gsm8k_tokenizer_path}"
     )
   fi
 
@@ -519,6 +617,9 @@ PY
 elif [[ "${TYPE}" == "concurrency" || "${TYPE}" == "request_rate" ]]; then
   run_external_benchmark "${TYPE}"
 
+elif [[ "${TYPE}" == "pure_text" ]]; then
+  run_pure_text_benchmark
+
 elif [[ "${TYPE}" == "performance" ]]; then
   echo
   echo "========== STARTING PERFORMANCE BENCHMARK =========="
@@ -539,7 +640,7 @@ elif [[ "${TYPE}" == "performance" ]]; then
 
 else
   echo "Unknown TYPE: ${TYPE}"
-  echo "Usage: $0 {launch|evaluation|concurrency|request_rate|performance} [model_name] [model_path] [TP] [EP] [timeout]"
+  echo "Usage: $0 {launch|evaluation|pure_text|concurrency|request_rate|performance} [model_name] [model_path] [TP] [EP] [timeout]"
   exit 1
 fi
 

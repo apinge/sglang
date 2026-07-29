@@ -24,12 +24,13 @@ on:
         type: choice
         options:
           - all
+          - pure_text
           - concurrency
           - request_rate
       model_list:
-        description: 'Model list to run on MI308 (JSON array format, default: ["Qwen3.5-35B-A3B-PTPC-compressor"])'
+        description: 'Model list to run on MI308 (JSON array format, default: ["Qwen3.5-27B-PTPC-compressor","Qwen3.5-35B-A3B-PTPC-compressor","Qwen3.5-397B-A17B-PTPC-FP8"])'
         required: false
-        default: '["Qwen3.5-35B-A3B-PTPC-compressor"]'
+        default: '["Qwen3.5-27B-PTPC-compressor","Qwen3.5-35B-A3B-PTPC-compressor","Qwen3.5-397B-A17B-PTPC-FP8"]'
       image:
         description: 'Optional image override for the benchmark'
         required: false
@@ -41,8 +42,11 @@ concurrency:
 
 env:
   SGLANG_BENCHMARK_PORT: "8080"
+  HOST_MODELS_ROOT: /raid/models
+  CONTAINER_MODELS_ROOT: /models
   SGLANG_BENCHMARK_EXAMPLE_ROOT: /models/benchamark_example
   SGLANG_BENCHMARK_RESULTS_DIR: benchmark_test_results
+  TVM_FFI_DISABLE_TORCH_C_DLPACK: "1"
   SGLANG_GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/apinge/sglang.git' }}
   SGLANG_GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
@@ -58,7 +62,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           RUN_MODE: ${{ github.event.inputs.run_mode || '' }}
           BENCHMARK_TARGET_INPUT: ${{ github.event.inputs.benchmark_target || 'all' }}
-          MODEL_LIST_JSON: ${{ github.event.inputs.model_list || '["Qwen3.5-35B-A3B-PTPC-compressor"]' }}
+          MODEL_LIST_JSON: ${{ github.event.inputs.model_list || '["Qwen3.5-27B-PTPC-compressor","Qwen3.5-35B-A3B-PTPC-compressor","Qwen3.5-397B-A17B-PTPC-FP8"]' }}
         run: |
           python3 <<'PY'
           import json
@@ -77,8 +81,8 @@ jobs:
               event_name == "workflow_dispatch" and run_mode == "benchmark"
           ):
               if benchmark_target == "all":
-                  targets = ["concurrency", "request_rate"]
-              elif benchmark_target in {"concurrency", "request_rate"}:
+                  targets = ["pure_text", "concurrency", "request_rate"]
+              elif benchmark_target in {"pure_text", "concurrency", "request_rate"}:
                   targets = [benchmark_target]
               else:
                   raise SystemExit(f"Unknown benchmark_target: {benchmark_target}")
@@ -117,7 +121,7 @@ jobs:
   qwen35:
     needs: prepare-qwen35-matrix
     name: qwen35 (${{ matrix.model }}, ${{ matrix.benchmark_target }})
-    runs-on: 1node-8mi308x
+    runs-on: self-hosted
     timeout-minutes: 420
     env:
       BENCHMARK_TARGET: ${{ matrix.benchmark_target }}
@@ -132,27 +136,34 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
       - name: Resolve model config
         run: |
           set -euo pipefail
 
+          host_models_root="${{ env.HOST_MODELS_ROOT }}"
+          container_models_root="${{ env.CONTAINER_MODELS_ROOT }}"
           model_name='${{ matrix.model }}'
           workflow_image='${{ github.event.inputs.image || '' }}'
           case "${model_name}" in
-            offical_qwen3p5_397B_ptpc)
-              model_path="/models/offical_qwen3p5_397B_ptpc"
+            offical_qwen3p5_397B_ptpc|Qwen3.5-397B-A17B-PTPC-FP8)
+              model_dir="offical_qwen3p5_397B_ptpc"
               model_image="rocm/ali-private:ubuntu22.04_rocm7.2.0.43_cp310_torch2.9.1_sglang_3038fa5_aiter_ea051b0_qwen3_5_20260710_v2"
               model_tp="8"
-              model_vlm_cache_size_mb="0"
+              model_vlm_cache_size_mb="8192"
               ;;
             Qwen3.5-27B-PTPC-compressor)
-              model_path="/models/Qwen3.5-27B-PTPC-compressor"
+              model_dir="Qwen3.5-27B-PTPC-compressor"
               model_image="rocm/ali-private:ubuntu22.04_rocm7.2.0.43_cp310_torch2.9.1_sglang_3038fa5_aiter_ea051b0_qwen3_5_20260710_v2"
               model_tp="1"
               model_vlm_cache_size_mb="8192"
               ;;
             Qwen3.5-35B-A3B-PTPC-compressor)
-              model_path="/models/Qwen3.5-35B-A3B-PTPC-compressor"
+              model_dir="Qwen3.5-35B-A3B-PTPC-compressor"
               model_image="rocm/ali-private:ubuntu22.04_rocm7.2.0.43_cp310_torch2.9.1_sglang_3038fa5_aiter_ea051b0_qwen3_5_20260710_v2"
               model_tp="4"
               model_vlm_cache_size_mb="8192"
@@ -163,25 +174,36 @@ jobs:
               ;;
           esac
 
+          model_path_host="${host_models_root}/${model_dir}"
+          model_path="${container_models_root}/${model_dir}"
+
           if [ -n "${workflow_image}" ]; then
             model_image="${workflow_image}"
           fi
 
           echo "MODEL_NAME=${model_name}" >> "${GITHUB_ENV}"
+          echo "MODEL_DIR=${model_dir}" >> "${GITHUB_ENV}"
           echo "MODEL_PATH=${model_path}" >> "${GITHUB_ENV}"
+          echo "MODEL_PATH_HOST=${model_path_host}" >> "${GITHUB_ENV}"
           echo "MODEL_IMAGE=${model_image}" >> "${GITHUB_ENV}"
           echo "MODEL_TP=${model_tp}" >> "${GITHUB_ENV}"
           echo "MODEL_VLM_CACHE_SIZE_MB=${model_vlm_cache_size_mb}" >> "${GITHUB_ENV}"
           echo "Resolved model_name: ${model_name}"
-          echo "Resolved model_path: ${model_path}"
+          echo "Resolved model_dir: ${model_dir}"
+          echo "Resolved model_path (container): ${model_path}"
+          echo "Resolved model_path (host): ${model_path_host}"
           echo "Resolved model_image: ${model_image}"
           echo "Resolved model_tp: ${model_tp}"
           echo "Resolved model_vlm_cache_size_mb: ${model_vlm_cache_size_mb}"
 
-      - name: Docker login
+      - name: Docker login (optional)
         env:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
+          if [ -z "${DOCKER_PASSWORD}" ]; then
+            echo "Skipping Docker login (DOCKER_PASSWORD not available; using local cached image if present)"
+            exit 0
+          fi
           for attempt in 1 2 3; do
             if echo "$DOCKER_PASSWORD" | docker login -u alishared --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
@@ -234,32 +256,35 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -z "${MODEL_NAME:-}" ] || [ -z "${MODEL_PATH:-}" ] || [ -z "${MODEL_IMAGE:-}" ] || [ -z "${MODEL_TP:-}" ] || [ -z "${MODEL_VLM_CACHE_SIZE_MB:-}" ]; then
+          if [ -z "${MODEL_NAME:-}" ] || [ -z "${MODEL_PATH:-}" ] || [ -z "${MODEL_PATH_HOST:-}" ] || [ -z "${MODEL_IMAGE:-}" ] || [ -z "${MODEL_TP:-}" ] || [ -z "${MODEL_VLM_CACHE_SIZE_MB:-}" ]; then
             echo "Model config is not set correctly."
             exit 1
           fi
 
-          if [ ! -d "${MODEL_PATH}" ]; then
-            echo "Expected model directory not found: ${MODEL_PATH}"
-            ls -lah /models
+          if [ ! -d "${MODEL_PATH_HOST}" ]; then
+            echo "Expected model directory not found on host: ${MODEL_PATH_HOST}"
+            echo "Container path will be: ${MODEL_PATH}"
+            ls -lah "${{ env.HOST_MODELS_ROOT }}"
             exit 1
           fi
 
-          ls -lah /models
-          du -sh "${MODEL_PATH}"
+          ls -lah "${{ env.HOST_MODELS_ROOT }}"
+          du -sh "${MODEL_PATH_HOST}"
 
       - name: Validate benchmark scripts
-        if: ${{ matrix.job_mode == 'benchmark' }}
+        if: ${{ matrix.job_mode == 'benchmark' && matrix.benchmark_target != 'pure_text' }}
         run: |
           set -euo pipefail
 
-          script_path="${{ env.SGLANG_BENCHMARK_EXAMPLE_ROOT }}/${BENCHMARK_TARGET}/run.sh"
+          benchmark_example_host="${{ env.HOST_MODELS_ROOT }}/benchamark_example"
+          script_path="${benchmark_example_host}/${BENCHMARK_TARGET}/run.sh"
           if [ ! -f "${script_path}" ]; then
-            echo "Expected benchmark script not found: ${script_path}"
+            echo "Expected benchmark script not found on host: ${script_path}"
+            echo "Container path will be: ${{ env.SGLANG_BENCHMARK_EXAMPLE_ROOT }}/${BENCHMARK_TARGET}/run.sh"
             exit 1
           fi
 
-          ls -lah "${{ env.SGLANG_BENCHMARK_EXAMPLE_ROOT }}"
+          ls -lah "${benchmark_example_host}"
 
       - name: Generate Dockerfile
         run: |
@@ -324,7 +349,8 @@ jobs:
             -e SGLANG_BENCHMARK_PORT=${{ env.SGLANG_BENCHMARK_PORT }} \
             -e SGLANG_BENCHMARK_EXAMPLE_ROOT=${{ env.SGLANG_BENCHMARK_EXAMPLE_ROOT }} \
             -e SGLANG_BENCHMARK_RESULTS_DIR=${{ env.SGLANG_BENCHMARK_RESULTS_DIR }} \
-            -v /models:/models:ro \
+            -e TVM_FFI_DISABLE_TORCH_C_DLPACK=${{ env.TVM_FFI_DISABLE_TORCH_C_DLPACK }} \
+            -v ${{ env.HOST_MODELS_ROOT }}:${{ env.CONTAINER_MODELS_ROOT }}:ro \
             --security-opt seccomp=unconfined \
             -w /sglang-checkout \
             --name "${CONTAINER_NAME}" \
@@ -340,7 +366,7 @@ jobs:
       - name: Show model and shared memory status
         run: |
           docker exec "${CONTAINER_NAME}" bash -lc "df -h /dev/shm"
-          docker exec "${CONTAINER_NAME}" bash -lc "ls -lah /models"
+          docker exec "${CONTAINER_NAME}" bash -lc "ls -lah ${{ env.CONTAINER_MODELS_ROOT }}"
           docker exec "${CONTAINER_NAME}" bash -lc "du -sh \"${MODEL_PATH}\""
 
       - name: Launch the server
@@ -390,6 +416,13 @@ jobs:
               f.write(f"- Score: `{score:.4f}`\n")
           PY
 
+      - name: Run pure text benchmark
+        if: ${{ matrix.job_mode == 'accuracy' }}
+        timeout-minutes: 30
+        run: |
+          set -ex
+          docker exec "${CONTAINER_NAME}" bash -lc "bash scripts/ci/sglang_benchmark_workflow.sh pure_text \"${MODEL_NAME}\" \"${MODEL_PATH}\" \"${MODEL_TP}\" 1"
+
       - name: Run selected load tests
         if: ${{ matrix.job_mode == 'benchmark' }}
         timeout-minutes: 300
@@ -398,7 +431,7 @@ jobs:
           docker exec "${CONTAINER_NAME}" bash -lc "bash scripts/ci/sglang_benchmark_workflow.sh ${BENCHMARK_TARGET} \"${MODEL_NAME}\" \"${MODEL_PATH}\" \"${MODEL_TP}\" 1 45"
 
       - name: Collect benchmark summary
-        if: ${{ always() && matrix.job_mode == 'benchmark' }}
+        if: ${{ always() && (matrix.job_mode == 'benchmark' || matrix.job_mode == 'accuracy') }}
         run: |
           python3 <<'PY'
           import os
@@ -437,7 +470,10 @@ jobs:
 
           with open(summary_path, "a", encoding="utf-8") as f:
               f.write("### Qwen3.5 Load Test Summary\n")
-              f.write(f"- Target: `{os.environ['BENCHMARK_TARGET']}`\n")
+              target = os.environ.get("BENCHMARK_TARGET", "pure_text")
+              if target == "accuracy":
+                  target = "pure_text"
+              f.write(f"- Target: `{target}`\n")
               for log_file in log_files:
                   f.write(f"- Log: `{log_file}`\n")
                   f.write("```text\n")
