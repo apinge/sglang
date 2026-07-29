@@ -718,11 +718,9 @@ class DeepseekSparseAttnBackend(
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens is not None
-                and forward_batch.extend_prefix_lens_cpu is not None
-            ), "All of them must not be None"
+            ), "extend_seq_lens(_cpu) must not be None"
 
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-            assert forward_batch.extend_seq_lens is not None
 
             max_seqlen_q = 1
             cu_seqlens_q = torch.arange(
