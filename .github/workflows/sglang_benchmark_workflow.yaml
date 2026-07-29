@@ -41,7 +41,7 @@ concurrency:
 
 env:
   SGLANG_BENCHMARK_PORT: "8080"
-  HOST_MODELS_ROOT: /raids/models
+  HOST_MODELS_ROOT: /raid/models
   CONTAINER_MODELS_ROOT: /models
   SGLANG_BENCHMARK_EXAMPLE_ROOT: /models/benchamark_example
   SGLANG_BENCHMARK_RESULTS_DIR: benchmark_test_results
