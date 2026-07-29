@@ -27,9 +27,9 @@ on:
           - concurrency
           - request_rate
       model_list:
-        description: 'Model list to run on MI308 (JSON array format, default: ["Qwen3.5-35B-A3B-PTPC-compressor"])'
+        description: 'Model list to run on MI308 (JSON array format, default: ["Qwen3.5-27B-PTPC-compressor","Qwen3.5-35B-A3B-PTPC-compressor","Qwen3.5-397B-A17B-PTPC-FP8"])'
         required: false
-        default: '["Qwen3.5-35B-A3B-PTPC-compressor"]'
+        default: '["Qwen3.5-27B-PTPC-compressor","Qwen3.5-35B-A3B-PTPC-compressor","Qwen3.5-397B-A17B-PTPC-FP8"]'
       image:
         description: 'Optional image override for the benchmark'
         required: false
@@ -45,6 +45,7 @@ env:
   CONTAINER_MODELS_ROOT: /models
   SGLANG_BENCHMARK_EXAMPLE_ROOT: /models/benchamark_example
   SGLANG_BENCHMARK_RESULTS_DIR: benchmark_test_results
+  TVM_FFI_DISABLE_TORCH_C_DLPACK: "1"
   SGLANG_GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/apinge/sglang.git' }}
   SGLANG_GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
@@ -60,7 +61,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           RUN_MODE: ${{ github.event.inputs.run_mode || '' }}
           BENCHMARK_TARGET_INPUT: ${{ github.event.inputs.benchmark_target || 'all' }}
-          MODEL_LIST_JSON: ${{ github.event.inputs.model_list || '["Qwen3.5-35B-A3B-PTPC-compressor"]' }}
+          MODEL_LIST_JSON: ${{ github.event.inputs.model_list || '["Qwen3.5-27B-PTPC-compressor","Qwen3.5-35B-A3B-PTPC-compressor","Qwen3.5-397B-A17B-PTPC-FP8"]' }}
         run: |
           python3 <<'PY'
           import json
@@ -143,11 +144,11 @@ jobs:
           model_name='${{ matrix.model }}'
           workflow_image='${{ github.event.inputs.image || '' }}'
           case "${model_name}" in
-            offical_qwen3p5_397B_ptpc)
+            offical_qwen3p5_397B_ptpc|Qwen3.5-397B-A17B-PTPC-FP8)
               model_dir="offical_qwen3p5_397B_ptpc"
               model_image="rocm/ali-private:ubuntu22.04_rocm7.2.0.43_cp310_torch2.9.1_sglang_3038fa5_aiter_ea051b0_qwen3_5_20260710_v2"
               model_tp="8"
-              model_vlm_cache_size_mb="0"
+              model_vlm_cache_size_mb="8192"
               ;;
             Qwen3.5-27B-PTPC-compressor)
               model_dir="Qwen3.5-27B-PTPC-compressor"
@@ -156,7 +157,7 @@ jobs:
               model_vlm_cache_size_mb="8192"
               ;;
             Qwen3.5-35B-A3B-PTPC-compressor)
-              model_dir="Qwen3.5-35B-A3B-PTPC-FP8"
+              model_dir="Qwen3.5-35B-A3B-PTPC-compressor"
               model_image="rocm/ali-private:ubuntu22.04_rocm7.2.0.43_cp310_torch2.9.1_sglang_3038fa5_aiter_ea051b0_qwen3_5_20260710_v2"
               model_tp="4"
               model_vlm_cache_size_mb="8192"
@@ -342,6 +343,7 @@ jobs:
             -e SGLANG_BENCHMARK_PORT=${{ env.SGLANG_BENCHMARK_PORT }} \
             -e SGLANG_BENCHMARK_EXAMPLE_ROOT=${{ env.SGLANG_BENCHMARK_EXAMPLE_ROOT }} \
             -e SGLANG_BENCHMARK_RESULTS_DIR=${{ env.SGLANG_BENCHMARK_RESULTS_DIR }} \
+            -e TVM_FFI_DISABLE_TORCH_C_DLPACK=${{ env.TVM_FFI_DISABLE_TORCH_C_DLPACK }} \
             -v ${{ env.HOST_MODELS_ROOT }}:${{ env.CONTAINER_MODELS_ROOT }}:ro \
             --security-opt seccomp=unconfined \
             -w /sglang-checkout \
