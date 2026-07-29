@@ -178,18 +178,14 @@ jobs:
           echo "Resolved model_tp: ${model_tp}"
           echo "Resolved model_vlm_cache_size_mb: ${model_vlm_cache_size_mb}"
 
-      - name: Check Docker secret is set
-        run: |
-          if [ -z "${{ secrets.DOCKER_PASSWORD }}" ]; then
-            echo "DOCKER_PASSWORD secret is empty or not available to this workflow"
-            exit 1
-          fi
-          echo "DOCKER_PASSWORD is set (length hidden)"
-
-      - name: Docker login
+      - name: Docker login (optional)
         env:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
+          if [ -z "${DOCKER_PASSWORD}" ]; then
+            echo "Skipping Docker login (DOCKER_PASSWORD not available; using local cached image if present)"
+            exit 0
+          fi
           for attempt in 1 2 3; do
             if echo "$DOCKER_PASSWORD" | docker login -u alishared --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
