@@ -117,7 +117,7 @@ jobs:
   qwen35:
     needs: prepare-qwen35-matrix
     name: qwen35 (${{ matrix.model }}, ${{ matrix.benchmark_target }})
-    runs-on: 1node-8mi308x
+    runs-on: self-hosted
     timeout-minutes: 420
     env:
       BENCHMARK_TARGET: ${{ matrix.benchmark_target }}
@@ -324,7 +324,7 @@ jobs:
             -e SGLANG_BENCHMARK_PORT=${{ env.SGLANG_BENCHMARK_PORT }} \
             -e SGLANG_BENCHMARK_EXAMPLE_ROOT=${{ env.SGLANG_BENCHMARK_EXAMPLE_ROOT }} \
             -e SGLANG_BENCHMARK_RESULTS_DIR=${{ env.SGLANG_BENCHMARK_RESULTS_DIR }} \
-            -v /models:/models:ro \
+            -v /raids/models:/models:ro \
             --security-opt seccomp=unconfined \
             -w /sglang-checkout \
             --name "${CONTAINER_NAME}" \
