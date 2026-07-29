@@ -24,6 +24,7 @@ on:
         type: choice
         options:
           - all
+          - pure_text
           - concurrency
           - request_rate
       model_list:
@@ -80,8 +81,8 @@ jobs:
               event_name == "workflow_dispatch" and run_mode == "benchmark"
           ):
               if benchmark_target == "all":
-                  targets = ["concurrency", "request_rate"]
-              elif benchmark_target in {"concurrency", "request_rate"}:
+                  targets = ["pure_text", "concurrency", "request_rate"]
+              elif benchmark_target in {"pure_text", "concurrency", "request_rate"}:
                   targets = [benchmark_target]
               else:
                   raise SystemExit(f"Unknown benchmark_target: {benchmark_target}")
@@ -134,6 +135,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Resolve model config
         run: |
@@ -266,7 +272,7 @@ jobs:
           du -sh "${MODEL_PATH_HOST}"
 
       - name: Validate benchmark scripts
-        if: ${{ matrix.job_mode == 'benchmark' }}
+        if: ${{ matrix.job_mode == 'benchmark' && matrix.benchmark_target != 'pure_text' }}
         run: |
           set -euo pipefail
 
@@ -410,6 +416,13 @@ jobs:
               f.write(f"- Score: `{score:.4f}`\n")
           PY
 
+      - name: Run pure text benchmark
+        if: ${{ matrix.job_mode == 'accuracy' }}
+        timeout-minutes: 30
+        run: |
+          set -ex
+          docker exec "${CONTAINER_NAME}" bash -lc "bash scripts/ci/sglang_benchmark_workflow.sh pure_text \"${MODEL_NAME}\" \"${MODEL_PATH}\" \"${MODEL_TP}\" 1"
+
       - name: Run selected load tests
         if: ${{ matrix.job_mode == 'benchmark' }}
         timeout-minutes: 300
@@ -418,7 +431,7 @@ jobs:
           docker exec "${CONTAINER_NAME}" bash -lc "bash scripts/ci/sglang_benchmark_workflow.sh ${BENCHMARK_TARGET} \"${MODEL_NAME}\" \"${MODEL_PATH}\" \"${MODEL_TP}\" 1 45"
 
       - name: Collect benchmark summary
-        if: ${{ always() && matrix.job_mode == 'benchmark' }}
+        if: ${{ always() && (matrix.job_mode == 'benchmark' || matrix.job_mode == 'accuracy') }}
         run: |
           python3 <<'PY'
           import os
@@ -457,7 +470,10 @@ jobs:
 
           with open(summary_path, "a", encoding="utf-8") as f:
               f.write("### Qwen3.5 Load Test Summary\n")
-              f.write(f"- Target: `{os.environ['BENCHMARK_TARGET']}`\n")
+              target = os.environ.get("BENCHMARK_TARGET", "pure_text")
+              if target == "accuracy":
+                  target = "pure_text"
+              f.write(f"- Target: `{target}`\n")
               for log_file in log_files:
                   f.write(f"- Log: `{log_file}`\n")
                   f.write("```text\n")

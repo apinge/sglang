@@ -18,6 +18,10 @@ SERVER_LOG=${SGLANG_BENCHMARK_SERVER_LOG:-/tmp/sglang_qwen35_server.log}
 SERVER_PORT_FILE="${SERVER_LOG}.port"
 BENCHMARK_RESULTS_DIR=${SGLANG_BENCHMARK_RESULTS_DIR:-benchmark_test_results}
 BENCHMARK_EXAMPLE_ROOT=${SGLANG_BENCHMARK_EXAMPLE_ROOT:-/models/benchamark_example}
+PURE_TEXT_INPUT_TOKENS=${SGLANG_BENCHMARK_PURE_TEXT_INPUT_TOKENS:-8000}
+PURE_TEXT_OUTPUT_TOKENS=${SGLANG_BENCHMARK_PURE_TEXT_OUTPUT_TOKENS:-500}
+PURE_TEXT_NUM_PROMPTS=${SGLANG_BENCHMARK_PURE_TEXT_NUM_PROMPTS:-32}
+PURE_TEXT_MAX_CONCURRENCY=${SGLANG_BENCHMARK_PURE_TEXT_MAX_CONCURRENCY:-1}
 
 if [[ -z "${SGLANG_BENCHMARK_PORT:-}" && -f "${SERVER_PORT_FILE}" ]]; then
   PORT=$(<"${SERVER_PORT_FILE}")
@@ -434,6 +438,51 @@ run_external_benchmark() {
   verify_external_benchmark_log "${log_path}"
 }
 
+ensure_server_ready() {
+  if curl -sf "http://localhost:${PORT}/v1/models" >/dev/null; then
+    return 0
+  fi
+
+  echo "SGLang server is not reachable on port ${PORT}."
+  if [[ -f "${SERVER_PORT_FILE}" ]]; then
+    saved_port=$(<"${SERVER_PORT_FILE}")
+    if [[ "${saved_port}" != "${PORT}" ]]; then
+      echo "Hint: the last successful launch used port ${saved_port}. Re-run with:"
+      echo "  export SGLANG_BENCHMARK_PORT=${saved_port}"
+    fi
+  fi
+  return 1
+}
+
+run_pure_text_benchmark() {
+  local log_path="${BENCHMARK_RESULTS_DIR}/pure_text_benchmark_${MODEL_NAME}_TP${TP}_EP${EP}.log"
+
+  echo
+  echo "========== STARTING PURE TEXT BENCHMARK =========="
+  ensure_server_ready
+
+  mkdir -p "${BENCHMARK_RESULTS_DIR}"
+  echo "bench model: ${MODEL_PATH}"
+  echo "input tokens: ${PURE_TEXT_INPUT_TOKENS}"
+  echo "output tokens: ${PURE_TEXT_OUTPUT_TOKENS}"
+  echo "max concurrency: ${PURE_TEXT_MAX_CONCURRENCY}"
+  echo "num prompts: ${PURE_TEXT_NUM_PROMPTS}"
+  echo "dataset-name: random"
+
+  python3 -m sglang.bench_serving \
+    --backend sglang \
+    --model "${MODEL_PATH}" \
+    --dataset-name random \
+    --host localhost \
+    --port "${PORT}" \
+    --num-prompts "${PURE_TEXT_NUM_PROMPTS}" \
+    --random-input "${PURE_TEXT_INPUT_TOKENS}" \
+    --random-output "${PURE_TEXT_OUTPUT_TOKENS}" \
+    --random-range-ratio 1.0 \
+    --max-concurrency "${PURE_TEXT_MAX_CONCURRENCY}" \
+    | tee "${log_path}"
+}
+
 if [[ "${TYPE}" == "launch" ]]; then
   echo
   echo "========== LAUNCHING SERVER =========="
@@ -498,17 +547,7 @@ if [[ "${TYPE}" == "launch" ]]; then
 elif [[ "${TYPE}" == "evaluation" ]]; then
   echo
   echo "========== STARTING GSM8K ACCURACY EVALUATION =========="
-  if ! curl -sf "http://localhost:${PORT}/v1/models" >/dev/null; then
-    echo "SGLang server is not reachable on port ${PORT}."
-    if [[ -f "${SERVER_PORT_FILE}" ]]; then
-      saved_port=$(<"${SERVER_PORT_FILE}")
-      if [[ "${saved_port}" != "${PORT}" ]]; then
-        echo "Hint: the last successful launch used port ${saved_port}. Re-run with:"
-        echo "  export SGLANG_BENCHMARK_PORT=${saved_port}"
-      fi
-    fi
-    exit 1
-  fi
+  ensure_server_ready
   mkdir -p "${ACCURACY_RESULTS_DIR}"
   result_jsonl="${ACCURACY_RESULTS_DIR}/${MODEL_NAME}_gsm8k_result.jsonl"
   raw_result_file="${ACCURACY_RESULTS_DIR}/${MODEL_NAME}_gsm8k_raw_results.jsonl"
@@ -578,6 +617,9 @@ PY
 elif [[ "${TYPE}" == "concurrency" || "${TYPE}" == "request_rate" ]]; then
   run_external_benchmark "${TYPE}"
 
+elif [[ "${TYPE}" == "pure_text" ]]; then
+  run_pure_text_benchmark
+
 elif [[ "${TYPE}" == "performance" ]]; then
   echo
   echo "========== STARTING PERFORMANCE BENCHMARK =========="
@@ -598,7 +640,7 @@ elif [[ "${TYPE}" == "performance" ]]; then
 
 else
   echo "Unknown TYPE: ${TYPE}"
-  echo "Usage: $0 {launch|evaluation|concurrency|request_rate|performance} [model_name] [model_path] [TP] [EP] [timeout]"
+  echo "Usage: $0 {launch|evaluation|pure_text|concurrency|request_rate|performance} [model_name] [model_path] [TP] [EP] [timeout]"
   exit 1
 fi
 
