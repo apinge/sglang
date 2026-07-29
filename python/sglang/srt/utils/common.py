@@ -1707,8 +1707,10 @@ def decode_single_image_opencl(tensor_bytes):
 
     np_arr = tensor_bytes.numpy()
     bgr_numpy = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if bgr_numpy is None:
+        raise ValueError("OpenCV imdecode returned None")
     rgb_numpy = cv2.cvtColor(bgr_numpy, cv2.COLOR_BGR2RGB)
-    rgb_tensor = torch.from_numpy(rgb_numpy).permute(2, 0, 1)
+    rgb_tensor = torch.from_numpy(rgb_numpy).permute(2, 0, 1).contiguous()
     return rgb_tensor
 
 
