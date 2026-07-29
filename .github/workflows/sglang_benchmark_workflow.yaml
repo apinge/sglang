@@ -152,7 +152,7 @@ jobs:
               model_vlm_cache_size_mb="8192"
               ;;
             Qwen3.5-35B-A3B-PTPC-compressor)
-              model_path="/models/Qwen3.5-35B-A3B-PTPC-compressor"
+              model_path="/models/Qwen3.5-35B-A3B-PTPC-FP8"
               model_image="rocm/ali-private:ubuntu22.04_rocm7.2.0.43_cp310_torch2.9.1_sglang_3038fa5_aiter_ea051b0_qwen3_5_20260710_v2"
               model_tp="4"
               model_vlm_cache_size_mb="8192"
