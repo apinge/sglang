@@ -47,6 +47,8 @@ env:
   CONTAINER_MODELS_ROOT: /models
   SGLANG_BENCHMARK_EXAMPLE_ROOT: /models/benchamark_example
   SGLANG_BENCHMARK_RESULTS_DIR: benchmark_test_results
+  SGLANG_BENCHMARK_DATASETS_ROOT: /models/benchmark_datasets
+  SGLANG_BENCHMARK_SHAREGPT_DATASET_PATH: /models/benchmark_datasets/ShareGPT_V3_unfiltered_cleaned_split.json
   TVM_FFI_DISABLE_TORCH_C_DLPACK: "1"
   SGLANG_GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/apinge/sglang.git' }}
   SGLANG_GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -272,6 +274,30 @@ jobs:
           ls -lah "${{ env.HOST_MODELS_ROOT }}"
           du -sh "${MODEL_PATH_HOST}"
 
+      - name: Validate benchmark datasets
+        if: ${{ matrix.job_mode == 'accuracy' || matrix.job_mode == 'benchmark' }}
+        run: |
+          set -euo pipefail
+
+          dataset_path="${{ env.HOST_MODELS_ROOT }}/benchmark_datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
+          if [ ! -f "${dataset_path}" ]; then
+            echo "Expected ShareGPT dataset not found on host: ${dataset_path}"
+            echo "Container path will be: ${{ env.SGLANG_BENCHMARK_SHAREGPT_DATASET_PATH }}"
+            echo "Prepare it once on the runner with:"
+            echo "  bash scripts/ci/prepare_benchmark_datasets.sh ${{ env.HOST_MODELS_ROOT }}/benchmark_datasets"
+            exit 1
+          fi
+
+          python3 - <<'PY' "${dataset_path}"
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          json.loads(path.read_text(encoding="utf-8"))
+          print(f"Validated ShareGPT dataset: {path} ({path.stat().st_size} bytes)")
+          PY
+
       - name: Validate benchmark scripts
         if: ${{ matrix.job_mode == 'benchmark' && (matrix.benchmark_target == 'load_test' || matrix.benchmark_target == 'concurrency' || matrix.benchmark_target == 'request_rate') }}
         run: |
@@ -358,6 +384,8 @@ jobs:
             -e SGLANG_BENCHMARK_PORT=${{ env.SGLANG_BENCHMARK_PORT }} \
             -e SGLANG_BENCHMARK_EXAMPLE_ROOT=${{ env.SGLANG_BENCHMARK_EXAMPLE_ROOT }} \
             -e SGLANG_BENCHMARK_RESULTS_DIR=${{ env.SGLANG_BENCHMARK_RESULTS_DIR }} \
+            -e SGLANG_BENCHMARK_DATASETS_ROOT=${{ env.SGLANG_BENCHMARK_DATASETS_ROOT }} \
+            -e SGLANG_BENCHMARK_SHAREGPT_DATASET_PATH=${{ env.SGLANG_BENCHMARK_SHAREGPT_DATASET_PATH }} \
             -e TVM_FFI_DISABLE_TORCH_C_DLPACK=${{ env.TVM_FFI_DISABLE_TORCH_C_DLPACK }} \
             -v ${{ env.HOST_MODELS_ROOT }}:${{ env.CONTAINER_MODELS_ROOT }}:ro \
             --security-opt seccomp=unconfined \

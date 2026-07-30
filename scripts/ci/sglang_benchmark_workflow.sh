@@ -22,6 +22,9 @@ PURE_TEXT_INPUT_TOKENS=${SGLANG_BENCHMARK_PURE_TEXT_INPUT_TOKENS:-8000}
 PURE_TEXT_OUTPUT_TOKENS=${SGLANG_BENCHMARK_PURE_TEXT_OUTPUT_TOKENS:-500}
 PURE_TEXT_NUM_PROMPTS=${SGLANG_BENCHMARK_PURE_TEXT_NUM_PROMPTS:-32}
 PURE_TEXT_MAX_CONCURRENCY=${SGLANG_BENCHMARK_PURE_TEXT_MAX_CONCURRENCY:-1}
+BENCHMARK_DATASETS_ROOT=${SGLANG_BENCHMARK_DATASETS_ROOT:-/models/benchmark_datasets}
+SHAREGPT_DATASET_FILENAME=${SGLANG_BENCHMARK_SHAREGPT_FILENAME:-ShareGPT_V3_unfiltered_cleaned_split.json}
+SHAREGPT_DATASET_PATH=${SGLANG_BENCHMARK_SHAREGPT_DATASET_PATH:-${BENCHMARK_DATASETS_ROOT}/${SHAREGPT_DATASET_FILENAME}}
 
 if [[ -z "${SGLANG_BENCHMARK_PORT:-}" && -f "${SERVER_PORT_FILE}" ]]; then
   PORT=$(<"${SERVER_PORT_FILE}")
@@ -432,6 +435,8 @@ run_external_benchmark() {
     export BASE_URL="http://127.0.0.1:${PORT}"
     export SGLANG_BENCHMARK_MODEL_PATH="${MODEL_PATH}"
     export SGLANG_BENCHMARK_PORT="${PORT}"
+    export SGLANG_BENCHMARK_SHAREGPT_DATASET_PATH="${SHAREGPT_DATASET_PATH}"
+    export DATASET_PATH="${SHAREGPT_DATASET_PATH}"
     bash -euo pipefail "./run.sh"
   ) | tee "${log_path}"
 
@@ -454,6 +459,31 @@ ensure_server_ready() {
   return 1
 }
 
+validate_sharegpt_dataset() {
+  if python3 - <<'PY' "${SHAREGPT_DATASET_PATH}"
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.is_file():
+    raise SystemExit(f"ShareGPT dataset not found: {path}")
+try:
+    json.loads(path.read_text(encoding="utf-8"))
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"ShareGPT dataset is not valid JSON: {path} ({exc})")
+print(f"Using ShareGPT dataset: {path}")
+PY
+  then
+    return 0
+  fi
+
+  echo "Expected local ShareGPT dataset at: ${SHAREGPT_DATASET_PATH}"
+  echo "Prepare it once on the runner host with:"
+  echo "  bash scripts/ci/prepare_benchmark_datasets.sh /raid/models/benchmark_datasets"
+  return 1
+}
+
 run_pure_text_benchmark() {
   local log_path="${BENCHMARK_RESULTS_DIR}/pure_text_benchmark_${MODEL_NAME}_TP${TP}_EP${EP}.log"
 
@@ -468,11 +498,14 @@ run_pure_text_benchmark() {
   echo "max concurrency: ${PURE_TEXT_MAX_CONCURRENCY}"
   echo "num prompts: ${PURE_TEXT_NUM_PROMPTS}"
   echo "dataset-name: random"
+  echo "dataset-path: ${SHAREGPT_DATASET_PATH}"
+  validate_sharegpt_dataset
 
   python3 -m sglang.bench_serving \
     --backend sglang \
     --model "${MODEL_PATH}" \
     --dataset-name random \
+    --dataset-path "${SHAREGPT_DATASET_PATH}" \
     --host localhost \
     --port "${PORT}" \
     --num-prompts "${PURE_TEXT_NUM_PROMPTS}" \
