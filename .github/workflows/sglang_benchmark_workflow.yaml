@@ -5,8 +5,8 @@ on:
     branches:
       - qwen3_5_v0.5.15_dflash
   schedule:
-    # Daily at 22:00 Beijing time (14:00 UTC)
-    - cron: "0 14 * * *"
+    # Daily at 04:00 AM Beijing time (20:00 UTC)
+    - cron: "0 20 * * *"
   workflow_dispatch:
     inputs:
       run_mode:
@@ -24,6 +24,7 @@ on:
         type: choice
         options:
           - all
+          - load_test
           - pure_text
           - concurrency
           - request_rate
@@ -80,8 +81,8 @@ jobs:
           if event_name == "schedule" or (
               event_name == "workflow_dispatch" and run_mode == "benchmark"
           ):
-              if benchmark_target == "all":
-                  targets = ["pure_text", "concurrency", "request_rate"]
+              if benchmark_target in {"all", "load_test"}:
+                  targets = ["load_test"]
               elif benchmark_target in {"pure_text", "concurrency", "request_rate"}:
                   targets = [benchmark_target]
               else:
@@ -272,17 +273,25 @@ jobs:
           du -sh "${MODEL_PATH_HOST}"
 
       - name: Validate benchmark scripts
-        if: ${{ matrix.job_mode == 'benchmark' && matrix.benchmark_target != 'pure_text' }}
+        if: ${{ matrix.job_mode == 'benchmark' && (matrix.benchmark_target == 'load_test' || matrix.benchmark_target == 'concurrency' || matrix.benchmark_target == 'request_rate') }}
         run: |
           set -euo pipefail
 
           benchmark_example_host="${{ env.HOST_MODELS_ROOT }}/benchamark_example"
-          script_path="${benchmark_example_host}/${BENCHMARK_TARGET}/run.sh"
-          if [ ! -f "${script_path}" ]; then
-            echo "Expected benchmark script not found on host: ${script_path}"
-            echo "Container path will be: ${{ env.SGLANG_BENCHMARK_EXAMPLE_ROOT }}/${BENCHMARK_TARGET}/run.sh"
-            exit 1
+          if [ "${{ matrix.benchmark_target }}" = "load_test" ]; then
+            benchmark_targets=(concurrency request_rate)
+          else
+            benchmark_targets=("${{ matrix.benchmark_target }}")
           fi
+
+          for target in "${benchmark_targets[@]}"; do
+            script_path="${benchmark_example_host}/${target}/run.sh"
+            if [ ! -f "${script_path}" ]; then
+              echo "Expected benchmark script not found on host: ${script_path}"
+              echo "Container path will be: ${{ env.SGLANG_BENCHMARK_EXAMPLE_ROOT }}/${target}/run.sh"
+              exit 1
+            fi
+          done
 
           ls -lah "${benchmark_example_host}"
 
@@ -423,9 +432,9 @@ jobs:
           set -ex
           docker exec "${CONTAINER_NAME}" bash -lc "bash scripts/ci/sglang_benchmark_workflow.sh pure_text \"${MODEL_NAME}\" \"${MODEL_PATH}\" \"${MODEL_TP}\" 1"
 
-      - name: Run selected load tests
+      - name: Run load tests
         if: ${{ matrix.job_mode == 'benchmark' }}
-        timeout-minutes: 300
+        timeout-minutes: 120
         run: |
           set -ex
           docker exec "${CONTAINER_NAME}" bash -lc "bash scripts/ci/sglang_benchmark_workflow.sh ${BENCHMARK_TARGET} \"${MODEL_NAME}\" \"${MODEL_PATH}\" \"${MODEL_TP}\" 1 45"
@@ -473,6 +482,8 @@ jobs:
               target = os.environ.get("BENCHMARK_TARGET", "pure_text")
               if target == "accuracy":
                   target = "pure_text"
+              elif target == "load_test":
+                  target = "pure_text, concurrency, request_rate"
               f.write(f"- Target: `{target}`\n")
               for log_file in log_files:
                   f.write(f"- Log: `{log_file}`\n")
@@ -487,4 +498,16 @@ jobs:
       - name: Clean up
         if: always()
         run: |
+          set -euo pipefail
+
+          # Only remove resources created by this workflow job. Do not prune or
+          # delete other images/containers on the shared CI runner.
+          echo "Stopping and removing CI container: ${CONTAINER_NAME}"
           docker rm -f "${CONTAINER_NAME}" || true
+
+          echo "Removing CI-built image for this job: ${LOCAL_IMAGE_NAME}"
+          docker rmi -f "${LOCAL_IMAGE_NAME}" || true
+
+          rm -f Dockerfile.mod || true
+
+          echo "CI cleanup complete (container + image for this job only)."

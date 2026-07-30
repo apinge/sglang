@@ -617,6 +617,12 @@ PY
 elif [[ "${TYPE}" == "concurrency" || "${TYPE}" == "request_rate" ]]; then
   run_external_benchmark "${TYPE}"
 
+elif [[ "${TYPE}" == "load_test" ]]; then
+  ensure_server_ready
+  run_pure_text_benchmark
+  run_external_benchmark "concurrency"
+  run_external_benchmark "request_rate"
+
 elif [[ "${TYPE}" == "pure_text" ]]; then
   run_pure_text_benchmark
 
@@ -640,7 +646,7 @@ elif [[ "${TYPE}" == "performance" ]]; then
 
 else
   echo "Unknown TYPE: ${TYPE}"
-  echo "Usage: $0 {launch|evaluation|pure_text|concurrency|request_rate|performance} [model_name] [model_path] [TP] [EP] [timeout]"
+  echo "Usage: $0 {launch|evaluation|load_test|pure_text|concurrency|request_rate|performance} [model_name] [model_path] [TP] [EP] [timeout]"
   exit 1
 fi
 
