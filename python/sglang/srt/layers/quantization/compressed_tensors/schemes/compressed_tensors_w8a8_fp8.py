@@ -17,6 +17,7 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
+from sglang.srt.layers.quantization.compressed_tensors.utils import AiterHipblaslt
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
@@ -178,11 +179,30 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 weight_scale = layer.weight_scale.data
 
             if _use_aiter:
+                layout = (16, 16)
                 # keep the weight as (N, K)
                 layer.weight = Parameter(
-                    shuffle_weight(weight, (16, 16)), requires_grad=False
+                    shuffle_weight(weight, layout), requires_grad=False
                 )
+                # FP8HIPB need to keep the weight as (K, N)
+                if get_bool_env_var("SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB"):
+                    AiterHipblaslt._initialize_hipblaslt()
+                    if AiterHipblaslt.can_shuffle(
+                        weight.shape[0], weight.shape[1], layout
+                    ):
+                        layer.weight = Parameter(
+                            shuffle_weight(weight, layout).t().data,
+                            requires_grad=False,
+                        )
+                        # Tag the layout on the parameter so apply time dispatches
+                        # to hipb_mm only for weights actually stored as (K, N).
+                        # Shapes that fail can_shuffle keep the (N, K) aiter
+                        # layout and the untransposed scale, and fall through to
+                        # gemm_a8w8_bpreshuffle.
+                        layer.weight.hipb_swizzled = True
+                        weight_scale = weight_scale.t()
             else:
+                # keep the weight as (K, N)
                 layer.weight = Parameter(weight.t(), requires_grad=False)
 
             # required by torch.compile to be torch.nn.Parameter

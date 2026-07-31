@@ -50,6 +50,11 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 
+from sglang.srt.layers.quantization.compressed_tensors.utils import (
+    AiterHipblaslt,
+    rocm_aiter_swizzle_hipb_unquantized_gemm,
+)
+
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
@@ -178,6 +183,23 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
 
+        if _use_aiter and get_bool_env_var("SGLANG_ROCM_USE_AITER_LINEAR_SHUFFLE"):
+            AiterHipblaslt._initialize_hipblaslt()
+            layout = (16, 16)
+            weight = layer.weight
+            if AiterHipblaslt.can_shuffle(weight.shape[0], weight.shape[1], layout):
+                shuffled_weight = shuffle_weight(weight, layout).t()
+                trans = True
+            else:
+                shuffled_weight = weight
+                trans = False
+
+            layer.weight = Parameter(shuffled_weight.data, requires_grad=False)
+            # Tag the parameter rather than self: a quant-method instance is not
+            # guaranteed to be per-layer, and apply() must not misread another
+            # layer's layout.
+            layer.weight.aiter_trans_weight = trans
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -197,6 +219,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
+
+        elif getattr(layer.weight, "aiter_trans_weight", False):
+            # Must precede the tgemm.mm branch below, which would otherwise
+            # swallow every aiter case and leave this path unreachable.
+            return rocm_aiter_swizzle_hipb_unquantized_gemm(x, layer.weight, bias)
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
