@@ -117,10 +117,17 @@ async def process_sample(
     if reasoning_effort:
         payload["reasoning_effort"] = reasoning_effort
     response = await client.chat.completions.create(**payload)
-    msg = response.choices[0].message
+    choice = response.choices[0]
+    msg = choice.message
     content = msg.content
-    if content is None:
-        content = getattr(msg, "reasoning_content", None)
+    reasoning_content = getattr(msg, "reasoning_content", None)
+    sample["response_content"] = content or ""
+    sample["response_reasoning_content"] = reasoning_content or ""
+    sample["finish_reason"] = choice.finish_reason
+    if response.usage is not None:
+        sample["usage"] = response.usage.model_dump()
+    if not content:
+        content = reasoning_content or content
     return sample, content
 
 
@@ -145,6 +152,8 @@ async def eval_mmmu(args) -> None:
     eval_args = EvalArgs.from_cli_args(args)
     sampling_params = get_sampling_params(eval_args)
     samples = prepare_samples(eval_args)
+    if args.max_samples is not None:
+        samples = samples[: args.max_samples]
     model = args.model
     reasoning_effort = eval_args.reasoning_effort
     lora_path = eval_args.lora_path
@@ -240,6 +249,12 @@ def parse_args():
         type=str,
         default="default",
         help="Model name to use in API requests.",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Limit the number of samples to run (debug/stress).",
     )
     EvalArgs.add_cli_args(parser)
     args = add_common_sglang_args_and_parse(parser)

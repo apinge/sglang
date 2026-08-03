@@ -609,6 +609,14 @@ def process_result(response, sample, answer_dict, out_samples):
         "ground_truth": sample["answer"],
         "question_type": sample["question_type"],
     }
+    for key in (
+        "finish_reason",
+        "usage",
+        "response_content",
+        "response_reasoning_content",
+    ):
+        if key in sample:
+            out_samples[sample["id"]][key] = sample[key]
 
     # set ground truth answer
     answer_dict[sample["id"]] = {
