@@ -174,6 +174,21 @@ def resolve_max_seqlen(source, cu_seqlens: torch.Tensor) -> int:
     return int(seq_lens.max().item())
 
 
+def resolve_max_seqlen_override(kwargs: dict[str, Any]) -> Optional[int]:
+    """Best-effort override for max seqlen passed down from model code.
+
+    Prefer a Python int or a CPU scalar tensor to avoid device->host sync on HIP/CUDA.
+    """
+    value = kwargs.get("max_seqlen", None)
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, torch.Tensor) and value.numel() == 1 and value.device.type == "cpu":
+        return int(value.item())
+    return None
+
+
 class VisionSdpaAttention(nn.Module):
     r"""
     Scaled Dot Product Attention inner product
@@ -393,7 +408,9 @@ class VisionTritonAttention(nn.Module):
             output = torch.empty_like(q)
 
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            max_seqlen = seq_lens.max().item()
+            max_seqlen = resolve_max_seqlen_override(kwargs)
+            if max_seqlen is None:
+                max_seqlen = int(seq_lens.max().item())
             context_attention_fwd(
                 q,
                 k,
@@ -459,7 +476,9 @@ class VisionFlash3Attention(nn.Module):
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
             cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-            max_seqlen = seq_lens.max().item()
+            max_seqlen = resolve_max_seqlen_override(kwargs)
+            if max_seqlen is None:
+                max_seqlen = int(seq_lens.max().item())
 
             fa_kwargs = dict(
                 cu_seqlens_q=cu_seqlens,
@@ -513,7 +532,9 @@ class VisionFlash4Attention(nn.Module):
 
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
+        max_seqlen = resolve_max_seqlen_override(kwargs)
+        if max_seqlen is None:
+            max_seqlen = int(seq_lens.max().item())
 
         output = flash_attn_varlen_func(
             q,
@@ -685,7 +706,9 @@ class VisionAiterAttention(nn.Module):
 
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
+        max_seqlen = resolve_max_seqlen_override(kwargs)
+        if max_seqlen is None:
+            max_seqlen = int(seq_lens.max().item())
 
         return self.flash_attn_varlen_func(
             q=q,
