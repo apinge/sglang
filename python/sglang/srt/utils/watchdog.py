@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -15,6 +17,63 @@ import psutil
 from sglang.srt.utils.cudacore_pyspy_dump_utils import pyspy_dump_schedulers
 
 logger = logging.getLogger(__name__)
+
+
+def _run_cmd_for_watchdog(cmd: List[str], timeout_s: float) -> str:
+    """Best-effort command runner for watchdog dumps.
+
+    Never raises: returns a short string suitable for logging.
+    """
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+        out = (proc.stdout or "").strip()
+        prefix = f"$ {' '.join(cmd)} (exit={proc.returncode})"
+        if out:
+            return f"{prefix}\n{out}\n"
+        return f"{prefix}\n<no output>\n"
+    except FileNotFoundError:
+        return ""
+    except subprocess.TimeoutExpired:
+        return f"$ {' '.join(cmd)}\n<timeout after {timeout_s}s>\n"
+    except Exception as e:
+        return f"$ {' '.join(cmd)}\n<error: {e}>\n"
+
+
+def _dump_gpu_snapshot_for_watchdog(timeout_s: float = 5.0) -> str:
+    """Collect a small GPU snapshot (rocm-smi/nvidia-smi) for hang triage."""
+    rocm_smi = shutil.which("rocm-smi")
+    if rocm_smi:
+        return _run_cmd_for_watchdog(
+            [
+                rocm_smi,
+                "--showuse",
+                "--showmemuse",
+                "--showtemp",
+                "--showpower",
+                "--showclocks",
+            ],
+            timeout_s=timeout_s,
+        )
+
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi:
+        return _run_cmd_for_watchdog(
+            [
+                nvidia_smi,
+                "--query-gpu=index,name,utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu,power.draw,clocks.sm",
+                "--format=csv,noheader,nounits",
+            ],
+            timeout_s=timeout_s,
+        )
+
+    return ""
 
 
 class Watchdog:
@@ -148,6 +207,9 @@ class WatchdogRaw:
 
         if self.dump_info is not None and (info_msg := self.dump_info()):
             logger.error(f"{self.debug_name} debug info:\n{info_msg}")
+
+        if gpu_msg := _dump_gpu_snapshot_for_watchdog(timeout_s=5.0):
+            logger.error(f"{self.debug_name} gpu snapshot:\n{gpu_msg}")
 
         pyspy_dump_schedulers()
         logger.error(
