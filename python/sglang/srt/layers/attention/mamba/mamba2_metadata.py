@@ -55,6 +55,9 @@ class ForwardMetadata:
     track_ssm_h_dst: Optional[torch.Tensor] = None
     track_ssm_final_src: Optional[torch.Tensor] = None
     track_ssm_final_dst: Optional[torch.Tensor] = None
+    track_ssm_h_trusted: bool = False
+    track_ssm_final_trusted: bool = False
+    track_ssm_final_disjoint: bool = False
 
     is_target_verify: bool = False
     draft_token_num: int = 1
@@ -156,7 +159,6 @@ class Mamba2Metadata(ForwardMetadata):
 
         p = 0  # num of insertions
         for s, e in zip(cu_seqlens[:-1], cu_seqlens[1:]):
-
             # if does not divide chunk_size, then there is one chunk insertion
             p += s % chunk_size > 0
 
@@ -193,6 +195,9 @@ class Mamba2Metadata(ForwardMetadata):
             track_ssm_h_dst=forward_metadata.track_ssm_h_dst,
             track_ssm_final_src=forward_metadata.track_ssm_final_src,
             track_ssm_final_dst=forward_metadata.track_ssm_final_dst,
+            track_ssm_h_trusted=forward_metadata.track_ssm_h_trusted,
+            track_ssm_final_trusted=forward_metadata.track_ssm_final_trusted,
+            track_ssm_final_disjoint=forward_metadata.track_ssm_final_disjoint,
             has_mamba_track_mask=forward_metadata.has_mamba_track_mask,
             num_decodes=len(seq_lens) if num_decodes is None else num_decodes,
             num_prefills=0,
@@ -284,6 +289,9 @@ class Mamba2Metadata(ForwardMetadata):
             track_ssm_h_dst=forward_metadata.track_ssm_h_dst,
             track_ssm_final_src=forward_metadata.track_ssm_final_src,
             track_ssm_final_dst=forward_metadata.track_ssm_final_dst,
+            track_ssm_h_trusted=forward_metadata.track_ssm_h_trusted,
+            track_ssm_final_trusted=forward_metadata.track_ssm_final_trusted,
+            track_ssm_final_disjoint=forward_metadata.track_ssm_final_disjoint,
             has_mamba_track_mask=forward_metadata.has_mamba_track_mask,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
