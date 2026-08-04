@@ -912,6 +912,7 @@ class BaseMultimodalProcessor(ABC):
         images: List[Any] = [None] * len(image_data) if image_data else []
         videos: List[Any] = [None] * len(video_data) if video_data else []
         audios: List[Any] = [None] * len(audio_data) if audio_data else []
+        target_device = torch.device(f"cuda:{self.server_args.base_gpu_id}")
 
         # Track JPEG images for batch decoding
         jpeg_indices: List[int] = []  # indices into images list
@@ -941,7 +942,7 @@ class BaseMultimodalProcessor(ABC):
                         images[idx] = None  # Placeholder, will be replaced later
                     else:
                         # Non-JPEG image - already decoded, move to cuda directly
-                        images[idx] = img_data.to("cuda")
+                        images[idx] = img_data.to(target_device)
                 else:
                     images[idx] = result
             elif modality == Modality.VIDEO:
@@ -951,10 +952,11 @@ class BaseMultimodalProcessor(ABC):
 
         # Batch decode all JPEG images on GPU
         if jpeg_bytes_list:
-            decode_device = f"cuda:{self.server_args.base_gpu_id}"
-            decoded_images = batch_decode_jpeg_gpu(jpeg_bytes_list, device=decode_device)
+            decoded_images = batch_decode_jpeg_gpu(
+                jpeg_bytes_list, device=target_device
+            )
             for img_idx, decoded_img in zip(jpeg_indices, decoded_images):
-                images[img_idx] = decoded_img.to("cuda")
+                images[img_idx] = decoded_img.to(target_device)
 
         logger.debug(
             "[load_mm_data(simple)] loaded counts: images=%d (jpeg_batch=%d), videos=%d, audios=%d",
@@ -1025,6 +1027,7 @@ class BaseMultimodalProcessor(ABC):
         final_results = []
         jpeg_indices = []  # Track which positions are JPEG images
         jpeg_bytes_list = []  # Collect preprocessed JPEG data
+        target_device = torch.device(f"cuda:{self.server_args.base_gpu_id}")
 
         for idx, (future, (modality, raw_data, frame_limit)) in enumerate(
             zip(futures, task_info)
@@ -1046,19 +1049,20 @@ class BaseMultimodalProcessor(ABC):
                     final_results.append(None)  # Placeholder, will be replaced later
                 else:
                     # Non-JPEG image - already decoded, move to cuda directly
-                    final_results.append(img_data.to("cuda"))
+                    final_results.append(img_data.to(target_device))
             else:
                 # Non-image data or precomputed data
                 final_results.append(result)
 
         # Batch decode all JPEG images
         if jpeg_bytes_list:
-            decode_device = f"cuda:{self.server_args.base_gpu_id}"
-            decoded_images = batch_decode_jpeg_gpu(jpeg_bytes_list, device=decode_device)
+            decoded_images = batch_decode_jpeg_gpu(
+                jpeg_bytes_list, device=target_device
+            )
 
             # Put decoded images back to their original positions
             for img_idx, decoded_img in zip(jpeg_indices, decoded_images):
-                final_results[img_idx] = decoded_img.to("cuda")
+                final_results[img_idx] = decoded_img.to(target_device)
 
         # Create result iterators
         task_info_iter = iter(task_info)

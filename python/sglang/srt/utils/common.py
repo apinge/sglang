@@ -1714,7 +1714,7 @@ def decode_single_image_opencl(tensor_bytes):
     return rgb_tensor
 
 
-def batch_decode_jpeg_gpu(img_tensor_bytes_list: list, device="cuda:1"):
+def batch_decode_jpeg_gpu(img_tensor_bytes_list: list, device=None):
     """
     Batch decode multiple JPEG images.
 
@@ -1727,6 +1727,8 @@ def batch_decode_jpeg_gpu(img_tensor_bytes_list: list, device="cuda:1"):
     """
     if not img_tensor_bytes_list:
         return []
+    if device is None:
+        device = f"cuda:{torch.cuda.current_device()}"
 
     start = time.time()
     try:
@@ -1788,6 +1790,8 @@ def load_image_tensor(
 
     if isinstance(image_file, ImageData):
         image_file = image_file.url
+    if isinstance(image_file, str) and image_file.startswith("file://"):
+        image_file = unquote(urlparse(image_file).path)
 
     image = image_size = None
 
@@ -1905,7 +1909,9 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
         finally:
             response.close()
         return result
-    if image_file.startswith(("file://", "/")):
+    if image_file.startswith("file://"):
+        image_file = unquote(urlparse(image_file).path)
+    if image_file.startswith("/"):
         with open(image_file, "rb") as f:
             return f.read()
     if isinstance(image_file, str) and image_file.startswith("data:"):
