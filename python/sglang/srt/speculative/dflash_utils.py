@@ -524,15 +524,16 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
 def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
     """Validate whether DFlash can slice KV weights from a fused QKV linear layer."""
     quant_method = getattr(qkv_proj, "quant_method", None)
+    weight = getattr(qkv_proj, "weight", None)
+
     if not isinstance(quant_method, UnquantizedLinearMethod):
         return (
             False,
             "quantized qkv_proj is not supported for this path "
             f"(quant_method={type(quant_method).__name__})",
         )
-    if not hasattr(qkv_proj, "weight"):
+    if weight is None:
         return False, "qkv weight tensor is missing"
-    weight = qkv_proj.weight
     if getattr(weight, "aiter_trans_weight", False):
         return False, "AITER transposed qkv weight layout is not sliceable"
     if getattr(weight, "ndim", None) != 2:
@@ -548,6 +549,38 @@ def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
             "qkv weight layout is not sliceable: "
             f"expected shape={expected_shape}, got shape={tuple(weight.shape)}",
         )
+    return True, ""
+
+
+def can_dflash_slice_aiter_trans_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
+    """Validate whether DFlash can column-slice KV from AITER transposed QKV weight."""
+    quant_method = getattr(qkv_proj, "quant_method", None)
+    weight = getattr(qkv_proj, "weight", None)
+
+    if not isinstance(quant_method, UnquantizedLinearMethod):
+        return (
+            False,
+            "quantized qkv_proj is not supported for AITER column-slice path "
+            f"(quant_method={type(quant_method).__name__})",
+        )
+    if weight is None:
+        return False, "qkv weight tensor is missing"
+    if not getattr(weight, "aiter_trans_weight", False):
+        return False, "qkv weight is not in AITER transposed layout"
+    if getattr(weight, "ndim", None) != 2:
+        return False, f"qkv weight must be 2D, got shape={tuple(weight.shape)}"
+
+    expected_shape = (
+        int(getattr(qkv_proj, "input_size")),
+        int(getattr(qkv_proj, "output_size_per_partition")),
+    )
+    if tuple(weight.shape) != expected_shape:
+        return (
+            False,
+            "AITER qkv weight layout is not column-sliceable: "
+            f"expected shape={expected_shape}, got shape={tuple(weight.shape)}",
+        )
+
     return True, ""
 
 

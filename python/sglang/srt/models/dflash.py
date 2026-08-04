@@ -22,6 +22,9 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.quantization.compressed_tensors.utils import (
+    rocm_aiter_swizzle_hipb_unquantized_gemm,
+)
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -29,6 +32,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import (
+    can_dflash_slice_aiter_trans_qkv_weight,
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
     get_dflash_layer_types,
@@ -216,6 +220,19 @@ class DFlashAttention(nn.Module):
                 self.qkv_proj.bias[kv_slice] if self.qkv_proj.bias is not None else None
             )
             kv = F.linear(hidden_states, weight, bias)
+            k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
+            return k, v
+
+        can_slice_aiter_qkv_weight, _ = (
+            can_dflash_slice_aiter_trans_qkv_weight(self.qkv_proj)
+        )
+        if can_slice_aiter_qkv_weight:
+            kv_slice = slice(self.q_size, self.q_size + 2 * self.kv_size)
+            weight = self.qkv_proj.weight[:, kv_slice]
+            bias = (
+                self.qkv_proj.bias[kv_slice] if self.qkv_proj.bias is not None else None
+            )
+            kv = rocm_aiter_swizzle_hipb_unquantized_gemm(hidden_states, weight, bias)
             k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
             return k, v
 
