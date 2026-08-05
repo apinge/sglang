@@ -28,7 +28,7 @@ class TestAiterGDNBackendRegistration(unittest.TestCase):
                 fly_available=True,
                 batch_size=8,
             ),
-            "triton",
+            "flydsl",
         )
         self.assertEqual(
             select_aiter_gdn_decode_backend(
@@ -38,7 +38,7 @@ class TestAiterGDNBackendRegistration(unittest.TestCase):
                 fly_available=True,
                 batch_size=16,
             ),
-            "triton",
+            "flydsl",
         )
         self.assertEqual(
             select_aiter_gdn_decode_backend(
@@ -48,7 +48,7 @@ class TestAiterGDNBackendRegistration(unittest.TestCase):
                 fly_available=True,
                 batch_size=20,
             ),
-            "triton",
+            "flydsl",
         )
         self.assertEqual(
             select_aiter_gdn_decode_backend(
@@ -58,7 +58,7 @@ class TestAiterGDNBackendRegistration(unittest.TestCase):
                 fly_available=True,
                 batch_size=24,
             ),
-            "triton",
+            "hip",
         )
         self.assertEqual(
             select_aiter_gdn_decode_backend(
@@ -83,6 +83,32 @@ class TestAiterGDNBackendRegistration(unittest.TestCase):
         self.assertEqual(
             select_aiter_gdn_decode_backend(
                 8, 24, hip_available=False, fly_available=True
+            ),
+            "flydsl",
+        )
+        self.assertEqual(
+            select_aiter_gdn_decode_backend(
+                4,
+                8,
+                hip_available=True,
+                fly_available=True,
+                batch_size=64,
+            ),
+            "flydsl",
+        )
+        self.assertEqual(
+            select_aiter_gdn_decode_backend(
+                2,
+                8,
+                hip_available=False,
+                fly_available=True,
+                batch_size=24,
+            ),
+            "flydsl",
+        )
+        self.assertEqual(
+            select_aiter_gdn_decode_backend(
+                8, 24, hip_available=False, fly_available=False
             ),
             "triton",
         )
@@ -748,11 +774,13 @@ class TestAiterGDNBackendRegistration(unittest.TestCase):
         )
 
         self.assertTrue(should_use_flydsl_decode(16, 48, 16))
-        self.assertFalse(should_use_flydsl_decode(16, 48, 32))
-        self.assertFalse(should_use_flydsl_decode(2, 8, 10))
-        self.assertFalse(should_use_flydsl_decode(2, 8, 24))
+        self.assertTrue(should_use_flydsl_decode(16, 48, 32))
+        self.assertTrue(should_use_flydsl_decode(2, 8, 10))
+        self.assertTrue(should_use_flydsl_decode(2, 8, 24))
         self.assertTrue(should_use_flydsl_decode(2, 8, 32))
-        self.assertFalse(should_use_flydsl_decode(8, 24, 8))
+        self.assertTrue(should_use_flydsl_decode(8, 24, 8))
+        self.assertFalse(should_use_flydsl_decode(0, 8, 8))
+        self.assertFalse(should_use_flydsl_decode(3, 8, 8))
 
     def test_decode_conv_split_returns_target_layout(self):
         from sglang.srt.layers.attention.linear.kernels.gdn_aiter import (
