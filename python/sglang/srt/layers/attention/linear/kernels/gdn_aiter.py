@@ -18,11 +18,7 @@ _UNSET = object()
 
 _HIP_GDN_SUPPORTED_LOCAL_HEAD_SHAPES = frozenset(
     {
-        (2, 4),
-        (4, 8),
         (2, 8),
-        (8, 16),
-        (16, 32),
     }
 )
 
@@ -44,9 +40,7 @@ def should_use_hip_gdn_decode(
         local_num_k_heads, local_num_v_heads
     ):
         return False
-    if (local_num_k_heads, local_num_v_heads) == (2, 8):
-        return batch_size >= 32
-    return True
+    return batch_size >= 24
 
 
 def supports_hip_gdn_decode_runtime(
@@ -127,11 +121,12 @@ def should_use_flydsl_decode(
     local_num_v_heads: int,
     batch_size: int,
 ) -> bool:
-    if (local_num_k_heads, local_num_v_heads) == (16, 48):
-        return batch_size <= 16
-    if (local_num_k_heads, local_num_v_heads) == (2, 8):
-        return batch_size >= 32
-    return False
+    del batch_size
+    return (
+        local_num_k_heads > 0
+        and local_num_v_heads >= local_num_k_heads
+        and local_num_v_heads % local_num_k_heads == 0
+    )
 
 
 def _load_aiter_decode_ops():
