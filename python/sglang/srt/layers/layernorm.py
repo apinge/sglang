@@ -51,6 +51,7 @@ _is_hip = is_hip()
 _is_musa = is_musa()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_AITER_NEW_CA = get_bool_env_var("SGLANG_USE_AITER_NEW_CA", "true")
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
@@ -176,7 +177,11 @@ def _forward_with_allreduce_fusion(
             # Prefer AITER fused AR+RMSNorm when enabled on AMD.
             if _use_aiter:
                 fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
-                    x, residual, weight, norm_module.variance_epsilon
+                    x,
+                    residual,
+                    weight,
+                    norm_module.variance_epsilon,
+                    use_old_ca=not _AITER_NEW_CA,
                 )
                 if fused_result is not None:
                     return fused_result
@@ -848,7 +853,7 @@ class GemmaRMSNorm(MultiPlatformOp):
             residual,
             post_residual_addition,
             self.gemma_weight,
-            use_attn_tp_group=True,
+            use_attn_tp_group=use_attn_tp_group,
         )
 
 

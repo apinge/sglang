@@ -678,7 +678,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
 
         # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = self.layer_communicator.prepare_mlp_with_norm_fusion(
             hidden_states, residual, forward_batch
         )
 
@@ -1064,7 +1064,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
 
         # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
+        hidden_states, residual = self.layer_communicator.prepare_mlp_with_norm_fusion(
             hidden_states, residual, forward_batch
         )
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(

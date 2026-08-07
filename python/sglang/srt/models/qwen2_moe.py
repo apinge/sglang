@@ -408,13 +408,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     def _forward_shared_experts(
         self, hidden_states: torch.Tensor, apply_gate: bool = True
     ):
+        bf16_view = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
         shared_output = None
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None and apply_gate:
                 if use_intel_amx_backend(self.shared_expert_gate):
                     shared_output = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
-                        hidden_states,
+                        bf16_view,
                         self.shared_expert_gate.weight,
                         self.shared_expert_gate.bias,
                         True,
@@ -425,11 +426,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         sigmoid_gate_mul_broadcast,
                     )
 
-                    gate = self.shared_expert_gate(hidden_states)
+                    gate = self.shared_expert_gate(bf16_view)
                     shared_output = sigmoid_gate_mul_broadcast(shared_output, gate)
                 else:
                     shared_output = (
-                        F.sigmoid(self.shared_expert_gate(hidden_states))
+                        F.sigmoid(self.shared_expert_gate(bf16_view))
                         * shared_output
                     )
 
