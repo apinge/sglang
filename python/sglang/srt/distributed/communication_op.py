@@ -30,6 +30,8 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
     residual_inp_: torch.Tensor,
     weight_: torch.Tensor,
     eps: float,
+    *,
+    use_old_ca: bool = False,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Fused TP all-reduce + RMSNorm.
 
@@ -37,7 +39,28 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
     it may dispatch to communicator-native fused APIs, custom fused kernels,
     or return None so callers can run generic fallback paths.
     """
-    return get_tp_group().fused_allreduce_rmsnorm(input_, residual_inp_, weight_, eps)
+    return get_tp_group().fused_allreduce_rmsnorm(
+        input_, residual_inp_, weight_, eps, use_old_ca=use_old_ca
+    )
+
+
+def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    *,
+    emit_bf16: bool = False,
+    use_old_ca: bool = False,
+) -> Optional[Tuple[torch.Tensor, ...]]:
+    return get_tp_group().fused_allreduce_rmsnorm_quant(
+        input_,
+        residual_inp_,
+        weight_,
+        eps,
+        emit_bf16=emit_bf16,
+        use_old_ca=use_old_ca,
+    )
 
 
 def tensor_model_parallel_all_gather(

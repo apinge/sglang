@@ -25,10 +25,12 @@ If you only need to use the distributed environment without model/pipeline
 """
 
 import contextlib
+import contextvars
 import gc
 import logging
 import os
 import pickle
+import threading
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
@@ -71,6 +73,83 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER")
+_use_aiter_cuda_comm = get_bool_env_var("USE_AITER_COMM")
+
+
+_aiter_cuda_comm_in_active_forward: contextvars.ContextVar[bool] = (
+    contextvars.ContextVar("_aiter_cuda_comm_in_active_forward", default=False)
+)
+
+
+def _should_use_aiter_cuda_comm_for_forward(forward_batch: Any) -> bool:
+    if not (_use_aiter_cuda_comm and _use_aiter):
+        return False
+    m = forward_batch.forward_mode
+    if m.is_decode() or m.is_idle():
+        return False
+    # Chunked prefill runs extend + decode in one forward; keep standard AR for safety.
+    if m.is_mixed():
+        return False
+    if m.is_target_verify():
+        return False
+    if m.is_prebuilt():
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def forward_aiter_cuda_comm_scope(forward_batch: Any):
+    """Restrict Aiter cuda quick all-reduce to prefill-like forwards (see env USE_AITER_COMM)."""
+    token = _aiter_cuda_comm_in_active_forward.set(
+        _should_use_aiter_cuda_comm_for_forward(forward_batch)
+    )
+    try:
+        yield
+    finally:
+        _aiter_cuda_comm_in_active_forward.reset(token)
+
+
+_model_runner_ar_scope_patch_lock = threading.Lock()
+_model_runner_ar_scope_patch_installed = False
+
+
+def _lazy_install_forward_aiter_cuda_comm_patch() -> None:
+    """Wrap ModelRunner._forward_raw once USE_AITER_COMM needs forward-mode context."""
+    global _model_runner_ar_scope_patch_installed
+    if _model_runner_ar_scope_patch_installed:
+        return
+    if not (_use_aiter_cuda_comm and _use_aiter):
+        _model_runner_ar_scope_patch_installed = True
+        return
+    with _model_runner_ar_scope_patch_lock:
+        if _model_runner_ar_scope_patch_installed:
+            return
+        try:
+            from sglang.srt.model_executor.model_runner import ModelRunner
+        except ImportError:
+            return
+
+        _orig_forward_raw = ModelRunner._forward_raw
+
+        def _forward_raw_with_aiter_scope(
+            self,
+            forward_batch,
+            pp_proxy_tensors,
+            reinit_attn_backend=False,
+            split_forward_count=1,
+        ):
+            with forward_aiter_cuda_comm_scope(forward_batch):
+                return _orig_forward_raw(
+                    self,
+                    forward_batch,
+                    pp_proxy_tensors,
+                    reinit_attn_backend=reinit_attn_backend,
+                    split_forward_count=split_forward_count,
+                )
+
+        ModelRunner._forward_raw = _forward_raw_with_aiter_scope
+        _model_runner_ar_scope_patch_installed = True
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -399,6 +478,11 @@ class GroupCoordinator:
 
         self.ca_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
+        self._aiter_cuda_comm: Optional[Any] = None
+        self._logged_first_aiter_cuda_comm_call = False
+        self._logged_first_fused_ar_rmsnorm_call = False
+        self._logged_first_fused_ar_rmsnorm_quant_call = False
+        self._logged_fused_ar_rmsnorm_skip = False
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
@@ -428,7 +512,34 @@ class GroupCoordinator:
                         )
                 except Exception as e:
                     logger.warning(f"Failed to initialize QuickAllReduce: {e}")
-        elif self.world_size > 1 and is_hip():
+
+        if _use_aiter:
+            from aiter.dist.parallel_state import set_custom_all_reduce
+
+            set_custom_all_reduce(True)
+            if _use_aiter_cuda_comm and self.world_size > 1:
+                try:
+                    from aiter.dist.device_communicators.communicator_cuda import (
+                        CudaCommunicator as AiterCudaCommunicator,
+                    )
+
+                    self._aiter_cuda_comm = AiterCudaCommunicator(
+                        cpu_group=self.cpu_group, device=self.device, unique_name="tp"
+                    )
+                    logger.info(
+                        "[AR] AITER CudaCommunicator initialized: rank=%s world_size=%s",
+                        self.rank,
+                        self.world_size,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to initialize AITER CudaCommunicator: {e}")
+
+        if (
+            not use_custom_allreduce
+            and self.world_size > 1
+            and is_hip()
+            and self._aiter_cuda_comm is None
+        ):
             logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
 
         self.torch_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
@@ -592,6 +703,7 @@ class GroupCoordinator:
         a new tensor in the same op. So we need to figure out if the op is
         in-place or out-of-place ahead of time.
         """
+        _lazy_install_forward_aiter_cuda_comm_patch()
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
@@ -636,18 +748,26 @@ class GroupCoordinator:
 
         outplace_all_reduce_method = None
         if (
+            self.qr_comm is not None
+            and not self.qr_comm.disabled
+            and self.qr_comm.should_quick_allreduce(input_)
+        ):
+            outplace_all_reduce_method = "qr"
+        elif (
+            self._aiter_cuda_comm is not None
+            and _use_aiter
+            and _use_aiter_cuda_comm
+            and _aiter_cuda_comm_in_active_forward.get()
+        ):
+            # Prefill-only AITER AR path. AITER internally tries quick reduce first.
+            outplace_all_reduce_method = "aiter_cuda_comm"
+        elif (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and not should_use_pymscclpp_allreduce
             and self.ca_comm.should_custom_ar(input_)
         ):
             outplace_all_reduce_method = "ca"
-        elif (
-            self.qr_comm is not None
-            and not self.qr_comm.disabled
-            and self.qr_comm.should_quick_allreduce(input_)
-        ):
-            outplace_all_reduce_method = "qr"
         elif self.pymscclpp_comm is not None and should_use_pymscclpp_allreduce:
             outplace_all_reduce_method = "pymscclpp"
         elif (
@@ -689,23 +809,37 @@ class GroupCoordinator:
         residual_inp_: torch.Tensor,
         weight_: torch.Tensor,
         eps: float,
+        *,
+        use_old_ca: bool = False,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator. ROCm/HIP Only"""
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
+            self._log_fused_ar_rmsnorm_skip("ca_comm unavailable or disabled", input_)
             return None
 
         # Prefer communicator-native fused API when provided.
         if hasattr(ca_comm, "fused_allreduce_rmsnorm"):
             try:
                 return ca_comm.fused_allreduce_rmsnorm(
-                    input_, residual_inp_, weight_, eps
+                    input_, residual_inp_, weight_, eps, use_old_ca=use_old_ca
                 )
             except Exception:
                 # Fall back to custom_fused_ar_rms path below.
                 pass
 
         if not hasattr(ca_comm, "custom_fused_ar_rms"):
+            self._log_fused_ar_rmsnorm_skip("custom_fused_ar_rms missing", input_)
+            return None
+        try:
+            should_custom_ar = ca_comm.should_custom_ar(input_)
+        except Exception as e:
+            self._log_fused_ar_rmsnorm_skip(
+                f"should_custom_ar raised {type(e).__name__}", input_
+            )
+            return None
+        if not should_custom_ar:
+            self._log_fused_ar_rmsnorm_skip("should_custom_ar returned false", input_)
             return None
 
         # 1-stage vs 2-stage selection for fused AR+RMSNorm:
@@ -734,15 +868,113 @@ class GroupCoordinator:
                 eps=eps,
                 registered=False,
                 use_1stage=use_1stage_ar,
+                use_old_ca=use_old_ca,
             )
+        if not self._logged_first_fused_ar_rmsnorm_call:
+            logger.info(
+                "[AR] fused AR+RMSNorm HIT: rank=%s shape=%s dtype=%s bytes=%s "
+                "use_1stage=%s use_old_ca=%s",
+                self.rank,
+                tuple(input_.shape),
+                input_.dtype,
+                input_.numel() * input_.element_size(),
+                use_1stage_ar,
+                use_old_ca,
+            )
+            self._logged_first_fused_ar_rmsnorm_call = True
         fused_outputs = ca_comm.custom_fused_ar_rms(
             input_,
             residual_inp_,
             weight_,
             eps,
             use_1stage_ar,
+            use_old_ca=use_old_ca,
         )
         return fused_outputs
+
+    def _log_fused_ar_rmsnorm_skip(self, reason: str, input_: torch.Tensor) -> None:
+        if self._logged_fused_ar_rmsnorm_skip:
+            return
+        logger.info(
+            "[AR] fused AR+RMSNorm skipped: rank=%s reason=%s shape=%s dtype=%s bytes=%s",
+            self.rank,
+            reason,
+            tuple(input_.shape),
+            input_.dtype,
+            input_.numel() * input_.element_size(),
+        )
+        self._logged_fused_ar_rmsnorm_skip = True
+
+    def fused_allreduce_rmsnorm_quant(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        *,
+        emit_bf16: bool = False,
+        use_old_ca: bool = False,
+    ) -> Optional[Tuple[torch.Tensor, ...]]:
+        ca_comm = self.ca_comm
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+        if not hasattr(ca_comm, "custom_fused_ar_rms_quant"):
+            return None
+        try:
+            should = ca_comm.should_custom_ar(input_)
+        except Exception:
+            should = False
+        if not should:
+            return None
+
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        else:
+            total_bytes = input_.numel() * input_.element_size()
+            use_1stage_ar = total_bytes <= 128 * 1024
+        if not self._logged_first_fused_ar_rmsnorm_quant_call:
+            logger.info(
+                "[AR] fused AR+RMSNorm+Quant HIT: rank=%s shape=%s dtype=%s bytes=%s "
+                "use_1stage=%s use_old_ca=%s emit_bf16=%s",
+                self.rank,
+                tuple(input_.shape),
+                input_.dtype,
+                input_.numel() * input_.element_size(),
+                use_1stage_ar,
+                use_old_ca,
+                emit_bf16,
+            )
+            self._logged_first_fused_ar_rmsnorm_quant_call = True
+        try:
+            return ca_comm.custom_fused_ar_rms_quant(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                use_1stage_ar,
+                emit_bf16=emit_bf16,
+                use_old_ca=use_old_ca,
+            )
+        except TypeError:
+            if use_old_ca:
+                return None
+            try:
+                return ca_comm.custom_fused_ar_rms_quant(
+                    input_,
+                    residual_inp_,
+                    weight_,
+                    eps,
+                    use_1stage_ar,
+                    emit_bf16=emit_bf16,
+                )
+            except TypeError:
+                if emit_bf16:
+                    return None
+                return ca_comm.custom_fused_ar_rms_quant(
+                    input_, residual_inp_, weight_, eps, use_1stage_ar
+                )
+        except Exception:
+            return None
 
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
@@ -752,18 +984,39 @@ class GroupCoordinator:
         pymscclpp_comm = self.pymscclpp_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
         pynccl_comm = self.pynccl_comm
-        assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm])
-        if outplace_all_reduce_method == "ca":
+        assert any(
+            [
+                qr_comm,
+                ca_comm,
+                pymscclpp_comm,
+                torch_symm_mem_comm,
+                pynccl_comm,
+                outplace_all_reduce_method == "aiter_cuda_comm"
+                and self._aiter_cuda_comm is not None,
+            ]
+        )
+        if outplace_all_reduce_method == "qr":
+            assert not qr_comm.disabled
+            out = qr_comm.quick_all_reduce(input_)
+        elif outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(
                 input_, use_new=get_bool_env_var("SGLANG_USE_AITER_NEW_CA", "true")
             )
-        elif outplace_all_reduce_method == "qr":
-            assert not qr_comm.disabled
-            out = qr_comm.quick_all_reduce(input_)
         elif outplace_all_reduce_method == "torch_symm_mem":
             assert not torch_symm_mem_comm.disabled
             out = torch_symm_mem_comm.all_reduce(input_)
+        elif outplace_all_reduce_method == "aiter_cuda_comm":
+            if not self._logged_first_aiter_cuda_comm_call:
+                logger.info(
+                    "[AR] AITER CudaCommunicator HIT: rank=%s shape=%s dtype=%s bytes=%s",
+                    self.rank,
+                    tuple(input_.shape),
+                    input_.dtype,
+                    input_.numel() * input_.element_size(),
+                )
+                self._logged_first_aiter_cuda_comm_call = True
+            out = self._aiter_cuda_comm.all_reduce(input_)
         elif outplace_all_reduce_method == "pymscclpp":
             assert not pymscclpp_comm.disabled
             out = pymscclpp_comm.all_reduce(input_)
@@ -2314,6 +2567,10 @@ def initialize_model_parallel(
         group_name="pp",
         recovered_rank=recovered_rank,
     )
+
+    # Install ModelRunner forward wrapper early so the first inference forward runs inside
+    # forward_aiter_cuda_comm_scope (lazy install from all_reduce can be too late).
+    _lazy_install_forward_aiter_cuda_comm_patch()
 
 
 def create_custom_parallel_group(
