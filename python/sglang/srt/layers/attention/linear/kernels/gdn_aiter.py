@@ -208,11 +208,11 @@ def _load_aiter_decode_ops():
 
 def _load_aiter_decode_conv_split():
     try:
-        from aiter.ops.triton.gated_delta_net.causal_conv1d_decode import (
-            causal_conv1d_update_split_qkv,
+        from aiter.ops.triton._triton_kernels.gated_delta_rule.decode import (
+            causal_conv1d_split_qkv,
         )
 
-        return causal_conv1d_update_split_qkv
+        return causal_conv1d_split_qkv.causal_conv1d_update_split_qkv
     except Exception as exc:
         logger.info("AITER fused decode conv-split is unavailable: %s", exc)
         return None

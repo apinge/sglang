@@ -822,6 +822,80 @@ class TestAiterGDNBackendRegistration(unittest.TestCase):
         self.assertEqual(k.shape, (1, 32, 2, 128))
         self.assertEqual(v.shape, (1, 32, 8, 128))
 
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.version.hip is not None,
+        "ROCm is required",
+    )
+    def test_real_decode_conv_split_matches_reference_without_qkv_copies(self):
+        from sglang.srt.layers.attention.linear.kernels.gdn_aiter import (
+            AiterGDNKernel,
+        )
+        from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+            causal_conv1d_update,
+        )
+
+        torch.manual_seed(109)
+        batch, k_heads, v_heads, dim = 4, 2, 8, 128
+        key_dim, value_dim = k_heads * dim, v_heads * dim
+        mixed_dim = 2 * key_dim + value_dim
+        x = torch.randn(batch, mixed_dim, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(
+            mixed_dim, 4, device="cuda", dtype=torch.bfloat16
+        )
+        bias = torch.randn(mixed_dim, device="cuda", dtype=torch.bfloat16)
+        indices = torch.tensor([1, 3, 4, 5], device="cuda", dtype=torch.int32)
+        initial_state = torch.randn(
+            6, mixed_dim, 3, device="cuda", dtype=torch.bfloat16
+        )
+        state_actual = initial_state.clone()
+        state_ref = initial_state.clone()
+
+        kernel = AiterGDNKernel(
+            fallback_kernel=mock.Mock(),
+            hip_decode=None,
+            fly_decode=mock.Mock(),
+            hip_arch_supported=False,
+        )
+        actual = kernel.decode_conv_split(
+            x,
+            state_actual,
+            weight,
+            bias=bias,
+            activation="silu",
+            conv_state_indices=indices,
+            key_dim=key_dim,
+            value_dim=value_dim,
+            num_k_heads=k_heads,
+            num_v_heads=v_heads,
+            head_k_dim=dim,
+            head_v_dim=dim,
+        )
+        self.assertIsNotNone(actual)
+
+        mixed_ref = causal_conv1d_update(
+            x,
+            state_ref,
+            weight,
+            bias=bias,
+            activation="silu",
+            conv_state_indices=indices,
+        )
+        q_ref, k_ref, v_ref = torch.split(
+            mixed_ref, [key_dim, key_dim, value_dim], dim=-1
+        )
+        expected = (
+            q_ref.view(batch, 1, k_heads, dim).transpose(0, 1),
+            k_ref.view(batch, 1, k_heads, dim).transpose(0, 1),
+            v_ref.view(batch, 1, v_heads, dim).transpose(0, 1),
+        )
+
+        for actual_tensor, expected_tensor in zip(actual, expected):
+            torch.testing.assert_close(
+                actual_tensor, expected_tensor, rtol=1e-2, atol=1e-2
+            )
+            self.assertTrue(actual_tensor.transpose(0, 1).is_contiguous())
+        torch.testing.assert_close(state_actual, state_ref, rtol=1e-2, atol=1e-2)
+
     def test_prefill_returns_aiter_intermediate_h_when_ops_are_available(self):
         from sglang.srt.layers.attention.linear.kernels.gdn_aiter import (
             AiterGDNKernel,
