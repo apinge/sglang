@@ -1188,6 +1188,9 @@ class Envs:
     # debugging). Correctness is unaffected; this only changes performance.
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+    # On HIP, use a Torch implementation of target-only stochastic EAGLE
+    # verification for non-greedy topk=1 trees instead of forcing greedy verify.
+    SGLANG_MIMO_EAGLE_HIP_NONGREEDY_VERIFY = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing
