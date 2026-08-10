@@ -26,7 +26,8 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
     load_audio,
-    load_image,
+    batch_decode_jpeg_gpu,
+    load_image_tensor,
     load_video,
     logger,
 )
@@ -529,22 +530,17 @@ class BaseMultimodalProcessor(ABC):
         Load a single multimodal data.
 
         If data is processor_output or precomputed embedding, return directly.
+        For images:
+          - JPEG: returns (img_tensor_bytes, 'jpeg')
+          - Non-JPEG: returns (img_tensor, None)
 
-        Class method that can be pickled for multiprocessing
+        Class method that can be pickled for multiprocessing.
         """
         if cls._is_preprocessed_input(data):
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, cls.gpu_image_decode)
-                if isinstance(img, torch.Tensor):
-                    return img  # JPEG already decoded on GPU by nvJPEG
-                # PIL decodes lazily; do it here in the io worker so the decode
-                # doesn't run later on the event-loop thread.
-                if discard_alpha_channel and img.mode != "RGB":
-                    return img.convert("RGB")
-                img.load()
-                return img
+                return load_image_tensor(data, discard_alpha_channel)
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
@@ -658,7 +654,10 @@ class BaseMultimodalProcessor(ABC):
         audio_sample_rate: Optional[int] = None,
     ) -> Tuple[List, List]:
         """
-        load multimodal data parallelly using iterators.
+        Load multimodal data parallelly using iterators.
+        For images, will return either:
+          - JPEG: (img_tensor_bytes, 'jpeg') for batch decoding
+          - Non-JPEG: (img_tensor, None) already decoded
         """
         futures = []
         task_info = []
@@ -913,6 +912,11 @@ class BaseMultimodalProcessor(ABC):
         images: List[Any] = [None] * len(image_data) if image_data else []
         videos: List[Any] = [None] * len(video_data) if video_data else []
         audios: List[Any] = [None] * len(audio_data) if audio_data else []
+        target_device = torch.device(f"cuda:{self.server_args.base_gpu_id}")
+
+        # Track JPEG images for batch decoding
+        jpeg_indices: List[int] = []  # indices into images list
+        jpeg_bytes_list: List[Any] = []  # preprocessed JPEG data
 
         for modality, idx, future in futures:
             try:
@@ -928,15 +932,34 @@ class BaseMultimodalProcessor(ABC):
                 )
 
             if modality == Modality.IMAGE:
-                images[idx] = result
+                # Check if this is a JPEG tuple result for batch decoding
+                if isinstance(result, tuple) and len(result) == 2:
+                    img_data, format_type = result
+                    if format_type == "jpeg":
+                        # JPEG image - record position for batch decoding
+                        jpeg_indices.append(idx)
+                        jpeg_bytes_list.append(img_data)
+                        images[idx] = None  # Placeholder, will be replaced later
+                    else:
+                        # Non-JPEG image - already decoded, move to cuda directly
+                        images[idx] = img_data.to(target_device)
+                else:
+                    images[idx] = result
             elif modality == Modality.VIDEO:
                 videos[idx] = result
             elif modality == Modality.AUDIO:
                 audios[idx] = result
 
+        if jpeg_bytes_list:
+            decoded_images = batch_decode_jpeg_gpu(jpeg_bytes_list, device=target_device)
+            for img_idx, decoded_img in zip(jpeg_indices, decoded_images):
+                if decoded_img is None:
+                    raise RuntimeError(f"Failed to decode JPEG image at index {img_idx}")
+                images[img_idx] = decoded_img.to(target_device)
         logger.debug(
-            "[load_mm_data(simple)] loaded counts: images=%d, videos=%d, audios=%d",
+            "[load_mm_data(simple)] loaded counts: images=%d (jpeg_batch=%d), videos=%d, audios=%d",
             len(images),
+            len(jpeg_bytes_list),
             len(videos),
             len(audios),
         )
@@ -999,8 +1022,51 @@ class BaseMultimodalProcessor(ABC):
             discard_alpha_channel=discard_alpha_channel,
             audio_sample_rate=audio_sample_rate,
         )
+        final_results = []
+        jpeg_indices = []  # Track which positions are JPEG images
+        jpeg_bytes_list = []  # Collect preprocessed JPEG data
+        target_device = torch.device(f"cuda:{self.server_args.base_gpu_id}")
+
+        for idx, (future, (modality, raw_data, frame_limit)) in enumerate(
+            zip(futures, task_info)
+        ):
+            result = await asyncio.wrap_future(future)
+
+            # Check if this is an image tuple result
+            if (
+                modality == Modality.IMAGE
+                and isinstance(result, tuple)
+                and len(result) == 2
+            ):
+                img_data, format_type = result
+
+                if format_type == "jpeg":
+                    # JPEG image - record position and preprocessed data
+                    jpeg_indices.append(idx)
+                    jpeg_bytes_list.append(img_data)
+                    final_results.append(None)  # Placeholder, will be replaced later
+                else:
+                    # Non-JPEG image - already decoded, move to cuda directly
+                    final_results.append(img_data.to(target_device))
+            else:
+                # Non-image data or precomputed data
+                final_results.append(result)
+
+        # Batch decode all JPEG images
+        if jpeg_bytes_list:
+            decoded_images = batch_decode_jpeg_gpu(
+                jpeg_bytes_list, device=target_device
+            )
+
+            # Put decoded images back to their original positions
+            for img_idx, decoded_img in zip(jpeg_indices, decoded_images):
+                if decoded_img is None:
+                    raise RuntimeError(f"Failed to decode JPEG image at index {img_idx}")
+                final_results[img_idx] = decoded_img.to(target_device)
+
+        # Create result iterators
         task_info_iter = iter(task_info)
-        futures_iter = iter(futures)
+        results_iter = iter(final_results)
 
         # Process results
         images, videos, audios = [], [], []
@@ -1010,7 +1076,9 @@ class BaseMultimodalProcessor(ABC):
             try:
                 if multimodal_tokens_pattern.match(text_part):
                     modality, raw_data, frame_limit = next(task_info_iter)
-                    result = await asyncio.wrap_future(next(futures_iter))
+                    result = next(
+                        results_iter
+                    )  # Get from results (already a complete tensor)
 
                     is_precomputed, new_imgs, new_vids, new_auds = (
                         self._process_loaded_mm_data(modality, raw_data, result)
