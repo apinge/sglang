@@ -950,14 +950,12 @@ class BaseMultimodalProcessor(ABC):
             elif modality == Modality.AUDIO:
                 audios[idx] = result
 
-        # Batch decode all JPEG images on GPU
         if jpeg_bytes_list:
-            decoded_images = batch_decode_jpeg_gpu(
-                jpeg_bytes_list, device=target_device
-            )
+            decoded_images = batch_decode_jpeg_gpu(jpeg_bytes_list, device=target_device)
             for img_idx, decoded_img in zip(jpeg_indices, decoded_images):
+                if decoded_img is None:
+                    raise RuntimeError(f"Failed to decode JPEG image at index {img_idx}")
                 images[img_idx] = decoded_img.to(target_device)
-
         logger.debug(
             "[load_mm_data(simple)] loaded counts: images=%d (jpeg_batch=%d), videos=%d, audios=%d",
             len(images),
