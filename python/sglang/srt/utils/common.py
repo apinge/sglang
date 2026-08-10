@@ -1780,8 +1780,7 @@ def batch_decode_jpeg_gpu(img_tensor_bytes_list: list, device=None):
 def load_image_tensor(
     image_file: Union[Image.Image, str, ImageData, bytes],
     discard_alpha_channel: bool = True,
-) -> tuple[Image.Image, tuple[int, int]]:
-    """
+) -> tuple[torch.Tensor, Optional[str]]:
     Load image, return preprocessed result for JPEG format.
 
     For JPEG, return encoded bytes for batch decoding. For non-JPEG, decode
