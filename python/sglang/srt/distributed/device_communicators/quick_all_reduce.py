@@ -209,6 +209,16 @@ class QuickAllReduce:
         self.qr_max_size = qr_max_size if qr_max_size > 0 else ops.qr_max_size()
         self.create_shared_buffer()
         self.disabled = False
+        self._logged_first_qr_call = False
+        logger.info(
+            "[AR] QuickAllReduce initialized: rank=%s world_size=%s quant=%s "
+            "qr_max_size=%s cast_bf16_to_fp16=%s",
+            self.rank,
+            self.world_size,
+            regime_str,
+            self.qr_max_size,
+            self.use_fp16_kernels,
+        )
 
     def create_shared_buffer(self):
         """
@@ -251,6 +261,16 @@ class QuickAllReduce:
         # as QR uses static IPC buffer.
         if out is None:
             out = torch.empty_like(inp)
+        if not getattr(self, "_logged_first_qr_call", False):
+            logger.info(
+                "[AR] QuickAllReduce HIT: rank=%s shape=%s dtype=%s bytes=%s quant=%s",
+                self.rank,
+                tuple(inp.shape),
+                inp.dtype,
+                inp.numel() * inp.element_size(),
+                self.qr_quant_level.name,
+            )
+            self._logged_first_qr_call = True
         ops.qr_all_reduce(
             self._ptr, inp, out, self.qr_quant_level.value, self.use_fp16_kernels
         )
