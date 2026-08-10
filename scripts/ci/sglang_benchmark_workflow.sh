@@ -109,10 +109,6 @@ print_launch_recipe() {
   echo "setup server for TP${TP}:"
   local chunked_prefill_size=32768
   local max_prefill_tokens=32768
-  if is_397b_model; then
-    chunked_prefill_size=65536
-    max_prefill_tokens=65536
-  fi
   cat <<EOF
 nohup python3 -m sglang.launch_server \\
   --port ${PORT} \\
@@ -498,10 +494,6 @@ if [[ "${TYPE}" == "launch" ]]; then
 
   chunked_prefill_size=32768
   max_prefill_tokens=32768
-  if is_397b_model; then
-    chunked_prefill_size=65536
-    max_prefill_tokens=65536
-  fi
 
   launch_args=(
     --port "${PORT}"
