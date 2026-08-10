@@ -334,6 +334,8 @@ def _build_common_server_args(
         "--mamba-scheduler-strategy",
         str(args.mamba_scheduler_strategy),
         "--disable-custom-all-reduce",
+        "--dtype",
+        str(args.dtype),
         "--kv-cache-dtype",
         "fp8_e4m3",
         "--page-size",
