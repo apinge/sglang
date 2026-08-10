@@ -1060,6 +1060,8 @@ class BaseMultimodalProcessor(ABC):
 
             # Put decoded images back to their original positions
             for img_idx, decoded_img in zip(jpeg_indices, decoded_images):
+                if decoded_img is None:
+                    raise RuntimeError(f"Failed to decode JPEG image at index {img_idx}")
                 final_results[img_idx] = decoded_img.to(target_device)
 
         # Create result iterators
