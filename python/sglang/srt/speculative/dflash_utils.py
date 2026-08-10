@@ -532,6 +532,29 @@ def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
         )
     if not hasattr(qkv_proj, "weight"):
         return False, "qkv weight tensor is missing"
+    weight = qkv_proj.weight
+    if getattr(weight, "aiter_trans_weight", False):
+        return (
+            False,
+            "qkv weight uses AITER shuffled layout; direct tensor slicing would bypass "
+            "the linear method",
+        )
+    if weight.ndim != 2:
+        return False, f"qkv weight must be 2D, got shape={tuple(weight.shape)}"
+
+    expected_in_features = getattr(qkv_proj, "input_size", None)
+    if expected_in_features is None:
+        expected_in_features = getattr(qkv_proj, "hidden_size", None)
+    if (
+        expected_in_features is not None
+        and int(weight.shape[1]) != int(expected_in_features)
+    ):
+        return (
+            False,
+            "qkv weight input dim does not match hidden size; direct tensor slicing "
+            f"would be invalid (weight.shape={tuple(weight.shape)}, "
+            f"expected_in_features={int(expected_in_features)})",
+        )
     return True, ""
 
 

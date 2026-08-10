@@ -1389,6 +1389,15 @@ class MHATokenToKVPool(KVCache):
         else:
             self._kv_copy_config = None
 
+        self._fused_fp8_set_kv_buffer = None
+        if (
+            _is_hip
+            and self.kv_cache_layout == "nhd"
+            and self.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+            and self.head_dim == 256
+        ):
+            self._init_fused_fp8_kv_write()
+
         self._finalize_allocation_log(size)
 
         # for store_cache JIT kernel
@@ -1445,6 +1454,42 @@ class MHATokenToKVPool(KVCache):
             BYTES_PER_TILE=self._kv_copy_config["bytes_per_tile"],
             num_warps=self._kv_copy_config["num_warps"],
             num_stages=2,
+        )
+
+    def _init_fused_fp8_kv_write(self):
+        from sglang.srt.layers.attention.triton_ops.aiter_fp8_kv_kernel import (
+            fused_fp8_set_kv_buffer,
+        )
+
+        self._fused_fp8_set_kv_buffer = fused_fp8_set_kv_buffer
+        if not self.k_buffer or not self.v_buffer:
+            return
+
+        dummy_k = torch.empty(
+            (1, self.head_num, self.head_dim),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        dummy_v = torch.empty(
+            (1, self.head_num, self.v_head_dim),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        dummy_loc = torch.zeros((1,), dtype=torch.int64, device=self.device)
+        dummy_scale = torch.ones((1,), dtype=torch.float32, device=self.device)
+        k_buffer = self.k_buffer[0]
+        v_buffer = self.v_buffer[0]
+        if self.store_dtype != self.dtype:
+            k_buffer = k_buffer.view(self.dtype)
+            v_buffer = v_buffer.view(self.dtype)
+        fused_fp8_set_kv_buffer(
+            dummy_k,
+            dummy_v,
+            k_buffer,
+            v_buffer,
+            dummy_loc,
+            dummy_scale,
+            dummy_scale,
         )
 
     def _create_buffers(self):
@@ -1689,6 +1734,49 @@ class MHATokenToKVPool(KVCache):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+        # The AITER fused FP8 KV writer only supports per-tensor scalar scales.
+        scale_ok_for_fused_fp8 = (
+            lambda scale: scale is None
+            or (not isinstance(scale, torch.Tensor) and float(scale) == 1.0)
+            or (
+                isinstance(scale, torch.Tensor)
+                and scale.device == cache_k.device
+                and scale.dtype == torch.float32
+                and scale.numel() == 1
+            )
+        )
+        if (
+            self._fused_fp8_set_kv_buffer is not None
+            and self.kv_cache_layout == "nhd"
+            and cache_k.dtype != self.dtype
+            and scale_ok_for_fused_fp8(k_scale)
+            and scale_ok_for_fused_fp8(v_scale)
+            and dcp_kv_mask is None
+            and cache_k.ndim == 3
+            and cache_v.ndim == 3
+            and self.k_buffer[layer_id - self.start_layer].ndim == 3
+            and self.v_buffer[layer_id - self.start_layer].ndim == 3
+        ):
+            # Qwen3.5 ROCm fp8 fast path only: NHD KV cache, head_dim=256
+            # (enforced at init). DFlash draft uses head_dim=128 and the future
+            # AITER vectorized_5d layout has its own writer, so both stay on the
+            # existing generic paths.
+            k_buffer = self.k_buffer[layer_id - self.start_layer]
+            v_buffer = self.v_buffer[layer_id - self.start_layer]
+            if self.store_dtype != self.dtype:
+                k_buffer = k_buffer.view(self.dtype)
+                v_buffer = v_buffer.view(self.dtype)
+            self._fused_fp8_set_kv_buffer(
+                cache_k,
+                cache_v,
+                k_buffer,
+                v_buffer,
+                loc,
+                k_scale,
+                v_scale,
+            )
+            return
+
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
