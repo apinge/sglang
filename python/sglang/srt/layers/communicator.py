@@ -101,8 +101,6 @@ _AITER_NEW_CA = get_bool_env_var("SGLANG_USE_AITER_NEW_CA", "true")
 _AITER_FUSED_AR_RMSNORM_DEFAULT = (
     _use_aiter
     and not _AITER_NEW_CA
-    and not get_bool_env_var("SGLANG_DISABLE_AITER_FUSED_AR_RMSNORM", "false")
-    and not get_bool_env_var("SGLANG_DISABLE_AITER_FUSED_MLP_QUANT", "false")
 )
 _AITER_FUSED_AR_RMSNORM_DECODE_ONLY = get_bool_env_var(
     "SGLANG_FUSED_AR_RMSNORM_DECODE_ONLY", "true"
