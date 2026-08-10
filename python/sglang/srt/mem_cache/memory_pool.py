@@ -1734,6 +1734,7 @@ class MHATokenToKVPool(KVCache):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+        # The AITER fused FP8 KV writer only supports per-tensor scalar scales.
         scale_ok_for_fused_fp8 = (
             lambda scale: scale is None
             or (not isinstance(scale, torch.Tensor) and float(scale) == 1.0)
@@ -1741,6 +1742,7 @@ class MHATokenToKVPool(KVCache):
                 isinstance(scale, torch.Tensor)
                 and scale.device == cache_k.device
                 and scale.dtype == torch.float32
+                and scale.numel() == 1
             )
         )
         if (

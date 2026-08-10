@@ -91,6 +91,11 @@ def _scale_ptr(
     if scale is None:
         return ref, False
     if isinstance(scale, torch.Tensor):
+        if scale.numel() != 1:
+            raise ValueError(
+                "AITER fused FP8 KV write expects k_scale/v_scale to be scalar "
+                "tensors (numel == 1)"
+            )
         return scale.to(device=ref.device, dtype=torch.float32), True
     if float(scale) == 1.0:
         return ref, False
