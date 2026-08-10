@@ -571,7 +571,13 @@ def _run_mode_for_backend_tp(
 
         metrics_by_conc: dict[int, BenchMetrics] = {}
         for conc in concurrencies:
-            n = num_questions_by_conc[conc]
+            max_n = len(prompts) - int(conc)
+            if max_n <= 0:
+                raise RuntimeError(
+                    f"concurrency={conc} exceeds available prompts={len(prompts)}; "
+                    "reduce --concurrencies or increase --max-questions-per-config."
+                )
+            n = min(num_questions_by_conc[conc], max_n)
             _flush_cache(base_url)
             print(
                 f"[warmup] run 1 warmup batch (size={conc}) after /flush_cache; excluded from metrics."
