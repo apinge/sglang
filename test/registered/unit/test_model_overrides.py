@@ -1573,6 +1573,26 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 SimpleNamespace(linear_attn_backend="fla"), "Qwen3NextForCausalLM"
             )
         )
+        with patch.object(overrides_module, "is_hip", return_value=True):
+            self.assertTrue(
+                supports_mamba_cache_extra_buffer(
+                    SimpleNamespace(linear_attn_backend="aiter"),
+                    "Qwen3_5ForConditionalGeneration",
+                )
+            )
+            self.assertFalse(
+                supports_mamba_cache_extra_buffer(
+                    SimpleNamespace(linear_attn_backend="aiter"),
+                    "Lfm2ForCausalLM",
+                )
+            )
+        with patch.object(overrides_module, "is_hip", return_value=False):
+            self.assertFalse(
+                supports_mamba_cache_extra_buffer(
+                    SimpleNamespace(linear_attn_backend="aiter"),
+                    "Qwen3_5ForConditionalGeneration",
+                )
+            )
 
     def test_page_size_leaf_materializes_end_state(self):
         sa = self._construct("LlamaForCausalLM", "llama")
