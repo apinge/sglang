@@ -378,9 +378,9 @@ jobs:
 
           echo
           echo "=== Clearing aiter JIT cache ==="
-          rm -rf /opt/aiter/aiter/jit/build
+          rm -rf "${AITER_DIR}/aiter/jit/build"
           shopt -s nullglob
-          rm -f /opt/aiter/aiter/jit/*.so
+          rm -f "${AITER_DIR}"/aiter/jit/*.so
           shopt -u nullglob
           rm -rf "${HOME}/.aiter"
 
