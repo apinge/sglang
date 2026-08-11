@@ -132,20 +132,14 @@ def should_use_flydsl_decode(
 def _load_aiter_decode_ops():
     hip_decode = None
     fly_decode = None
-    reset_sort_cache = None
     try:
-        # The HIP extension's host-side sorted-index cache cannot be replayed
-        # safely by CUDA Graph. Keep the graph-safe unsorted kernel path.
-        os.environ["HIP_GDN_SORT_IDX_BS"] = "0"
         from aiter.ops.hip.gated_delta_net import (
             hip_fused_sigmoid_gating_delta_rule_update,
-            hip_gdn_decode_reset_sort_cache,
         )
         from aiter.ops.hip.gated_delta_net.hip_gdn_decode import _load_extension
 
         _load_extension()
         hip_decode = hip_fused_sigmoid_gating_delta_rule_update
-        reset_sort_cache = hip_gdn_decode_reset_sort_cache
     except Exception as exc:
         logger.info("AITER HIP GDN decode is unavailable; using FlyDSL: %s", exc)
 
@@ -203,7 +197,7 @@ def _load_aiter_decode_ops():
         except Exception as exc:
             logger.warning("AITER FlyDSL GDN decode is unavailable: %s", exc)
 
-    return hip_decode, fly_decode, reset_sort_cache
+    return hip_decode, fly_decode
 
 
 def _load_aiter_decode_conv_split():
@@ -333,7 +327,6 @@ class AiterGDNKernel(LinearAttnKernelBase):
         *,
         hip_decode: Optional[Callable] | object = _UNSET,
         fly_decode: Optional[Callable] | object = _UNSET,
-        reset_sort_cache: Optional[Callable] | object = _UNSET,
         prefill_vk: Optional[Callable] | object = _UNSET,
         prefill_intermediate_ops: Optional[dict[str, Callable]] | object = _UNSET,
         l2norm: Optional[Callable] | object = _UNSET,
@@ -349,18 +342,15 @@ class AiterGDNKernel(LinearAttnKernelBase):
             fallback_kernel = TritonGDNKernel()
         self.fallback_kernel = fallback_kernel
 
-        if hip_decode is _UNSET or fly_decode is _UNSET or reset_sort_cache is _UNSET:
-            loaded_hip, loaded_fly, loaded_reset = _load_aiter_decode_ops()
+        if hip_decode is _UNSET or fly_decode is _UNSET:
+            loaded_hip, loaded_fly = _load_aiter_decode_ops()
             if hip_decode is _UNSET:
                 hip_decode = loaded_hip
             if fly_decode is _UNSET:
                 fly_decode = loaded_fly
-            if reset_sort_cache is _UNSET:
-                reset_sort_cache = loaded_reset
 
         self.hip_decode = hip_decode
         self.fly_decode = fly_decode
-        self.reset_sort_cache = reset_sort_cache
         self.hip_arch_supported = (
             is_gfx942_supported() if hip_arch_supported is None else hip_arch_supported
         )
@@ -387,10 +377,6 @@ class AiterGDNKernel(LinearAttnKernelBase):
 
             l2norm_qk = fused_l2norm_qk
         self.l2norm_qk = l2norm_qk
-
-    def reset_decode_cache(self):
-        if self.reset_sort_cache is not None:
-            self.reset_sort_cache()
 
     def decode_conv_split(
         self,

@@ -184,11 +184,6 @@ class GDNKernelDispatcher:
             f"packed_decode={self.supports_packed_decode}"
         )
 
-    def reset_decode_cache(self):
-        reset = getattr(self.decode_kernel, "reset_decode_cache", None)
-        if reset is not None:
-            reset()
-
     def decode_conv_split(self, *args, **kwargs):
         decode_conv_split = getattr(
             self.decode_kernel, "decode_conv_split", None
@@ -380,7 +375,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 if original_batch_size is not None
                 else forward_batch.batch_size - num_padding
             )
-            self.kernel_dispatcher.reset_decode_cache()
 
     def forward_decode(
         self,

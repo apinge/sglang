@@ -194,21 +194,6 @@ class TestAiterGDNBackendRegistration(unittest.TestCase):
             "triton",
         )
 
-    def test_decode_sort_cache_reset_is_forwarded(self):
-        from sglang.srt.layers.attention.linear.kernels.gdn_aiter import (
-            AiterGDNKernel,
-        )
-
-        reset = mock.Mock()
-        kernel = AiterGDNKernel(
-            fallback_kernel=mock.Mock(),
-            hip_decode=mock.Mock(),
-            fly_decode=None,
-            reset_sort_cache=reset,
-        )
-        kernel.reset_decode_cache()
-        reset.assert_called_once_with()
-
     def test_decode_ignores_cuda_graph_padding(self):
         from sglang.srt.layers.attention.linear.kernels.gdn_aiter import (
             AiterGDNKernel,
@@ -532,16 +517,6 @@ class TestAiterGDNBackendRegistration(unittest.TestCase):
         self.assertIsInstance(dispatcher.verify_kernel, TritonGDNKernel)
         self.assertTrue(dispatcher.supports_packed_decode)
 
-    def test_dispatcher_forwards_decode_cache_reset(self):
-        from sglang.srt.layers.attention.linear.gdn_backend import (
-            GDNKernelDispatcher,
-        )
-
-        dispatcher = object.__new__(GDNKernelDispatcher)
-        dispatcher.decode_kernel = mock.Mock()
-        dispatcher.reset_decode_cache()
-        dispatcher.decode_kernel.reset_decode_cache.assert_called_once_with()
-
     def test_backend_prepares_active_decode_batch_for_graph_padding(self):
         from sglang.srt.layers.attention.linear.gdn_backend import (
             GDNAttnBackend,
@@ -559,9 +534,7 @@ class TestAiterGDNBackendRegistration(unittest.TestCase):
         )
         backend._prepare_aiter_forward_metadata(forward_batch)
         self.assertEqual(backend._aiter_decode_active_batch_size, 5)
-        backend.kernel_dispatcher.reset_decode_cache.assert_called_once_with()
 
-        backend.kernel_dispatcher.reset_mock()
         backend._prepare_aiter_forward_metadata(
             SimpleNamespace(
                 forward_mode=forward_mode,
@@ -571,7 +544,6 @@ class TestAiterGDNBackendRegistration(unittest.TestCase):
             )
         )
         self.assertEqual(backend._aiter_decode_active_batch_size, 5)
-        backend.kernel_dispatcher.reset_decode_cache.assert_called_once_with()
 
         self.assertTrue(
             _forward_batch_has_padding(
