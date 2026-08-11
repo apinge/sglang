@@ -204,6 +204,17 @@ def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
     )
 
 
+def should_apply_aiter_all_reduce_fusion(
+    input_tensor: torch.Tensor, forward_batch: ForwardBatch
+):
+    if not apply_aiter_all_reduce_fusion(input_tensor):
+        return False
+    return (
+        not _AITER_FUSED_AR_RMSNORM_DECODE_ONLY
+        or forward_batch.forward_mode.is_decode_or_idle()
+    )
+
+
 class ScatterMode(Enum):
     """
     Suppose we have TP=4, DP=2, enable-dp-attention, and the system handles seq a,b,c,d
@@ -578,7 +589,9 @@ class LayerCommunicator:
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
                 if (
-                    apply_aiter_all_reduce_fusion(hidden_states)
+                    should_apply_aiter_all_reduce_fusion(
+                        hidden_states, forward_batch
+                    )
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     hidden_states, residual = (
@@ -1208,7 +1221,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         else:
             handled = False
             if (
-                apply_aiter_all_reduce_fusion(hidden_states)
+                should_apply_aiter_all_reduce_fusion(hidden_states, forward_batch)
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
