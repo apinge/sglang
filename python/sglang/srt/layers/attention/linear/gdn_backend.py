@@ -334,6 +334,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
         self.mamba_cache_chunk_size = model_runner.server_args.mamba_cache_chunk_size
         self._aiter_decode_active_batch_size: Optional[int] = None
+        self._aiter_prefill_metadata_builder = None
+        self._aiter_prefill_metadata = None
+        if prefill_backend.is_aiter() and is_hip():
+            try:
+                from aiter.ops.triton.gated_delta_net import (
+                    build_gated_delta_rule_prefill_metadata,
+                )
+
+                self._aiter_prefill_metadata_builder = (
+                    build_gated_delta_rule_prefill_metadata
+                )
+            except Exception as exc:
+                rank0_log(
+                    "AITER reusable GDN prefill metadata is unavailable; "
+                    f"using the legacy metadata path: {exc}"
+                )
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
@@ -366,6 +382,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         in_capture: bool = False,
     ):
         self._aiter_decode_active_batch_size = None
+        self._aiter_prefill_metadata = None
         if forward_batch.forward_mode.is_decode_or_idle():
             num_padding = (
                 0 if in_capture else int(getattr(forward_batch, "num_padding", 0) or 0)
@@ -381,6 +398,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 else forward_batch.batch_size - num_padding
             )
             self.kernel_dispatcher.reset_decode_cache()
+        elif (
+            self._aiter_prefill_metadata_builder is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not _forward_batch_has_padding(forward_batch)
+            and self.forward_metadata.query_start_loc.numel() == 2
+            and len(forward_batch.extend_seq_lens_cpu) == 1
+        ):
+            self._aiter_prefill_metadata = self._aiter_prefill_metadata_builder(
+                forward_batch.extend_seq_lens_cpu,
+                cu_seqlens=self.forward_metadata.query_start_loc,
+                chunk_size=self.mamba_cache_chunk_size,
+            )
 
     def forward_decode(
         self,
@@ -676,6 +705,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 return_intermediate_h=return_intermediate_h,
                 has_padding=_forward_batch_has_padding(forward_batch),
                 mamba_cache_chunk_size=self.mamba_cache_chunk_size,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                prefill_metadata=self._aiter_prefill_metadata,
             )
 
             if is_npu() and last_recurrent_state is not None:

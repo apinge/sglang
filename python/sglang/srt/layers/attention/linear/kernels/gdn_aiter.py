@@ -699,6 +699,21 @@ class AiterGDNKernel(LinearAttnKernelBase):
             return self.fallback_kernel.extend(**fallback_kwargs)
 
         return_intermediate_h = kwargs.get("return_intermediate_h", False)
+        seq_lens_cpu = kwargs.get("seq_lens_cpu")
+        prefill_metadata = kwargs.get("prefill_metadata")
+        metadata_kwargs = (
+            {
+                "seq_lens_cpu": seq_lens_cpu,
+                "prefill_metadata": prefill_metadata,
+            }
+            if prefill_metadata is not None
+            else {}
+        )
+        prefill_metadata_kwargs = (
+            {"prefill_metadata": prefill_metadata}
+            if prefill_metadata is not None
+            else {}
+        )
         use_low_level = return_intermediate_h or self.prefill_vk is None
         if use_low_level:
             autotune_enabled = os.getenv(
@@ -722,6 +737,7 @@ class AiterGDNKernel(LinearAttnKernelBase):
                 g=launch_g,
                 cu_seqlens=launch_start_loc,
                 use_exp2=True,
+                **prefill_metadata_kwargs,
             )
             w, u = self.prefill_intermediate_ops["solve"](
                 A_raw=A,
@@ -731,6 +747,7 @@ class AiterGDNKernel(LinearAttnKernelBase):
                 g_cumsum=g_cumsum,
                 cu_seqlens=launch_start_loc,
                 use_exp2=True,
+                **prefill_metadata_kwargs,
             )
             chunk_h = self.prefill_intermediate_ops["chunk_h"]
             chunk_h_kwargs = {}
@@ -753,6 +770,7 @@ class AiterGDNKernel(LinearAttnKernelBase):
                 cu_seqlens=launch_start_loc,
                 state_dtype=ssm_states.dtype,
                 use_exp2=True,
+                **prefill_metadata_kwargs,
                 **chunk_h_kwargs,
             )
             output = self.prefill_intermediate_ops["chunk_o"](
@@ -765,6 +783,7 @@ class AiterGDNKernel(LinearAttnKernelBase):
                 scale=launch_k.shape[-1] ** -0.5,
                 cu_seqlens=launch_start_loc,
                 use_exp2=True,
+                **prefill_metadata_kwargs,
             )
             return output, None, h if return_intermediate_h else None
 
@@ -785,5 +804,6 @@ class AiterGDNKernel(LinearAttnKernelBase):
             use_chunk_hip=launch_start_loc.numel() == 2,
             state_dtype=ssm_states.dtype,
             use_exp2=True,
+            **metadata_kwargs,
         )
         return output, None, None
