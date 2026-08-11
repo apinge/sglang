@@ -323,15 +323,84 @@ jobs:
 
       - name: Generate Dockerfile
         run: |
+          cat <<'AITER_SCRIPT' > aiter_update.sh
+          #!/bin/bash
+          set -euo pipefail
+
+          AITER_DIR="${AITER_DIR:-/opt/aiter}"
+          AITER_BRANCH="${AITER_BRANCH:-Qwen3.5_dev}"
+          AITER_REMOTE="${AITER_REMOTE:-origin}"
+
+          if [[ ! -d "${AITER_DIR}/.git" ]]; then
+            echo "ERROR: ${AITER_DIR} is not a git repository"
+            exit 1
+          fi
+
+          cd "${AITER_DIR}"
+
+          COMPOSABLE_KERNEL_PATH="${AITER_DIR}/3rdparty/composable_kernel"
+          COMPOSABLE_KERNEL_BACKUP=""
+
+          echo "========== UPDATING AITER =========="
+          echo "Repository: ${AITER_DIR}"
+          echo "Remote: ${AITER_REMOTE}"
+          echo "Branch: ${AITER_BRANCH}"
+          echo "Preserving local changes in: ${COMPOSABLE_KERNEL_PATH}"
+
+          if [[ -d "${COMPOSABLE_KERNEL_PATH}" ]]; then
+            COMPOSABLE_KERNEL_BACKUP="$(mktemp -d)"
+            echo "=== Backing up composable_kernel before git pull ==="
+            cp -a "${COMPOSABLE_KERNEL_PATH}" "${COMPOSABLE_KERNEL_BACKUP}/"
+          fi
+
+          echo
+          echo "=== Aiter before update ==="
+          git rev-parse HEAD
+          git log -1 --oneline || true
+
+          git fetch "${AITER_REMOTE}" "${AITER_BRANCH}"
+          git checkout "${AITER_BRANCH}"
+          git pull --ff-only "${AITER_REMOTE}" "${AITER_BRANCH}"
+
+          if [[ -n "${COMPOSABLE_KERNEL_BACKUP}" && -d "${COMPOSABLE_KERNEL_BACKUP}/composable_kernel" ]]; then
+            echo
+            echo "=== Restoring local composable_kernel after git pull ==="
+            rm -rf "${COMPOSABLE_KERNEL_PATH}"
+            mkdir -p "${AITER_DIR}/3rdparty"
+            cp -a "${COMPOSABLE_KERNEL_BACKUP}/composable_kernel" "${COMPOSABLE_KERNEL_PATH}"
+            rm -rf "${COMPOSABLE_KERNEL_BACKUP}"
+          fi
+
+          echo
+          echo "=== Aiter after update ==="
+          git rev-parse HEAD
+          git log -1 --oneline
+
+          echo
+          echo "=== Clearing aiter JIT cache ==="
+          rm -rf "${AITER_DIR}/aiter/jit/build"
+          shopt -s nullglob
+          rm -f "${AITER_DIR}"/aiter/jit/*.so
+          shopt -u nullglob
+          rm -rf "${HOME}/.aiter"
+
+          echo
+          echo "=== Reinstalling aiter (editable) ==="
+          pip install -e .
+          pip show amd-aiter || true
+
+          echo "Aiter update complete."
+          AITER_SCRIPT
+          chmod +x aiter_update.sh
+
           cat <<EOF > Dockerfile.mod
           FROM ${MODEL_IMAGE}
           ENV GPU_ARCHS="gfx942"
           ENV PYTORCH_ROCM_ARCH="gfx942"
 
+          COPY aiter_update.sh /tmp/aiter_update.sh
           RUN echo "=== Aiter version in base image ===" && pip show amd-aiter || true
-          RUN rm -rf /opt/aiter/aiter/jit/build
-          RUN rm -rf /opt/aiter/aiter/jit/*.so
-          RUN rm -rf ~/.aiter
+          RUN bash /tmp/aiter_update.sh && rm -f /tmp/aiter_update.sh
 
           RUN echo "=== sgl-kernel version before installation ===" && pip show sgl-kernel || true
           RUN echo "=== sglang version before installation ===" && pip show sglang || true
@@ -536,6 +605,6 @@ jobs:
           echo "Removing CI-built image for this job: ${LOCAL_IMAGE_NAME}"
           docker rmi -f "${LOCAL_IMAGE_NAME}" || true
 
-          rm -f Dockerfile.mod || true
+          rm -f Dockerfile.mod aiter_update.sh || true
 
           echo "CI cleanup complete (container + image for this job only)."
