@@ -65,6 +65,10 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.shared_expert_topk_fusion import (
+    append_shared_to_topk,
+    get_shared_expert_gate_weights,
+)
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputChecker
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
@@ -355,19 +359,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         ]
 
     def _get_shared_expert_weights(
-        self, hidden_states: torch.Tensor
-    ) -> Optional[Tuple[torch.Tensor, float]]:
-        """Return the shared_expert_gate weights and the 1/ep_size scale.
+        self,
+        hidden_states: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Return the per-token shared_expert_gate weights, already ep-scaled.
 
-        On the AMD AITER path the sigmoid activation and the scale are applied
-        (in fp32) inside the fused append kernel, so this returns the raw gate
-        logits to avoid a standalone activation kernel + cast. On the CUDA path
-        the legacy eager ``sigmoid(logits) * scale`` is returned unchanged.
+        The gate itself goes through ``get_shared_expert_gate_weights``, which
+        dispatches to the Triton ``fused_linear_sigmoid_kernel`` (one kernel for
+        ``sigmoid(x @ w^T)``) whenever the gate is a bias-free (1, H) linear on
+        device, and falls back to eager ``linear`` + ``sigmoid`` otherwise.
         """
         if not self.enable_shared_expert_fusion or self.shared_expert_gate is None:
             return None
-        shared_out = self.shared_expert_gate(hidden_states)
-        shared_logits = shared_out[0] if isinstance(shared_out, tuple) else shared_out
+        shared_weights = get_shared_expert_gate_weights(
+            self.shared_expert_gate, hidden_states
+        )
         # Allreduce-EP path: the fused shared expert occupies a single global
         # slot loaded onto every EP rank (see FusedMoE.__init__: num_shared_slots
         # == num_fused_shared_experts when not is_deepep_class_backend()). Every
@@ -375,15 +381,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # post-experts all_reduce sums it ep_size times. Pre-scale the per-token
         # routing weight by 1/ep_size to cancel this, mirroring DeepSeek-V2's
         # fused_shared_experts_scaling_factor pattern.
-        scale = 1.0
+        #
+        # The gated append kernel takes the gate weights verbatim, so the scale
+        # is folded in here. On ep_size == 1 (the TP-only serving configs) this
+        # is a no-op and costs no extra kernel.
         moe_ep_size = get_parallel().moe_ep_size
         if moe_ep_size > 1 and not is_deepep_class_backend():
-            scale = 1.0 / float(moe_ep_size)
-        # Only AITER fuses sigmoid + cast in-kernel; on CUDA keep the legacy
-        # eager activation so the NVIDIA path behavior is unchanged.
-        if not _use_aiter:
-            return F.sigmoid(shared_logits) * scale, 1.0
-        return shared_logits, scale
+            shared_weights = shared_weights * (1.0 / float(moe_ep_size))
+        return shared_weights
 
     def _append_shared_to_topk_output(
         self,
@@ -393,25 +398,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         """Append shared expert ids and weights to topk output before fused MoE."""
         if not self.enable_shared_expert_fusion:
             return topk_output
-        shared = self._get_shared_expert_weights(hidden_states)
-        if shared is None:
+        shared_weights = self._get_shared_expert_weights(hidden_states)
+        if shared_weights is None:
             return topk_output
-        shared_weights, shared_scale = shared
 
-        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
-            fused_append_shared_experts_with_weights,
-        )
-
-        # AITER returns raw logits + scale for in-kernel sigmoid fusion; CUDA
-        # returns pre-activated weights (scale already folded in) → no fusion.
-        fused_topk_ids, fused_topk_weights = fused_append_shared_experts_with_weights(
+        # Dispatches to the Triton _fused_append_shared_experts_gated_kernel,
+        # which writes the routed top-k and the per-token shared-expert slots in
+        # one pass; falls back to the eager cat-based reference off-device.
+        fused_topk_ids, fused_topk_weights = append_shared_to_topk(
             topk_output.topk_ids,
             topk_output.topk_weights,
             shared_weights,
+            self.num_experts,
             self.num_fused_shared_experts,
-            N=self.num_experts,
-            apply_sigmoid=_use_aiter,
-            scale=shared_scale,
         )
         return StandardTopKOutput(
             topk_weights=fused_topk_weights,
