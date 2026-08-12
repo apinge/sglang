@@ -47,17 +47,20 @@ def fused_linear_sigmoid(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
     out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """Triton: sigmoid(sum_h x[n,h]*W[0,h]) -> [N, 1]."""
     assert hidden_states.dim() == 2 and weight.dim() == 2
     n, h = hidden_states.shape
     assert weight.shape == (1, h), "gate weight must be (1, hidden_size), no bias"
     assert weight.device == hidden_states.device
+    if out_dtype is None:
+        out_dtype = hidden_states.dtype
 
     if out is None:
-        out = torch.empty((n, 1), dtype=hidden_states.dtype, device=hidden_states.device)
+        out = torch.empty((n, 1), dtype=out_dtype, device=hidden_states.device)
     else:
-        assert out.shape == (n, 1) and out.dtype == hidden_states.dtype
+        assert out.shape == (n, 1) and out.dtype == out_dtype
 
     assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
     assert weight.is_contiguous(), "weight must be contiguous"

@@ -1455,7 +1455,7 @@ def _fused_append_shared_experts_gated_kernel(
     tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
     tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws, mask=mask_k)
 
-    shared_w = tl.load(shared_weights_ptr + pid)
+    shared_w = tl.load(shared_weights_ptr + pid).to(ws.dtype)
     offs_s = tl.arange(0, BLOCK_S)
     mask_s = offs_s < S
     shared_ids = tl.cast(N_BASE + offs_s, ids.dtype)
@@ -1487,8 +1487,6 @@ def fused_append_shared_experts_gated(
     out_weights = torch.empty(
         (m, k + s), dtype=topk_weights.dtype, device=topk_weights.device
     )
-
-    shared_weights = shared_weights.to(topk_weights.dtype)
 
     _fused_append_shared_experts_gated_kernel[(m,)](
         topk_ids,
