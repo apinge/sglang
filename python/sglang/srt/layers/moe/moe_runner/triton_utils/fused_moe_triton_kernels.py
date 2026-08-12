@@ -1421,3 +1421,86 @@ def fused_append_shared_experts_with_weights(
         num_warps=1,
     )
     return out_ids, out_weights
+
+
+@triton.jit
+def _fused_append_shared_experts_gated_kernel(
+    topk_ids_ptr,
+    topk_weights_ptr,
+    shared_weights_ptr,
+    out_ids_ptr,
+    out_weights_ptr,
+    N_BASE,
+    K: tl.constexpr,
+    S: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    """
+    Copy routed top-k then append shared expert ids/weights with per-token gate
+    weights (sigmoid of shared_expert_gate), matching expand(M, S) semantics.
+    """
+    pid = tl.program_id(0)
+
+    ids_row_ptr = pid * K
+    w_row_ptr = pid * K
+    out_ids_row_ptr = pid * (K + S)
+    out_w_row_ptr = pid * (K + S)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_k = offs_k < K
+    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k, mask=mask_k, other=0)
+    ws = tl.load(topk_weights_ptr + w_row_ptr + offs_k, mask=mask_k, other=0.0)
+
+    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
+    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws, mask=mask_k)
+
+    shared_w = tl.load(shared_weights_ptr + pid)
+    offs_s = tl.arange(0, BLOCK_S)
+    mask_s = offs_s < S
+    shared_ids = tl.cast(N_BASE + offs_s, ids.dtype)
+    shared_ws = tl.full([BLOCK_S], shared_w, dtype=ws.dtype)
+
+    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids, mask=mask_s)
+    tl.store(out_weights_ptr + out_w_row_ptr + K + offs_s, shared_ws, mask=mask_s)
+
+
+def fused_append_shared_experts_gated(
+    topk_ids,
+    topk_weights,
+    shared_weights,
+    num_experts,
+    num_fused_shared_experts,
+):
+    """Append shared experts using per-token gate weights instead of a constant."""
+    m, k = topk_ids.shape
+    s = int(num_fused_shared_experts)
+    if s <= 0:
+        return topk_ids, topk_weights
+
+    if shared_weights.dim() == 2:
+        assert shared_weights.shape[1] == 1
+        shared_weights = shared_weights.squeeze(-1)
+    assert shared_weights.shape == (m,)
+
+    out_ids = torch.empty((m, k + s), dtype=topk_ids.dtype, device=topk_ids.device)
+    out_weights = torch.empty(
+        (m, k + s), dtype=topk_weights.dtype, device=topk_weights.device
+    )
+
+    shared_weights = shared_weights.to(topk_weights.dtype)
+
+    _fused_append_shared_experts_gated_kernel[(m,)](
+        topk_ids,
+        topk_weights,
+        shared_weights,
+        out_ids,
+        out_weights,
+        N_BASE=num_experts,
+        K=k,
+        S=s,
+        BLOCK_K=triton.next_power_of_2(k),
+        BLOCK_S=triton.next_power_of_2(s),
+        num_warps=1,
+    )
+    return out_ids, out_weights
