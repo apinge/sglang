@@ -583,6 +583,60 @@ class TestAiterGDNBackendRegistration(unittest.TestCase):
             )
         )
 
+    def test_backend_builds_reusable_aiter_prefill_metadata(self):
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+
+        backend = object.__new__(GDNAttnBackend)
+        backend._aiter_decode_active_batch_size = None
+        backend._aiter_prefill_metadata = None
+        backend._aiter_prefill_metadata_builder = mock.Mock(
+            return_value="prefill-metadata"
+        )
+        backend.mamba_cache_chunk_size = 64
+        query_start_loc = torch.tensor([0, 8192], dtype=torch.int32)
+        backend.forward_metadata = SimpleNamespace(query_start_loc=query_start_loc)
+        forward_mode = mock.Mock()
+        forward_mode.is_decode_or_idle.return_value = False
+        forward_mode.is_extend_without_speculative.return_value = True
+        forward_batch = SimpleNamespace(
+            forward_mode=forward_mode,
+            batch_size=1,
+            num_padding=0,
+            extend_seq_lens_cpu=[8192],
+        )
+
+        backend._prepare_aiter_forward_metadata(forward_batch)
+
+        self.assertEqual(backend._aiter_prefill_metadata, "prefill-metadata")
+        backend._aiter_prefill_metadata_builder.assert_called_once_with(
+            [8192],
+            cu_seqlens=query_start_loc,
+            chunk_size=64,
+        )
+
+    def test_backend_skips_reusable_prefill_metadata_without_cpu_lengths(self):
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+
+        backend = object.__new__(GDNAttnBackend)
+        backend._aiter_prefill_metadata_builder = mock.Mock()
+        backend.forward_metadata = SimpleNamespace(
+            query_start_loc=torch.tensor([0, 8192], dtype=torch.int32)
+        )
+        forward_mode = mock.Mock()
+        forward_mode.is_decode_or_idle.return_value = False
+        forward_mode.is_extend_without_speculative.return_value = True
+        forward_batch = SimpleNamespace(
+            forward_mode=forward_mode,
+            batch_size=1,
+            num_padding=0,
+            extend_seq_lens_cpu=None,
+        )
+
+        backend._prepare_aiter_forward_metadata(forward_batch)
+
+        self.assertIsNone(backend._aiter_prefill_metadata)
+        backend._aiter_prefill_metadata_builder.assert_not_called()
+
     def test_prefill_uses_aiter_and_falls_back_when_intermediate_h_is_required(self):
         from sglang.srt.layers.attention.linear.kernels.gdn_aiter import (
             AiterGDNKernel,
@@ -652,6 +706,7 @@ class TestAiterGDNBackendRegistration(unittest.TestCase):
         k_norm = torch.full_like(k, 2)
         fused_l2norm_qk = mock.Mock(return_value=(q_norm, k_norm))
         prefill = mock.Mock(return_value=("aiter", None))
+        prefill_metadata = object()
         kernel = AiterGDNKernel(
             fallback_kernel=mock.Mock(),
             hip_decode=None,
@@ -675,6 +730,8 @@ class TestAiterGDNBackendRegistration(unittest.TestCase):
                 cache_indices=torch.tensor([1], dtype=torch.int32),
                 query_start_loc=torch.tensor([0, 5], dtype=torch.int32),
                 return_intermediate_h=False,
+                seq_lens_cpu=[5],
+                prefill_metadata=prefill_metadata,
             )
 
         self.assertEqual(output, "aiter")
@@ -684,6 +741,8 @@ class TestAiterGDNBackendRegistration(unittest.TestCase):
         call = prefill.call_args.kwargs
         self.assertIs(call["q"], q_norm)
         self.assertIs(call["k"], k_norm)
+        self.assertEqual(call["seq_lens_cpu"], [5])
+        self.assertIs(call["prefill_metadata"], prefill_metadata)
         self.assertFalse(call["use_qk_l2norm_in_kernel"])
         self.assertTrue(call["use_chunk_hip"])
 
