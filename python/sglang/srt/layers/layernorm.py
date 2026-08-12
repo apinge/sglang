@@ -36,6 +36,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    is_aiter_fused_ar_rmsnorm_disabled,
     is_cpu,
     is_cuda,
     is_flashinfer_available,
@@ -52,6 +53,11 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _AITER_NEW_CA = get_bool_env_var("SGLANG_USE_AITER_NEW_CA", "true")
+_AITER_FUSED_NORM_DEFAULT = (
+    _use_aiter
+    and not _AITER_NEW_CA
+    and not is_aiter_fused_ar_rmsnorm_disabled()
+)
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
@@ -155,7 +161,9 @@ def _forward_with_allreduce_fusion(
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
         from sglang.srt.distributed import (
-            tensor_model_parallel_all_reduce,
+            attention_tensor_model_parallel_all_reduce,
+            is_custom_all_reduce_enabled,
+            moe_tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
         from sglang.srt.layers.flashinfer_comm_fusion import (
@@ -173,9 +181,14 @@ def _forward_with_allreduce_fusion(
         if world_size > 1:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
+                post_residual_addition = None
 
             # Prefer AITER fused AR+RMSNorm when enabled on AMD.
-            if _use_aiter:
+            if (
+                _AITER_FUSED_NORM_DEFAULT
+                and is_custom_all_reduce_enabled()
+                and x.numel() > 0
+            ):
                 fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
                     x,
                     residual,
@@ -185,7 +198,7 @@ def _forward_with_allreduce_fusion(
                 )
                 if fused_result is not None:
                     return fused_result
-            else:
+            elif not _use_aiter and x.numel() > 0:
                 fused_result = flashinfer_allreduce_residual_rmsnorm(
                     input_tensor=x,
                     residual=residual,
@@ -197,9 +210,11 @@ def _forward_with_allreduce_fusion(
                 if fused_result[0] is not None:
                     return fused_result
 
-            # For AITER route, preserve correctness when fused path is unavailable.
-            if _use_aiter and get_global_server_args().enable_aiter_allreduce_fusion:
-                x = tensor_model_parallel_all_reduce(x)
+            if x.numel() > 0:
+                if use_attn_tp_group:
+                    x = attention_tensor_model_parallel_all_reduce(x)
+                else:
+                    x = moe_tensor_model_parallel_all_reduce(x)
                 return norm_module.forward(x, residual, None)
 
     return norm_module.forward(x, residual, post_residual_addition)
