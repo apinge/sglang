@@ -614,6 +614,29 @@ class TestAiterGDNBackendRegistration(unittest.TestCase):
             chunk_size=64,
         )
 
+    def test_backend_skips_reusable_prefill_metadata_without_cpu_lengths(self):
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+
+        backend = object.__new__(GDNAttnBackend)
+        backend._aiter_prefill_metadata_builder = mock.Mock()
+        backend.forward_metadata = SimpleNamespace(
+            query_start_loc=torch.tensor([0, 8192], dtype=torch.int32)
+        )
+        forward_mode = mock.Mock()
+        forward_mode.is_decode_or_idle.return_value = False
+        forward_mode.is_extend_without_speculative.return_value = True
+        forward_batch = SimpleNamespace(
+            forward_mode=forward_mode,
+            batch_size=1,
+            num_padding=0,
+            extend_seq_lens_cpu=None,
+        )
+
+        backend._prepare_aiter_forward_metadata(forward_batch)
+
+        self.assertIsNone(backend._aiter_prefill_metadata)
+        backend._aiter_prefill_metadata_builder.assert_not_called()
+
     def test_prefill_uses_aiter_and_falls_back_when_intermediate_h_is_required(self):
         from sglang.srt.layers.attention.linear.kernels.gdn_aiter import (
             AiterGDNKernel,

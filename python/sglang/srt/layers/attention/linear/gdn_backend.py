@@ -403,6 +403,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and forward_batch.forward_mode.is_extend_without_speculative()
             and not _forward_batch_has_padding(forward_batch)
             and self.forward_metadata.query_start_loc.numel() == 2
+            and forward_batch.extend_seq_lens_cpu is not None
             and len(forward_batch.extend_seq_lens_cpu) == 1
         ):
             self._aiter_prefill_metadata = self._aiter_prefill_metadata_builder(
