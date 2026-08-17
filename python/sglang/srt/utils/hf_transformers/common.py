@@ -56,6 +56,8 @@ from sglang.srt.configs import (
     Olmo3Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
+    Qwen3_5TextConfig,
     Qwen3NextConfig,
     Step3p5Config,
     Step3p7Config,
@@ -109,6 +111,13 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         DeepseekVLV2Config,
         Qwen3_5Config,
         Qwen3_5MoeConfig,
+        # Text-only checkpoints ship model_type "qwen3_5_text" /
+        # "qwen3_5_moe_text" (no multimodal wrapper). Register these so
+        # get_config() returns SGLang's config subclass instead of the
+        # transformers-native class, keeping isinstance-based dispatch
+        # (e.g. hybrid_gdn_config -> HybridLinearAttnBackend) working.
+        Qwen3_5TextConfig,
+        Qwen3_5MoeTextConfig,
         InternS2PreviewConfig,
         JetNemotronConfig,
         JetVLMConfig,
