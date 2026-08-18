@@ -181,9 +181,23 @@ def _forward_with_allreduce_fusion(
                 residual = residual + post_residual_addition
                 post_residual_addition = None
 
+            # The fused helper below dispatches through get_tp_group(), so only
+            # use it when this path's target group is equivalent to regular TP.
+            parallel = get_parallel()
+            fused_ar_uses_tp_group = (
+                parallel.attn_tp_size == parallel.tp_size
+                if use_attn_tp_group
+                else (
+                    parallel.moe_ep_size == 1
+                    and parallel.moe_dp_size == 1
+                    and parallel.moe_tp_size == parallel.tp_size
+                )
+            )
+
             # Prefer AITER fused AR+RMSNorm when enabled on AMD.
             if (
-                _AITER_FUSED_NORM_DEFAULT
+                fused_ar_uses_tp_group
+                and _AITER_FUSED_NORM_DEFAULT
                 and is_custom_all_reduce_enabled()
                 and x.numel() > 0
             ):
