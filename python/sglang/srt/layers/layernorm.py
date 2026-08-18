@@ -161,6 +161,7 @@ def _forward_with_allreduce_fusion(
         from sglang.srt.distributed import (
             attention_tensor_model_parallel_all_reduce,
             is_custom_all_reduce_enabled,
+            moe_expert_parallel_all_reduce,
             moe_tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
@@ -225,6 +226,8 @@ def _forward_with_allreduce_fusion(
             if x.numel() > 0:
                 if use_attn_tp_group:
                     x = attention_tensor_model_parallel_all_reduce(x)
+                elif parallel.moe_ep_size > 1:
+                    x = moe_expert_parallel_all_reduce(x)
                 else:
                     x = moe_tensor_model_parallel_all_reduce(x)
                 return norm_module.forward(x, residual, None)
