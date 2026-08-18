@@ -1246,14 +1246,6 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
     return value in truthy_values
 
 
-def is_aiter_fused_ar_rmsnorm_disabled() -> bool:
-    """Return whether AITER fused AR + residual add + RMSNorm is disabled."""
-    # Keep the old MLP-quant name as a compatibility alias for existing scripts.
-    return get_bool_env_var(
-        "SGLANG_DISABLE_AITER_FUSED_AR_RMSNORM", "false"
-    ) or get_bool_env_var("SGLANG_DISABLE_AITER_FUSED_MLP_QUANT", "false")
-
-
 def get_int_env_var(name: str, default: int = 0) -> int:
     # FIXME: move your environment variable to sglang.srt.environ
     value = os.getenv(name)

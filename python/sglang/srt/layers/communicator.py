@@ -80,7 +80,6 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_bool_env_var,
-    is_aiter_fused_ar_rmsnorm_disabled,
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
@@ -103,7 +102,6 @@ _AITER_NEW_CA = get_bool_env_var("SGLANG_USE_AITER_NEW_CA", "true")
 _AITER_FUSED_AR_RMSNORM_DEFAULT = (
     _use_aiter
     and not _AITER_NEW_CA
-    and not is_aiter_fused_ar_rmsnorm_disabled()
 )
 _AITER_FUSED_AR_RMSNORM_DECODE_ONLY = get_bool_env_var(
     "SGLANG_FUSED_AR_RMSNORM_DECODE_ONLY", "true"
