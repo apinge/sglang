@@ -748,7 +748,7 @@ class GroupCoordinator:
                 return input_
 
         outplace_all_reduce_method = None
-        custom_allreduce_enabled = _ENABLE_CUSTOM_ALL_REDUCE
+        custom_allreduce_enabled = is_custom_all_reduce_enabled()
         if (
             custom_allreduce_enabled
             and self.qr_comm is not None
@@ -818,7 +818,7 @@ class GroupCoordinator:
         use_old_ca: bool = False,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator. ROCm/HIP Only"""
-        if not _ENABLE_CUSTOM_ALL_REDUCE:
+        if not is_custom_all_reduce_enabled():
             self._log_fused_ar_rmsnorm_skip("custom AR disabled", input_)
             return None
         ca_comm = self.ca_comm
@@ -923,7 +923,7 @@ class GroupCoordinator:
         emit_bf16: bool = False,
         use_old_ca: bool = False,
     ) -> Optional[Tuple[torch.Tensor, ...]]:
-        if not _ENABLE_CUSTOM_ALL_REDUCE:
+        if not is_custom_all_reduce_enabled():
             return None
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
@@ -1921,7 +1921,7 @@ def init_model_parallel_group(
     recovered_rank: bool = False,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
-        use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
+        use_custom_allreduce = is_custom_all_reduce_enabled()
     if use_mscclpp_allreduce is None:
         use_mscclpp_allreduce = _ENABLE_MSCCLPP_ALL_REDUCE
     if use_torch_symm_mem_allreduce is None:
