@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
-        StandardDispatchOutput,
+        DispatchOutput,
     )
 
 __all__ = ["CompressedTensorsW8A8Fp8MoE"]
@@ -369,11 +369,8 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
     def apply_weights(
         self,
         layer: torch.nn.Module,
-        dispatch_output: StandardDispatchOutput,
+        dispatch_output: DispatchOutput,
     ) -> CombineInput:
-
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
 
         moe_runner_config = self.moe_runner_config
 
@@ -392,6 +389,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 w2_scale=layer.w2_weight_scale,
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
+                expert_mask=getattr(layer.dispatcher, "expert_mask_gpu", None),
             )
             return self.runner.run(dispatch_output, quant_info)
         elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:
