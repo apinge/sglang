@@ -513,11 +513,11 @@ class GroupCoordinator:
                 except Exception as e:
                     logger.warning(f"Failed to initialize QuickAllReduce: {e}")
 
-        if _use_aiter:
+        if _use_aiter and group_name == "tp":
             from aiter.dist.parallel_state import set_custom_all_reduce
 
-            set_custom_all_reduce(True)
-            if _use_aiter_cuda_comm and self.world_size > 1:
+            set_custom_all_reduce(use_custom_allreduce)
+            if use_custom_allreduce and _use_aiter_cuda_comm and self.world_size > 1:
                 try:
                     from aiter.dist.device_communicators.communicator_cuda import (
                         CudaCommunicator as AiterCudaCommunicator,
@@ -539,6 +539,7 @@ class GroupCoordinator:
             and self.world_size > 1
             and is_hip()
             and self._aiter_cuda_comm is None
+            and group_name == "tp"
         ):
             logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
 
@@ -747,14 +748,17 @@ class GroupCoordinator:
                 return input_
 
         outplace_all_reduce_method = None
+        custom_allreduce_enabled = is_custom_all_reduce_enabled()
         if (
-            self.qr_comm is not None
+            custom_allreduce_enabled
+            and self.qr_comm is not None
             and not self.qr_comm.disabled
             and self.qr_comm.should_quick_allreduce(input_)
         ):
             outplace_all_reduce_method = "qr"
         elif (
-            self._aiter_cuda_comm is not None
+            custom_allreduce_enabled
+            and self._aiter_cuda_comm is not None
             and _use_aiter
             and _use_aiter_cuda_comm
             and _aiter_cuda_comm_in_active_forward.get()
@@ -762,7 +766,8 @@ class GroupCoordinator:
             # Prefill-only AITER AR path. AITER internally tries quick reduce first.
             outplace_all_reduce_method = "aiter_cuda_comm"
         elif (
-            self.ca_comm is not None
+            custom_allreduce_enabled
+            and self.ca_comm is not None
             and not self.ca_comm.disabled
             and not should_use_pymscclpp_allreduce
             and self.ca_comm.should_custom_ar(input_)
@@ -813,6 +818,9 @@ class GroupCoordinator:
         use_old_ca: bool = False,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator. ROCm/HIP Only"""
+        if not is_custom_all_reduce_enabled():
+            self._log_fused_ar_rmsnorm_skip("custom AR disabled", input_)
+            return None
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             self._log_fused_ar_rmsnorm_skip("ca_comm unavailable or disabled", input_)
@@ -915,6 +923,8 @@ class GroupCoordinator:
         emit_bf16: bool = False,
         use_old_ca: bool = False,
     ) -> Optional[Tuple[torch.Tensor, ...]]:
+        if not is_custom_all_reduce_enabled():
+            return None
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None
@@ -1911,7 +1921,7 @@ def init_model_parallel_group(
     recovered_rank: bool = False,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
-        use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
+        use_custom_allreduce = is_custom_all_reduce_enabled()
     if use_mscclpp_allreduce is None:
         use_mscclpp_allreduce = _ENABLE_MSCCLPP_ALL_REDUCE
     if use_torch_symm_mem_allreduce is None:
@@ -2071,6 +2081,10 @@ _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
 def set_custom_all_reduce(enable: bool):
     global _ENABLE_CUSTOM_ALL_REDUCE
     _ENABLE_CUSTOM_ALL_REDUCE = enable
+
+
+def is_custom_all_reduce_enabled() -> bool:
+    return _ENABLE_CUSTOM_ALL_REDUCE
 
 
 def set_mscclpp_all_reduce(enable: bool):
