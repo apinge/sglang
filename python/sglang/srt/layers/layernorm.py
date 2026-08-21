@@ -473,6 +473,9 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if _use_aiter:
+            return self.forward_aiter(x, residual, post_residual_addition)
+
         # Fallback to native implementation if vllm is not available
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
