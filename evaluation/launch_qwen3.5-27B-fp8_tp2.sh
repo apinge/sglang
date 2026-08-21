@@ -9,10 +9,7 @@ export SGLANG_USE_AITER=1
 export SGLANG_ROCM_USE_AITER_LINEAR_SHUFFLE=1
 export SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB=1
 export SGLANG_USE_AITER_NEW_CA=false
-#export USE_HIP_LINEAR_ATTN=1
 export SGLANG_USE_IPC_POOL_HANDLE_CACHE=1
-#export AITER_QUICK_REDUCE_QUANTIZATION=INT8
-#export SGLANG_DISABLE_AITER_FUSED_AR_RMSNORM=1
 export HIP_GDN_SORT_IDX_BS=32768
 
 export TVM_FFI_DISABLE_TORCH_C_DLPACK=1
@@ -39,4 +36,5 @@ python3 -m sglang.launch_server \
   --linear-attn-backend aiter \
   --linear-attn-decode-backend aiter \
   --linear-attn-prefill-backend aiter \
+  --watchdog-timeout 1200 \
   --disable-custom-all-reduce 2>&1 | tee "${ROOT}/logs/server"/qwen3.5-27B-fp8_tp2_no_prefix_cache_origin.log
