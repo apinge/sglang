@@ -36,5 +36,4 @@ python3 -m sglang.launch_server \
   --linear-attn-backend aiter \
   --linear-attn-decode-backend aiter \
   --linear-attn-prefill-backend aiter \
-  --watchdog-timeout 1200 \
-  --disable-custom-all-reduce 2>&1 | tee "${ROOT}/logs/server"/qwen3.5-9B-bf16_tp1_no_prefix_cache_origin.log
+  --watchdog-timeout 1200 2>&1 | tee "${ROOT}/logs/server"/qwen3.5-9B-bf16_tp1_no_prefix_cache_origin.log
