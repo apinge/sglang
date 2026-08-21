@@ -32,7 +32,7 @@ python3 -m sglang.launch_server \
  --mem-fraction-static 0.9 \
  --max-prefill-tokens 32768 \
  --max-running-requests 128 \
-  --cuda-graph-max-bs 128 \
+ --cuda-graph-max-bs 128 \
  --attention-backend aiter \
  --mm-attention-backend aiter_attn \
  --linear-attn-backend aiter \
