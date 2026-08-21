@@ -99,6 +99,7 @@ if _is_cuda or _is_xpu or _is_musa:
     )
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
+_has_rocm_triton_gemma_rms_norm = False
 if _use_aiter:
     from aiter import layernorm2d_fwd as layer_norm
     from aiter import rmsnorm2d_fwd as rms_norm
@@ -114,6 +115,19 @@ elif _is_hip:
     except ImportError:
         # Fallback: vllm not available, will use forward_native
         _has_vllm_rms_norm = False
+
+if _is_hip:
+    try:
+        from sglang.jit_kernel.minimax_m3.rmsnorm import (
+            gemma_fused_add_rmsnorm as rocm_triton_gemma_fused_add_rmsnorm,
+        )
+        from sglang.jit_kernel.minimax_m3.rmsnorm import (
+            gemma_rmsnorm as rocm_triton_gemma_rmsnorm,
+        )
+
+        _has_rocm_triton_gemma_rms_norm = True
+    except ImportError:
+        _has_rocm_triton_gemma_rms_norm = False
 
 if _is_cuda:
     # HF-semantics RMSNorm kernel (JIT-compiled).  Used when `cast_x_before_out_mul=True`
@@ -480,14 +494,10 @@ class RMSNorm(MultiPlatformOp):
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
         if residual is not None:
-            out = torch.empty_like(x)
-            residual_out = torch.empty_like(x)
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            fused_add_rms_norm(
-                out, x, residual_out, residual, self.weight.data, self.variance_epsilon
-            )
-            return out, residual_out
+            fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)
+            return x, residual
         out = torch.empty_like(x)
         rms_norm(out, x, self.weight.data, self.variance_epsilon)
         return out
@@ -788,6 +798,15 @@ class GemmaRMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if _has_rocm_triton_gemma_rms_norm:
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                return rocm_triton_gemma_fused_add_rmsnorm(
+                    x, residual, self.weight.data, self.variance_epsilon
+                )
+            return rocm_triton_gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
+
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
 
@@ -811,14 +830,10 @@ class GemmaRMSNorm(MultiPlatformOp):
             if not x.is_contiguous():
                 x = x.contiguous()
             if residual is not None:
-                out = torch.empty_like(x)
-                residual_out = torch.empty_like(x)
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
-                fused_add_rms_norm(
-                    out, x, residual_out, residual, w, self.variance_epsilon
-                )
-                return out, residual_out
+                fused_add_rms_norm(x, residual, w, self.variance_epsilon)
+                return x, residual
             out = torch.empty_like(x)
             rms_norm(out, x, w, self.variance_epsilon)
             return out
