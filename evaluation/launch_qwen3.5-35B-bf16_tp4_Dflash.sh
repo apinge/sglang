@@ -22,7 +22,6 @@ python3 -m sglang.launch_server \
  --tp-size 4 \
  --reasoning-parser qwen3 \
  --tool-call-parser qwen3_coder \
- --disable-radix-cache \
  --speculative-algorithm DFLASH \
  --speculative-draft-model-path ${model1} \
  --speculative-num-draft-tokens 16 \
