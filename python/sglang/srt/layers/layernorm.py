@@ -801,6 +801,16 @@ class GemmaRMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if x.numel() == 0:
+            if residual is not None:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                return x, residual
+            return x
+
+        if is_batch_invariant_mode_enabled():
+            return self.forward_native(x, residual, post_residual_addition)
+
         if _has_rocm_triton_gemma_rms_norm:
             if residual is not None:
                 if post_residual_addition is not None:
