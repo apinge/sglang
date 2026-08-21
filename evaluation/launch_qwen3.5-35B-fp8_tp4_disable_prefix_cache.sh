@@ -12,6 +12,7 @@ export SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB=1
 export SGLANG_USE_AITER_NEW_CA=false
 export SGLANG_USE_IPC_POOL_HANDLE_CACHE=1
 export AITER_QUICK_REDUCE_QUANTIZATION=INT6
+export USE_AITER_COMM=1
 export HIP_GDN_SORT_IDX_BS=32768
 
 export TVM_FFI_DISABLE_TORCH_C_DLPACK=1 # pip uninstall torch-c-dlpack-ext
@@ -28,7 +29,7 @@ python3 -m sglang.launch_server \
   --enable-multimodal \
   --trust-remote-code \
   --chunked-prefill-size 32768 \
-  --mem-fraction-static 0.8 \
+  --mem-fraction-static 0.9 \
   --max-prefill-tokens 32768 \
   --max-running-requests 128 \
   --cuda-graph-max-bs 128 \
@@ -40,4 +41,5 @@ python3 -m sglang.launch_server \
   --enable-strict-thinking \
   --kv-cache-dtype fp8_e4m3 \
   --disable-radix-cache \
+  --watchdog-timeout 1200 \
   2>&1 | tee "${ROOT}/logs/server"/qwen3.5-35B-fp8_tp4_disable_prefix_cache.log
