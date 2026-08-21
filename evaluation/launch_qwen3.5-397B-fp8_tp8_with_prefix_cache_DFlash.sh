@@ -11,7 +11,6 @@ export USE_AITER_COMM=1
 export SGLANG_USE_AITER_NEW_CA=false
 export SGLANG_USE_IPC_POOL_HANDLE_CACHE=1
 
-#export AITER_MOE_PADDING_SIZE=192
 export HIP_GDN_SORT_IDX_BS=32768
 export TVM_FFI_DISABLE_TORCH_C_DLPACK=1 # pip uninstall torch-c-dlpack-ext
 
