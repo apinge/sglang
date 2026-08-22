@@ -265,6 +265,14 @@ class AiterAttnBackend(AttentionBackend):
                 "SGLANG_USE_AITER_UNIFIED_ATTN"
             )
 
+        # pa_decode_gluon consumes a 2D physical-page table even though it is
+        # not the unified_attention compute path. Keep this separate from the
+        # unified-attention switch: enabling it for 5D must not change verify,
+        # cache-write, or other unified-only behavior.
+        self.use_paged_decode_page_table = (
+            self.kv_cache_is_vectorized_5d or self.use_triton_unified_attention
+        )
+
         # When topk == 1 the EAGLE draft chain is linear, so target_verify's
         # mask reduces to pure causal and can go through unified_attention
         # instead of the legacy triton extend_attention_fwd. Gated on non-MLA
@@ -283,7 +291,7 @@ class AiterAttnBackend(AttentionBackend):
 
         nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
 
-        if not (self.use_mla or self.use_triton_unified_attention):
+        if not (self.use_mla or self.use_paged_decode_page_table):
             self.workspace_buffer = torch.empty(
                 (max_bs * self.num_head * self.max_num_partitions * self.head_dim)
                 * nbyes_per_qo_elem
@@ -884,6 +892,21 @@ class AiterAttnBackend(AttentionBackend):
             seq_lens_cpu=seq_lens_cpu,
         )
 
+        # Decode graph replay pads to a captured batch bucket with synthetic
+        # rows (seq_len=1, req_pool_index=0). pa_decode_gluon really loads the
+        # first page for every such row, unlike the unified-attention path.
+        # Do not inherit req_to_token[0, 0], which may be a freed slot (-1) or
+        # a live request's page; route padded rows to the always-addressable
+        # physical page 0 instead. Their outputs are discarded by the runner.
+        num_padding = getattr(forward_batch, "num_padding", 0)
+        if self.use_paged_decode_page_table and num_padding:
+            pad_start = forward_batch.batch_size - num_padding
+            self.cuda_graph_page_table[pad_start : forward_batch.batch_size].zero_()
+            if self.use_sliding_window_kv_pool:
+                self.cuda_graph_swa_page_table[
+                    pad_start : forward_batch.batch_size
+                ].zero_()
+
         # Refill the SWA write-target buffer from the live out_cache_loc and
         # bind it onto the metadata before replay (_apply rebuilds it each call).
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
@@ -930,7 +953,7 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
 
-                if not self.use_triton_unified_attention:
+                if not self.use_paged_decode_page_table:
                     kv_indices = self._get_kv_indices_scratch(
                         forward_batch.seq_lens_sum, forward_batch.seq_lens.device
                     )
@@ -981,7 +1004,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr = self.qo_indptr_unified_decode[: bs + 1]
 
             else:
-                if self.use_triton_unified_attention and not self.use_mla:
+                if self.use_paged_decode_page_table and not self.use_mla:
                     bs = spec_info.kv_indptr.shape[0] - 1
                     kv_indices, swa_page_table = (
                         self._build_unified_page_table_from_spec(spec_info, bs)
@@ -1444,7 +1467,7 @@ class AiterAttnBackend(AttentionBackend):
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
 
-        if self.use_triton_unified_attention:
+        if self.use_paged_decode_page_table:
             # Keep a distinct page-table buffer for unified attention.  Sharing
             # cuda_graph_kv_indices with non-unified token indices makes
             # page-table width ambiguous after the token buffer is expanded.
@@ -1542,13 +1565,13 @@ class AiterAttnBackend(AttentionBackend):
             max_q_len = None
 
             if spec_info is None or (
-                self.use_triton_unified_attention and not self.use_mla
+                self.use_paged_decode_page_table and not self.use_mla
             ):
                 max_num_blocks_per_seq = (
                     self.max_context_len + self.page_size - 1
                 ) // self.page_size
 
-                if not self.use_triton_unified_attention:
+                if not self.use_paged_decode_page_table:
                     kv_indptr = self.kv_indptr
                     kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
                     kv_indptr = kv_indptr[: bs + 1]
