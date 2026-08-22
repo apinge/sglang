@@ -42,6 +42,19 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+def _resolve_mha_sub_pool(pool, layer: RadixAttention):
+    if hasattr(pool, "layers_mapping"):
+        sub_layer_id, sub_is_swa = pool.layers_mapping[layer.layer_id]
+        return pool.swa_kv_pool if sub_is_swa else pool.full_kv_pool, sub_layer_id
+
+    if hasattr(pool, "full_attention_layer_id_mapping") and hasattr(
+        pool, "full_kv_pool"
+    ):
+        return pool.full_kv_pool, pool.full_attention_layer_id_mapping[layer.layer_id]
+
+    return pool, layer.layer_id
+
+
 def forward_extend_vectorized_5d(
     backend: AiterAttnBackend,
     q: torch.Tensor,
@@ -137,13 +150,7 @@ def forward_extend_vectorized_5d(
 
     # Resolve the raw 5D K/V buffer for this layer (going through the
     # SWA→sub-pool mapping when applicable).
-    pool = backend.token_to_kv_pool
-    if hasattr(pool, "layers_mapping"):
-        sub_layer_id, sub_is_swa = pool.layers_mapping[layer.layer_id]
-        sub_pool = pool.swa_kv_pool if sub_is_swa else pool.full_kv_pool
-    else:
-        sub_pool = pool
-        sub_layer_id = layer.layer_id
+    sub_pool, sub_layer_id = _resolve_mha_sub_pool(backend.token_to_kv_pool, layer)
     k_buf = sub_pool.k_buffer[sub_layer_id - sub_pool.start_layer]
     v_buf = sub_pool.v_buffer[sub_layer_id - sub_pool.start_layer]
 
@@ -298,6 +305,7 @@ def forward_decode_vectorized_5d(
         max_context_partition_num=max_part_num,
         context_partition_size=ctx_part,
         compute_type=backend.input_dtype,
+        query_scale=None,
         key_scale=key_scale,
         value_scale=value_scale,
         exp_sums=exp_sums,
