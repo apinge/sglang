@@ -1,12 +1,14 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-
-register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=7, suite="stage-b-test-1-gpu-small-amd-mi35x")
-
 import os
 import unittest
 
 import torch
+
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+
+register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=7, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
 
 try:
     from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
@@ -353,6 +355,96 @@ class TestMambaStateScatterPerf(unittest.TestCase):
             f"  ref_total_ms (baseline):  {ref_ms:.4f}\n"
             f"  fused_total_ms:           {fused_ms:.4f}  (ratio={ratio:.3f}x, speedup={speedup:.2f}x)\n"
         )
+
+
+class TestMambaExtendStateCopy(unittest.TestCase):
+    def test_copy_flags_validate_ranges_and_overlap(self):
+        from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+            derive_track_ssm_copy_flags,
+        )
+
+        flags = derive_track_ssm_copy_flags(
+            torch.tensor([0, 3]),
+            torch.tensor([10, 11]),
+            torch.tensor([4, 5]),
+            torch.tensor([12, 13]),
+            h_state_rows=6,
+            pool_rows=16,
+        )
+        self.assertEqual(flags, (True, True, True))
+
+        flags = derive_track_ssm_copy_flags(
+            torch.tensor([0]),
+            torch.tensor([100]),
+            torch.tensor([4, 5]),
+            torch.tensor([5, 6]),
+            h_state_rows=6,
+            pool_rows=16,
+        )
+        self.assertEqual(flags, (False, True, False))
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.version.hip is not None,
+        "ROCm is required",
+    )
+    def test_direct_extend_copy_matches_advanced_indexing(self):
+        from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+            copy_mamba_state_extend_rows,
+        )
+
+        torch.manual_seed(23)
+        h = torch.randn(6, 2, 8, 8, device="cuda", dtype=torch.float32)
+        states = torch.randn(16, 2, 8, 8, device="cuda", dtype=torch.bfloat16)
+        expected = states.clone()
+        h_src = torch.tensor([1, 4], device="cuda", dtype=torch.int32)
+        h_dst = torch.tensor([10, 11], device="cuda", dtype=torch.int32)
+        final_src = torch.tensor([2, 3], device="cuda", dtype=torch.int32)
+        final_dst = torch.tensor([12, 13], device="cuda", dtype=torch.int32)
+        expected[h_dst] = h[h_src].to(expected.dtype)
+        expected[final_dst] = expected[final_src]
+
+        copy_mamba_state_extend_rows(
+            h,
+            states,
+            h_src,
+            h_dst,
+            final_src,
+            final_dst,
+            h_indices_trusted=True,
+            final_indices_trusted=True,
+            final_state_disjoint=True,
+        )
+        torch.testing.assert_close(states, expected, rtol=0, atol=0)
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.version.hip is not None,
+        "ROCm is required",
+    )
+    def test_overlapping_state_copy_preserves_gather_before_scatter(self):
+        from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+            copy_mamba_state_extend_rows,
+        )
+
+        states = torch.arange(8 * 2 * 4 * 4, device="cuda", dtype=torch.float32).view(
+            8, 2, 4, 4
+        )
+        expected = states.clone()
+        src = torch.tensor([1, 2, 3], device="cuda", dtype=torch.int32)
+        dst = torch.tensor([2, 3, 4], device="cuda", dtype=torch.int32)
+        expected[dst] = expected[src]
+
+        copy_mamba_state_extend_rows(
+            None,
+            states,
+            torch.empty(0, device="cuda", dtype=torch.int32),
+            torch.empty(0, device="cuda", dtype=torch.int32),
+            src,
+            dst,
+            h_indices_trusted=True,
+            final_indices_trusted=True,
+            final_state_disjoint=False,
+        )
+        torch.testing.assert_close(states, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":  # pragma: no cover

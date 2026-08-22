@@ -24,8 +24,10 @@ from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
     get_tp_group,
+    is_custom_all_reduce_enabled,
     moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_fused_allreduce_rmsnorm,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -96,6 +98,18 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
+_AITER_NEW_CA = get_bool_env_var("SGLANG_USE_AITER_NEW_CA", "true")
+_AITER_FUSED_AR_RMSNORM_DEFAULT = (
+    _use_aiter
+    and not _AITER_NEW_CA
+)
+_AITER_FUSED_AR_RMSNORM_DECODE_ONLY = get_bool_env_var(
+    "SGLANG_FUSED_AR_RMSNORM_DECODE_ONLY", "true"
+)
+
+logger = logging.getLogger(__name__)
+_logged_mlp_norm_fusion_skip_reasons = set()
+
 if _use_aiter:
     from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
     from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
@@ -163,6 +177,10 @@ def _fused_rmsnorm_fp8_per_token_quant(
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
 
+def _is_aiter_fused_ar_rmsnorm_enabled() -> bool:
+    return _AITER_FUSED_AR_RMSNORM_DEFAULT and is_custom_all_reduce_enabled()
+
+
 def apply_flashinfer_allreduce_fusion(batch_size: int):
     return (
         # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
@@ -182,13 +200,23 @@ def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
     total_bytes = input_tensor.numel() * input_tensor.element_size()
     # Aiter's should_custom_ar uses <= max_size/2 (64 MB); match that boundary.
     return (
-        _use_aiter
+        _is_aiter_fused_ar_rmsnorm_enabled()
         and total_bytes > 0
         and n <= 16384
         and total_bytes <= 8 * 1024 * 8192
         and get_parallel().tp_size != 6
         and not is_dp_attention_enabled()
-        and get_global_server_args().enable_aiter_allreduce_fusion
+    )
+
+
+def should_apply_aiter_all_reduce_fusion(
+    input_tensor: torch.Tensor, forward_batch: ForwardBatch
+):
+    if not apply_aiter_all_reduce_fusion(input_tensor):
+        return False
+    return (
+        not _AITER_FUSED_AR_RMSNORM_DECODE_ONLY
+        or forward_batch.forward_mode.is_decode_or_idle()
     )
 
 
@@ -463,6 +491,7 @@ class LayerCommunicator:
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm
         )
+        self._logged_mlp_norm_fusion_skip = False
 
     def _post_init_communicate(self):
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -565,7 +594,9 @@ class LayerCommunicator:
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
                 if (
-                    apply_aiter_all_reduce_fusion(hidden_states)
+                    should_apply_aiter_all_reduce_fusion(
+                        hidden_states, forward_batch
+                    )
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     hidden_states, residual = (
@@ -737,6 +768,95 @@ class LayerCommunicator:
             context=self._context,
         )
 
+    def prepare_mlp_with_norm_fusion(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        cache=None,
+    ):
+        if cache is not None:
+            self._context.cache = cache
+        if not self._can_fuse_mlp_norm(forward_batch):
+            return self.prepare_mlp(hidden_states, residual, forward_batch)
+
+        post_norm = self.post_attention_layernorm
+        weight = getattr(post_norm, "gemma_weight", None)
+        if weight is None:
+            weight = getattr(post_norm, "weight", None)
+        eps = getattr(post_norm, "variance_epsilon", None)
+        if weight is None or eps is None or residual is None:
+            return self.prepare_mlp(hidden_states, residual, forward_batch)
+        if not isinstance(weight, torch.Tensor) or weight.dim() != 1:
+            return self.prepare_mlp(hidden_states, residual, forward_batch)
+        if hidden_states.dtype != weight.dtype:
+            return self.prepare_mlp(hidden_states, residual, forward_batch)
+        if hidden_states.shape[0] == 0:
+            return self.prepare_mlp(hidden_states, residual, forward_batch)
+
+        result = tensor_model_parallel_fused_allreduce_rmsnorm(
+            hidden_states,
+            residual,
+            weight,
+            eps,
+            use_old_ca=not _AITER_NEW_CA,
+        )
+        if result is None:
+            self._log_mlp_norm_fusion_skip("fused_allreduce_rmsnorm returned None")
+            return self.prepare_mlp(hidden_states, residual, forward_batch)
+        return result
+
+    def _log_mlp_norm_fusion_skip(self, reason: str) -> None:
+        global _logged_mlp_norm_fusion_skip_reasons
+        if self._logged_mlp_norm_fusion_skip or reason in _logged_mlp_norm_fusion_skip_reasons:
+            return
+        logger.info(
+            "[AR] AITER fused MLP norm skipped: reason=%s layer_modes=%s "
+            "tp=%s attn_dp=%s input_scattered=%s",
+            reason,
+            self.layer_scatter_modes,
+            self._context.tp_size,
+            self._context.attn_dp_size,
+            get_attn_tp_context().input_scattered,
+        )
+        self._logged_mlp_norm_fusion_skip = True
+        _logged_mlp_norm_fusion_skip_reasons.add(reason)
+
+    def _can_fuse_mlp_norm(self, forward_batch: ForwardBatch) -> bool:
+        if not _is_aiter_fused_ar_rmsnorm_enabled():
+            self._log_mlp_norm_fusion_skip("env/custom AR gate disabled")
+            return False
+        if (
+            _AITER_FUSED_AR_RMSNORM_DECODE_ONLY
+            and not forward_batch.forward_mode.is_decode_or_idle()
+        ):
+            self._log_mlp_norm_fusion_skip(
+                f"forward_mode={forward_batch.forward_mode} is not decode_or_idle"
+            )
+            return False
+        ctx = self._context
+        if ctx.tp_size <= 1:
+            self._log_mlp_norm_fusion_skip("tp_size <= 1")
+            return False
+        if ctx.attn_dp_size != 1:
+            self._log_mlp_norm_fusion_skip("attn_dp_size != 1")
+            return False
+        if get_attn_tp_context().input_scattered:
+            self._log_mlp_norm_fusion_skip("attn input is scattered")
+            return False
+        fn = self._communicate_with_all_reduce_and_layer_norm_fn
+        if not isinstance(fn, partial):
+            self._log_mlp_norm_fusion_skip(f"communicate fn is not partial: {fn}")
+            return False
+        if not (
+            fn.func
+            is CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual
+        ):
+            self._log_mlp_norm_fusion_skip(f"unexpected communicate fn: {fn.func}")
+            return False
+        return True
+
     def postprocess_layer(
         self,
         hidden_states: torch.Tensor,
@@ -804,12 +924,15 @@ class LayerCommunicator:
             (
                 apply_flashinfer_allreduce_fusion(batch_size)
                 or (
-                    _use_aiter
+                    _is_aiter_fused_ar_rmsnorm_enabled()
                     and batch_size > 0
                     and get_parallel().tp_size != 6
                     and not is_dp_attention_enabled()
                     and get_moe_a2a_backend().is_none()
-                    and get_global_server_args().enable_aiter_allreduce_fusion
+                    and (
+                        not _AITER_FUSED_AR_RMSNORM_DECODE_ONLY
+                        or forward_batch.forward_mode.is_decode_or_idle()
+                    )
                 )
             )
             and (not self.is_last_layer)
@@ -1103,7 +1226,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         else:
             handled = False
             if (
-                apply_aiter_all_reduce_fusion(hidden_states)
+                should_apply_aiter_all_reduce_fusion(hidden_states, forward_batch)
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(

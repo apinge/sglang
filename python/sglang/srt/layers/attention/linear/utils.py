@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 class LinearAttnKernelBackend(Enum):
     TRITON = "triton"
+    AITER = "aiter"
     CUTEDSL = "cutedsl"
     FLASHINFER = "flashinfer"
     FLASHKDA = "flashkda"
@@ -25,6 +26,9 @@ class LinearAttnKernelBackend(Enum):
 
     def is_triton(self):
         return self == LinearAttnKernelBackend.TRITON
+
+    def is_aiter(self):
+        return self == LinearAttnKernelBackend.AITER
 
     def is_cutedsl(self):
         return self == LinearAttnKernelBackend.CUTEDSL

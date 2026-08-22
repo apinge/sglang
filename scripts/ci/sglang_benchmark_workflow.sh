@@ -22,6 +22,7 @@ PURE_TEXT_INPUT_TOKENS=${SGLANG_BENCHMARK_PURE_TEXT_INPUT_TOKENS:-8000}
 PURE_TEXT_OUTPUT_TOKENS=${SGLANG_BENCHMARK_PURE_TEXT_OUTPUT_TOKENS:-500}
 PURE_TEXT_NUM_PROMPTS=${SGLANG_BENCHMARK_PURE_TEXT_NUM_PROMPTS:-32}
 PURE_TEXT_MAX_CONCURRENCY=${SGLANG_BENCHMARK_PURE_TEXT_MAX_CONCURRENCY:-1}
+PURE_TEXT_WARMUP_REQUESTS=${SGLANG_BENCHMARK_PURE_TEXT_WARMUP_REQUESTS:-8}
 BENCHMARK_DATASETS_ROOT=${SGLANG_BENCHMARK_DATASETS_ROOT:-/models/benchmark_datasets}
 SHAREGPT_DATASET_FILENAME=${SGLANG_BENCHMARK_SHAREGPT_FILENAME:-ShareGPT_V3_unfiltered_cleaned_split.json}
 SHAREGPT_DATASET_PATH=${SGLANG_BENCHMARK_SHAREGPT_DATASET_PATH:-${BENCHMARK_DATASETS_ROOT}/${SHAREGPT_DATASET_FILENAME}}
@@ -34,6 +35,10 @@ is_397b_model() {
   [[ "${MODEL_NAME}" == "offical_qwen3p5_397B_ptpc" || "${MODEL_NAME}" == "Qwen3.5-397B-A17B-PTPC-FP8" ]]
 }
 
+is_27b_model() {
+  [[ "${MODEL_NAME}" == "Qwen3.5-27B-PTPC-compressor" ]]
+}
+
 export SGLANG_DISABLE_CUDNN_CHECK=1
 export SGLANG_USE_CUDA_IPC_TRANSPORT=1
 export SGLANG_VLM_CACHE_SIZE_MB="${SGLANG_VLM_CACHE_SIZE_MB:-8192}"
@@ -42,28 +47,12 @@ export SGLANG_ROCM_USE_AITER_LINEAR_SHUFFLE=1
 export SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB=1
 export SGLANG_USE_AITER_NEW_CA=false
 export SGLANG_USE_IPC_POOL_HANDLE_CACHE="${SGLANG_USE_IPC_POOL_HANDLE_CACHE:-1}"
-export HIP_GDN_SORT_IDX_BS="${HIP_GDN_SORT_IDX_BS:-32768}"
 export TVM_FFI_DISABLE_TORCH_C_DLPACK="${TVM_FFI_DISABLE_TORCH_C_DLPACK:-1}"
-
-# Model-specific aiter tuning (from the validated launch references).
-if [[ "${MODEL_NAME}" == "Qwen3.5-27B-PTPC-compressor" ]]; then
-  export AITER_QUICK_REDUCE_QUANTIZATION="${AITER_QUICK_REDUCE_QUANTIZATION:-INT8}"
-  export SGLANG_DISABLE_AITER_FUSED_AR_RMSNORM="${SGLANG_DISABLE_AITER_FUSED_AR_RMSNORM:-1}"
-  export USE_HIP_LINEAR_ATTN="${USE_HIP_LINEAR_ATTN:-1}"
-elif [[ "${MODEL_NAME}" == "Qwen3.5-35B-A3B-PTPC-compressor" ]]; then
-  export USE_AITER_COMM="${USE_AITER_COMM:-1}"
-  export AITER_MOE_SMALL_BATCH="${AITER_MOE_SMALL_BATCH:-1}"
-  unset USE_HIP_LINEAR_ATTN 2>/dev/null || true
-  unset AITER_QUICK_REDUCE_QUANTIZATION 2>/dev/null || true
-elif is_397b_model; then
-  export USE_AITER_COMM="${USE_AITER_COMM:-1}"
-  export AITER_MOE_SMALL_BATCH="${AITER_MOE_SMALL_BATCH:-1}"
-  export USE_HIP_LINEAR_ATTN="${USE_HIP_LINEAR_ATTN:-1}"
-  export AITER_MOE_PADDING_SIZE="${AITER_MOE_PADDING_SIZE:-192}"
-  unset AITER_QUICK_REDUCE_QUANTIZATION 2>/dev/null || true
+export USE_AITER_COMM="${USE_AITER_COMM:-1}"
+if is_27b_model; then
+  unset AITER_QUICK_REDUCE_QUANTIZATION
 else
   export AITER_QUICK_REDUCE_QUANTIZATION="${AITER_QUICK_REDUCE_QUANTIZATION:-INT6}"
-  export USE_HIP_LINEAR_ATTN="${USE_HIP_LINEAR_ATTN:-1}"
 fi
 
 echo "Detect TYPE: ${TYPE}"
@@ -118,21 +107,10 @@ print_launch_recipe() {
   echo "export SGLANG_ROCM_USE_AITER_LINEAR_SHUFFLE=${SGLANG_ROCM_USE_AITER_LINEAR_SHUFFLE}"
   echo "export SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB=${SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB}"
   echo "export SGLANG_USE_AITER_NEW_CA=${SGLANG_USE_AITER_NEW_CA}"
-  echo "export USE_HIP_LINEAR_ATTN=${USE_HIP_LINEAR_ATTN:-}"
   echo "export SGLANG_USE_IPC_POOL_HANDLE_CACHE=${SGLANG_USE_IPC_POOL_HANDLE_CACHE}"
-  echo "export HIP_GDN_SORT_IDX_BS=${HIP_GDN_SORT_IDX_BS}"
-  echo "export AITER_QUICK_REDUCE_QUANTIZATION=${AITER_QUICK_REDUCE_QUANTIZATION:-}"
-  if [[ -n "${USE_AITER_COMM:-}" ]]; then
-    echo "export USE_AITER_COMM=${USE_AITER_COMM}"
-  fi
-  if [[ -n "${AITER_MOE_SMALL_BATCH:-}" ]]; then
-    echo "export AITER_MOE_SMALL_BATCH=${AITER_MOE_SMALL_BATCH}"
-  fi
-  if [[ -n "${AITER_MOE_PADDING_SIZE:-}" ]]; then
-    echo "export AITER_MOE_PADDING_SIZE=${AITER_MOE_PADDING_SIZE}"
-  fi
-  if [[ -n "${SGLANG_DISABLE_AITER_FUSED_AR_RMSNORM:-}" ]]; then
-    echo "export SGLANG_DISABLE_AITER_FUSED_AR_RMSNORM=${SGLANG_DISABLE_AITER_FUSED_AR_RMSNORM}"
+  echo "export USE_AITER_COMM=${USE_AITER_COMM}"
+  if [[ -n "${AITER_QUICK_REDUCE_QUANTIZATION:-}" ]]; then
+    echo "export AITER_QUICK_REDUCE_QUANTIZATION=${AITER_QUICK_REDUCE_QUANTIZATION}"
   fi
   if [[ -n "${TVM_FFI_DISABLE_TORCH_C_DLPACK:-}" ]]; then
     echo "export TVM_FFI_DISABLE_TORCH_C_DLPACK=${TVM_FFI_DISABLE_TORCH_C_DLPACK}"
@@ -142,10 +120,6 @@ print_launch_recipe() {
   echo "setup server for TP${TP}:"
   local chunked_prefill_size=32768
   local max_prefill_tokens=32768
-  if is_397b_model; then
-    chunked_prefill_size=65536
-    max_prefill_tokens=65536
-  fi
   cat <<EOF
 nohup python3 -m sglang.launch_server \\
   --port ${PORT} \\
@@ -160,16 +134,18 @@ nohup python3 -m sglang.launch_server \\
   --mem-fraction-static 0.9 \\
   --max-prefill-tokens ${max_prefill_tokens} \\
   --max-running-requests 128 \\
+  --cuda-graph-max-bs 128 \\
 EOF
-  if [[ "${MODEL_NAME}" != "Qwen3.5-35B-A3B-PTPC-compressor" ]] && ! is_397b_model; then
-    echo "  --cuda-graph-max-bs 128 \\"
-  fi
   cat <<EOF
   --kv-cache-dtype fp8_e4m3 \\
   --disable-radix-cache \\
   --mm-attention-backend aiter_attn \\
+  --linear-attn-backend aiter \\
+  --linear-attn-decode-backend aiter \\
+  --linear-attn-prefill-backend aiter \\
+  --watchdog-timeout 1200 \\
 EOF
-  if [[ "${MODEL_NAME}" == "Qwen3.5-27B-PTPC-compressor" ]]; then
+  if is_27b_model; then
     echo "  --disable-custom-all-reduce \\"
   fi
   cat <<EOF
@@ -497,6 +473,7 @@ run_pure_text_benchmark() {
   echo "output tokens: ${PURE_TEXT_OUTPUT_TOKENS}"
   echo "max concurrency: ${PURE_TEXT_MAX_CONCURRENCY}"
   echo "num prompts: ${PURE_TEXT_NUM_PROMPTS}"
+  echo "warmup requests: ${PURE_TEXT_WARMUP_REQUESTS}"
   echo "dataset-name: random"
   echo "dataset-path: ${SHAREGPT_DATASET_PATH}"
   validate_sharegpt_dataset
@@ -513,6 +490,7 @@ run_pure_text_benchmark() {
     --random-output "${PURE_TEXT_OUTPUT_TOKENS}" \
     --random-range-ratio 1.0 \
     --max-concurrency "${PURE_TEXT_MAX_CONCURRENCY}" \
+    --warmup-requests "${PURE_TEXT_WARMUP_REQUESTS}" \
     | tee "${log_path}"
 }
 
@@ -532,10 +510,6 @@ if [[ "${TYPE}" == "launch" ]]; then
 
   chunked_prefill_size=32768
   max_prefill_tokens=32768
-  if is_397b_model; then
-    chunked_prefill_size=65536
-    max_prefill_tokens=65536
-  fi
 
   launch_args=(
     --port "${PORT}"
@@ -550,18 +524,17 @@ if [[ "${TYPE}" == "launch" ]]; then
     --mem-fraction-static 0.9
     --max-prefill-tokens "${max_prefill_tokens}"
     --max-running-requests 128
+    --cuda-graph-max-bs 128
     --kv-cache-dtype fp8_e4m3
     --disable-radix-cache
     --mm-attention-backend aiter_attn
+    --linear-attn-backend aiter
+    --linear-attn-decode-backend aiter
+    --linear-attn-prefill-backend aiter
+    --watchdog-timeout 1200
   )
 
-  if [[ "${MODEL_NAME}" != "Qwen3.5-35B-A3B-PTPC-compressor" ]] && ! is_397b_model; then
-    launch_args+=(--cuda-graph-max-bs 128)
-  fi
-
-  # 27B disables the aiter custom all-reduce (paired with
-  # SGLANG_DISABLE_AITER_FUSED_AR_RMSNORM=1 above); 397B keeps it.
-  if [[ "${MODEL_NAME}" == "Qwen3.5-27B-PTPC-compressor" ]]; then
+  if is_27b_model; then
     launch_args+=(--disable-custom-all-reduce)
   fi
 

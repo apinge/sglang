@@ -11,6 +11,8 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     Mamba2Metadata,
 )
 from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+    copy_mamba_state_extend_rows,
+    derive_track_ssm_copy_flags,
     fused_conv_window_scatter_with_mask,
     fused_mamba_state_scatter_with_mask,
     track_mamba_states_if_needed,
@@ -70,6 +72,9 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_h_dst = None
         track_ssm_final_src = None
         track_ssm_final_dst = None
+        track_ssm_h_trusted = False
+        track_ssm_final_trusted = False
+        track_ssm_final_disjoint = False
 
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
@@ -187,6 +192,9 @@ class MambaAttnBackendBase(AttentionBackend):
                         track_ssm_h_dst,
                         track_ssm_final_src,
                         track_ssm_final_dst,
+                        track_ssm_h_trusted,
+                        track_ssm_final_trusted,
+                        track_ssm_final_disjoint,
                     ) = self._init_track_ssm_indices(mamba_cache_indices, forward_batch)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
@@ -210,6 +218,9 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_h_dst=track_ssm_h_dst,
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
+            track_ssm_h_trusted=track_ssm_h_trusted,
+            track_ssm_final_trusted=track_ssm_final_trusted,
+            track_ssm_final_disjoint=track_ssm_final_disjoint,
             has_mamba_track_mask=has_mamba_track_mask,
             replayssm_write_pos=replayssm_write_pos,
             replayssm_force_flush=replayssm_force_flush,
@@ -301,11 +312,34 @@ class MambaAttnBackendBase(AttentionBackend):
         )
         track_ssm_h_dst = dst_masked[not_aligned]
 
+        h_state_rows = int(num_h_states.sum().item())
+        pool_rows = None
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        mamba_cache = getattr(mamba_pool, "mamba_cache", None)
+        if mamba_cache is not None and hasattr(mamba_cache, "temporal"):
+            pool_rows = int(mamba_cache.temporal.shape[1])
+
+        (
+            track_ssm_h_trusted,
+            track_ssm_final_trusted,
+            track_ssm_final_disjoint,
+        ) = derive_track_ssm_copy_flags(
+            track_ssm_h_src,
+            track_ssm_h_dst,
+            track_ssm_final_src,
+            track_ssm_final_dst,
+            h_state_rows=h_state_rows,
+            pool_rows=pool_rows,
+        )
+
         return (
             track_ssm_h_src.to(self.device, non_blocking=True),
             track_ssm_h_dst.to(self.device, non_blocking=True),
             track_ssm_final_src.to(self.device, non_blocking=True),
             track_ssm_final_dst.to(self.device, non_blocking=True),
+            track_ssm_h_trusted,
+            track_ssm_final_trusted,
+            track_ssm_final_disjoint,
         )
 
     def init_forward_metadata_capture_cpu_graph(
@@ -347,9 +381,9 @@ class MambaAttnBackendBase(AttentionBackend):
         return mask.cpu()
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        assert (
-            max_num_tokens % max_bs == 0
-        ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+        assert max_num_tokens % max_bs == 0, (
+            f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+        )
         draft_token_num = max_num_tokens // max_bs
         # Per-bs static write-cursor / force-flush buffers, captured by pointer +
         # refreshed in-place each replay; sized like state_indices_list. None when off.
@@ -404,9 +438,9 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
-        assert (
-            max_num_tokens % max_bs == 0
-        ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+        assert max_num_tokens % max_bs == 0, (
+            f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+        )
         for i in range(max_bs):
             self.state_indices_list.append(
                 torch.full(
@@ -658,23 +692,24 @@ class MambaAttnBackendBase(AttentionBackend):
     def _track_mamba_state_extend(
         self,
         forward_batch: ForwardBatch,
-        h: torch.Tensor,
+        h: Optional[torch.Tensor],
         ssm_states: torch.Tensor,
         forward_metadata: ForwardMetadata,
     ):
         """Copy extend SSM state at the last chunk boundary to track slots (source
         depends on chunk alignment; see `_init_track_ssm_indices`)."""
         if forward_metadata.has_mamba_track_mask:
-            h = h.squeeze(0)
-
-            if forward_metadata.track_ssm_h_src.numel() > 0:
-                ssm_states[forward_metadata.track_ssm_h_dst] = h[
-                    forward_metadata.track_ssm_h_src
-                ].to(ssm_states.dtype, copy=False)
-            if forward_metadata.track_ssm_final_src.numel() > 0:
-                ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
-                    forward_metadata.track_ssm_final_src
-                ]
+            copy_mamba_state_extend_rows(
+                h.squeeze(0) if h is not None else None,
+                ssm_states,
+                forward_metadata.track_ssm_h_src,
+                forward_metadata.track_ssm_h_dst,
+                forward_metadata.track_ssm_final_src,
+                forward_metadata.track_ssm_final_dst,
+                h_indices_trusted=forward_metadata.track_ssm_h_trusted,
+                final_indices_trusted=forward_metadata.track_ssm_final_trusted,
+                final_state_disjoint=forward_metadata.track_ssm_final_disjoint,
+            )
 
 
 class Mamba2AttnBackend(MambaAttnBackendBase):
@@ -692,12 +727,14 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
 
         if model_runner.server_args.enable_mamba_extra_buffer():
-            assert (
-                self.conv_states_shape[-1] < self.mamba_chunk_size
-            ), f"{self.conv_states_shape[-1]=} should be less than {self.mamba_chunk_size}"
+            assert self.conv_states_shape[-1] < self.mamba_chunk_size, (
+                f"{self.conv_states_shape[-1]=} should be less than {self.mamba_chunk_size}"
+            )
             assert (
                 model_runner.server_args.mamba_track_interval >= self.mamba_chunk_size
-            ), f"mamba_track_interval ({model_runner.server_args.mamba_track_interval}) must be >= mamba_chunk_size ({self.mamba_chunk_size})"
+            ), (
+                f"mamba_track_interval ({model_runner.server_args.mamba_track_interval}) must be >= mamba_chunk_size ({self.mamba_chunk_size})"
+            )
 
     def init_forward_metadata_out_graph(
         self,
@@ -1021,9 +1058,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             ]
         )
 
-        mamba_caches = (
-            self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
-        )
+        mamba_caches = self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
 
         conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal

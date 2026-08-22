@@ -1330,10 +1330,12 @@ def _fused_append_shared_experts_with_weights_kernel(
     out_ids_ptr,
     out_weights_ptr,
     N_BASE,
+    scale,
     K: tl.constexpr,
     S: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_S: tl.constexpr,
+    APPLY_SIGMOID: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -1352,22 +1354,43 @@ def _fused_append_shared_experts_with_weights_kernel(
     mask_s = offs_s < S
     shared_ids = tl.cast(N_BASE + offs_s, ids.dtype)
     shared_ws = tl.load(shared_weights_ptr + pid * S + offs_s, mask=mask_s)
+    if APPLY_SIGMOID:
+        # Fuse sigmoid(shared_gate) + dtype upcast (+ optional 1/ep_size scale)
+        # in-register so the raw bf16 logits stream straight into the fp32
+        # output, eliminating the standalone sigmoid and bf16->fp32 copy kernels.
+        shared_ws = tl.sigmoid(shared_ws.to(tl.float32)) * scale
 
     tl.store(out_ids_ptr + out_row_ptr + K + offs_s, shared_ids, mask=mask_s)
     tl.store(out_weights_ptr + out_row_ptr + K + offs_s, shared_ws, mask=mask_s)
 
 
 def fused_append_shared_experts_with_weights(
-    topk_ids, topk_weights, shared_weights, num_fused_shared_experts, N=None
+    topk_ids,
+    topk_weights,
+    shared_weights,
+    num_fused_shared_experts,
+    N=None,
+    apply_sigmoid=False,
+    scale=1.0,
 ):
-    """Like fused_append_shared_experts but accepts per-token shared weights tensor."""
+    """Like fused_append_shared_experts but accepts per-token shared weights tensor.
+
+    When ``apply_sigmoid`` is True, ``shared_weights`` are treated as raw gate
+    logits: the kernel applies ``sigmoid`` (in fp32) and the optional ``scale``
+    in-register, so the caller can skip the separate ``sigmoid`` activation and
+    the bf16->fp32 cast. When False the legacy behavior is preserved exactly.
+    """
     assert N is not None, "N (shared expert base id) must be provided"
     m, k = topk_ids.shape
     s = int(num_fused_shared_experts)
     if s <= 0:
         return topk_ids, topk_weights
 
-    shared_weights_2d = shared_weights.to(topk_weights.dtype)
+    # When fusing sigmoid in-kernel, keep the raw logits dtype (the kernel emits
+    # fp32 directly); otherwise match the output weight dtype as before.
+    shared_weights_2d = (
+        shared_weights if apply_sigmoid else shared_weights.to(topk_weights.dtype)
+    )
     if shared_weights_2d.ndim == 1:
         shared_weights_2d = shared_weights_2d.unsqueeze(-1)
     if shared_weights_2d.shape[1] < s:
@@ -1389,10 +1412,93 @@ def fused_append_shared_experts_with_weights(
         out_ids,
         out_weights,
         N_BASE=N,
+        scale=scale,
         K=k,
         S=s,
         BLOCK_K=block_k,
         BLOCK_S=block_s,
+        APPLY_SIGMOID=apply_sigmoid,
+        num_warps=1,
+    )
+    return out_ids, out_weights
+
+
+@triton.jit
+def _fused_append_shared_experts_gated_kernel(
+    topk_ids_ptr,
+    topk_weights_ptr,
+    shared_weights_ptr,
+    out_ids_ptr,
+    out_weights_ptr,
+    N_BASE,
+    K: tl.constexpr,
+    S: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    """
+    Copy routed top-k then append shared expert ids/weights with per-token gate
+    weights (sigmoid of shared_expert_gate), matching expand(M, S) semantics.
+    """
+    pid = tl.program_id(0)
+
+    ids_row_ptr = pid * K
+    w_row_ptr = pid * K
+    out_ids_row_ptr = pid * (K + S)
+    out_w_row_ptr = pid * (K + S)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_k = offs_k < K
+    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k, mask=mask_k, other=0)
+    ws = tl.load(topk_weights_ptr + w_row_ptr + offs_k, mask=mask_k, other=0.0)
+
+    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
+    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws, mask=mask_k)
+
+    shared_w = tl.load(shared_weights_ptr + pid).to(ws.dtype)
+    offs_s = tl.arange(0, BLOCK_S)
+    mask_s = offs_s < S
+    shared_ids = tl.cast(N_BASE + offs_s, ids.dtype)
+    shared_ws = tl.full([BLOCK_S], shared_w, dtype=ws.dtype)
+
+    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids, mask=mask_s)
+    tl.store(out_weights_ptr + out_w_row_ptr + K + offs_s, shared_ws, mask=mask_s)
+
+
+def fused_append_shared_experts_gated(
+    topk_ids,
+    topk_weights,
+    shared_weights,
+    num_experts,
+    num_fused_shared_experts,
+):
+    """Append shared experts using per-token gate weights instead of a constant."""
+    m, k = topk_ids.shape
+    s = int(num_fused_shared_experts)
+    if s <= 0:
+        return topk_ids, topk_weights
+
+    if shared_weights.dim() == 2:
+        assert shared_weights.shape[1] == 1
+        shared_weights = shared_weights.squeeze(-1)
+    assert shared_weights.shape == (m,)
+
+    out_ids = torch.empty((m, k + s), dtype=topk_ids.dtype, device=topk_ids.device)
+    out_weights = torch.empty(
+        (m, k + s), dtype=topk_weights.dtype, device=topk_weights.device
+    )
+
+    _fused_append_shared_experts_gated_kernel[(m,)](
+        topk_ids,
+        topk_weights,
+        shared_weights,
+        out_ids,
+        out_weights,
+        N_BASE=num_experts,
+        K=k,
+        S=s,
+        BLOCK_K=triton.next_power_of_2(k),
+        BLOCK_S=triton.next_power_of_2(s),
         num_warps=1,
     )
     return out_ids, out_weights
