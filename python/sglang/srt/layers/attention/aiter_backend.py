@@ -237,8 +237,14 @@ class AiterAttnBackend(AttentionBackend):
         # corresponding branch in forward_decode), since unified_attention's
         # 4D `.view(-1, page, H, D)` cannot be applied to a 5D pool.
         def _pool_is_vec5d(pool):
-            if getattr(pool, "kv_cache_layout", "nhd") == "vectorized_5d":
-                return True
+            k_buffer = getattr(pool, "k_buffer", None)
+            v_buffer = getattr(pool, "v_buffer", None)
+            if k_buffer and v_buffer:
+                return (
+                    getattr(pool, "kv_cache_layout", "nhd") == "vectorized_5d"
+                    and k_buffer[0].dim() == 5
+                    and v_buffer[0].dim() == 5
+                )
 
             # Qwen3.5 hybrid linear models wrap the full-attention MHA KV pool
             # inside HybridLinearKVPool. SWAKVPool similarly owns full/SWA

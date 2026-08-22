@@ -43,6 +43,12 @@ if TYPE_CHECKING:
 
 
 def _resolve_mha_sub_pool(pool, layer: RadixAttention):
+    wait_for_layer = getattr(pool, "_wait_for_layer", None)
+    if wait_for_layer is not None:
+        # Wrapper pools keep layer-transfer synchronization at the wrapper,
+        # while child pools deliberately have their counters cleared.
+        wait_for_layer(layer.layer_id)
+
     if hasattr(pool, "layers_mapping"):
         sub_layer_id, sub_is_swa = pool.layers_mapping[layer.layer_id]
         return pool.swa_kv_pool if sub_is_swa else pool.full_kv_pool, sub_layer_id
