@@ -33,7 +33,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
+from sglang.srt.models.qwen3_5 import Qwen3_5Model
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_npu
@@ -96,7 +96,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         mtp_config = copy.deepcopy(config)
         mtp_config.num_hidden_layers = 1
         mtp_config.full_attention_interval = 1
-        self.model = Qwen3_5ForCausalLM(
+        self.model = Qwen3_5Model(
             mtp_config,
             quant_config,
             prefix=add_prefix("mtp", prefix),
