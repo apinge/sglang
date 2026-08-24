@@ -51,6 +51,9 @@ _is_hip = is_hip()
 _is_musa = is_musa()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_rocm_triton_gemma_rms_norm = (
+    get_bool_env_var("SGLANG_USE_ROCM_TRITON_GEMMA_RMSNORM") and _is_hip
+)
 _AITER_NEW_CA = get_bool_env_var("SGLANG_USE_AITER_NEW_CA", "true")
 _AITER_FUSED_NORM_DEFAULT = (
     _use_aiter
@@ -116,7 +119,7 @@ elif _is_hip:
         # Fallback: vllm not available, will use forward_native
         _has_vllm_rms_norm = False
 
-if _is_hip:
+if _use_rocm_triton_gemma_rms_norm:
     try:
         from sglang.jit_kernel.minimax_m3.rmsnorm import (
             gemma_fused_add_rmsnorm as rocm_triton_gemma_fused_add_rmsnorm,
@@ -811,7 +814,7 @@ class GemmaRMSNorm(MultiPlatformOp):
         if is_batch_invariant_mode_enabled():
             return self.forward_native(x, residual, post_residual_addition)
 
-        if _has_rocm_triton_gemma_rms_norm:
+        if _use_rocm_triton_gemma_rms_norm and _has_rocm_triton_gemma_rms_norm:
             if residual is not None:
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
