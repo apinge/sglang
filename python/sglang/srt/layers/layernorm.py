@@ -51,9 +51,6 @@ _is_hip = is_hip()
 _is_musa = is_musa()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_use_rocm_triton_gemma_rms_norm = (
-    get_bool_env_var("SGLANG_USE_ROCM_TRITON_GEMMA_RMSNORM") and _is_hip
-)
 _AITER_NEW_CA = get_bool_env_var("SGLANG_USE_AITER_NEW_CA", "true")
 _AITER_FUSED_NORM_DEFAULT = (
     _use_aiter
@@ -102,7 +99,6 @@ if _is_cuda or _is_xpu or _is_musa:
     )
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
-_has_rocm_triton_gemma_rms_norm = False
 if _use_aiter:
     from aiter import layernorm2d_fwd as layer_norm
     from aiter import rmsnorm2d_fwd as rms_norm
@@ -118,19 +114,6 @@ elif _is_hip:
     except ImportError:
         # Fallback: vllm not available, will use forward_native
         _has_vllm_rms_norm = False
-
-if _use_rocm_triton_gemma_rms_norm:
-    try:
-        from sglang.jit_kernel.minimax_m3.rmsnorm import (
-            gemma_fused_add_rmsnorm as rocm_triton_gemma_fused_add_rmsnorm,
-        )
-        from sglang.jit_kernel.minimax_m3.rmsnorm import (
-            gemma_rmsnorm as rocm_triton_gemma_rmsnorm,
-        )
-
-        _has_rocm_triton_gemma_rms_norm = True
-    except ImportError:
-        _has_rocm_triton_gemma_rms_norm = False
 
 if _is_cuda:
     # HF-semantics RMSNorm kernel (JIT-compiled).  Used when `cast_x_before_out_mul=True`
@@ -814,15 +797,6 @@ class GemmaRMSNorm(MultiPlatformOp):
         if is_batch_invariant_mode_enabled():
             return self.forward_native(x, residual, post_residual_addition)
 
-        if _use_rocm_triton_gemma_rms_norm and _has_rocm_triton_gemma_rms_norm:
-            if residual is not None:
-                if post_residual_addition is not None:
-                    residual = residual + post_residual_addition
-                return rocm_triton_gemma_fused_add_rmsnorm(
-                    x, residual, self.weight.data, self.variance_epsilon
-                )
-            return rocm_triton_gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
-
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
 
@@ -842,7 +816,7 @@ class GemmaRMSNorm(MultiPlatformOp):
             return rms_norm(x, w, self.variance_epsilon)
         else:
             # vllm API: rms_norm(out, input, weight, eps) -> None (in-place)
-            #           fused_add_rms_norm(out, input, residual_out, residual, weight, eps)
+            #           fused_add_rms_norm(input, residual, weight, eps) -> None
             if not x.is_contiguous():
                 x = x.contiguous()
             if residual is not None:
