@@ -24,6 +24,7 @@ from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
     get_tp_group,
+    is_custom_all_reduce_enabled,
     moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_allreduce_rmsnorm,
@@ -176,6 +177,10 @@ def _fused_rmsnorm_fp8_per_token_quant(
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
 
+def _is_aiter_fused_ar_rmsnorm_enabled() -> bool:
+    return _AITER_FUSED_AR_RMSNORM_DEFAULT and is_custom_all_reduce_enabled()
+
+
 def apply_flashinfer_allreduce_fusion(batch_size: int):
     return (
         # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
@@ -195,7 +200,7 @@ def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
     total_bytes = input_tensor.numel() * input_tensor.element_size()
     # Aiter's should_custom_ar uses <= max_size/2 (64 MB); match that boundary.
     return (
-        _AITER_FUSED_AR_RMSNORM_DEFAULT
+        _is_aiter_fused_ar_rmsnorm_enabled()
         and total_bytes > 0
         and n <= 16384
         and total_bytes <= 8 * 1024 * 8192
@@ -819,8 +824,8 @@ class LayerCommunicator:
         _logged_mlp_norm_fusion_skip_reasons.add(reason)
 
     def _can_fuse_mlp_norm(self, forward_batch: ForwardBatch) -> bool:
-        if not _AITER_FUSED_AR_RMSNORM_DEFAULT:
-            self._log_mlp_norm_fusion_skip("env gate disabled")
+        if not _is_aiter_fused_ar_rmsnorm_enabled():
+            self._log_mlp_norm_fusion_skip("env/custom AR gate disabled")
             return False
         if (
             _AITER_FUSED_AR_RMSNORM_DECODE_ONLY
@@ -919,7 +924,7 @@ class LayerCommunicator:
             (
                 apply_flashinfer_allreduce_fusion(batch_size)
                 or (
-                    _AITER_FUSED_AR_RMSNORM_DEFAULT
+                    _is_aiter_fused_ar_rmsnorm_enabled()
                     and batch_size > 0
                     and get_parallel().tp_size != 6
                     and not is_dp_attention_enabled()
