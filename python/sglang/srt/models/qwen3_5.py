@@ -30,6 +30,7 @@ from sglang.jit_kernel.triton.gdn_fused_proj import (
 from sglang.srt.configs.qwen3_5 import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
     Qwen3_5TextConfig,
 )
 
@@ -57,6 +58,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
@@ -67,7 +69,10 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -1103,8 +1108,17 @@ ALL_DECODER_LAYER_TYPES = {
 }
 
 
-class Qwen3_5ForCausalLM(nn.Module):
-    """Qwen3.5 Model with support for dense variant."""
+def _coerce_qwen3_5_text_config(
+    config: Qwen3_5TextConfig, *, moe: bool = False
+) -> Qwen3_5TextConfig:
+    cls = Qwen3_5MoeTextConfig if moe else Qwen3_5TextConfig
+    if isinstance(config, cls):
+        return config
+    return cls(**config.to_dict())
+
+
+class Qwen3_5Model(nn.Module):
+    """Qwen3.5 backbone (embeddings + decoder layers + norm) for the dense variant."""
 
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -1183,7 +1197,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             from sglang.srt.arg_groups.overrides import declare_load_time_override
 
             declare_load_time_override(
-                "Qwen3_5ForCausalLM._maybe_autodisable_shared_experts_fusion",
+                "Qwen3_5Model._maybe_autodisable_shared_experts_fusion",
                 {"disable_shared_experts_fusion": True},
             )
             logger.info(
@@ -1341,6 +1355,97 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         return hidden_states, aux_hidden_states
 
+
+class Qwen3_5MoeModel(Qwen3_5Model):
+    """Qwen3.5-MoE backbone (embeddings + decoder layers + norm)."""
+
+    def __init__(
+        self,
+        config: Qwen3_5TextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+
+
+class Qwen3_5ForCausalLM(nn.Module):
+    """Qwen3.5 text-only dense causal LM."""
+
+    packed_modules_mapping = Qwen3_5Model.packed_modules_mapping
+    supported_lora_modules = Qwen3_5Model.supported_lora_modules
+
+    def __init__(
+        self,
+        config: Qwen3_5TextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        config = _coerce_qwen3_5_text_config(config, moe=False)
+        super().__init__()
+        self.pp_group = get_pp_group()
+        self.config = config
+        self.quant_config = quant_config
+        self.model = Qwen3_5Model(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
+        if self.pp_group.is_last_rank:
+            if self.pp_group.world_size == 1 and config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                    use_attn_tp_group=get_flags().enable_dp_lm_head,
+                )
+        else:
+            self.lm_head = PPMissingLayer()
+        self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        return self.model.get_hidden_dim(module_name, layer_idx)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
+
+    @property
+    def start_layer(self) -> int:
+        return self.model.start_layer
+
+    @property
+    def end_layer(self) -> int:
+        return self.model.end_layer
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
+        if not self.pp_group.is_last_rank:
+            return hidden_states
+
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+        )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1369,6 +1474,17 @@ class Qwen3_5ForCausalLM(nn.Module):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if (
+                self.config.tie_word_embeddings
+                and self.pp_group.is_last_rank
+                and "model.embed_tokens.weight" in name
+                and "lm_head.weight" in params_dict
+            ):
+                lm_head_param = params_dict["lm_head.weight"]
+                weight_loader = getattr(
+                    lm_head_param, "weight_loader", default_weight_loader
+                )
+                weight_loader(lm_head_param, loaded_weight)
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
@@ -1388,9 +1504,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # Skip layers on other devices.
-                # if is_pp_missing_parameter(name, self):
-                #     continue
                 if name not in params_dict:
                     continue
                 param = params_dict[name]
@@ -1411,23 +1524,66 @@ class Qwen3_5ForCausalLM(nn.Module):
             loaded_params.add(name)
         return loaded_params
 
-    @classmethod
-    def get_model_config_for_expert_location(cls, config):
-        return ModelConfigForExpertLocation(
-            num_layers=config.num_hidden_layers,
-            num_logical_experts=config.num_experts,
-            num_groups=None,
-        )
-
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
+    """Qwen3.5-MoE text-only causal LM."""
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        config = _coerce_qwen3_5_text_config(config, moe=True)
+        nn.Module.__init__(self)
+        self.pp_group = get_pp_group()
+        self.config = config
+        self.quant_config = quant_config
+        self.model = Qwen3_5MoeModel(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
+        if self.pp_group.is_last_rank:
+            if self.pp_group.world_size == 1 and config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                    use_attn_tp_group=get_flags().enable_dp_lm_head,
+                )
+        else:
+            self.lm_head = PPMissingLayer()
+        self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
+
+        self.num_fused_shared_experts = 0
+        if _use_aiter and not _disable_shared_experts_fusion():
+            self.num_fused_shared_experts = self._get_num_fused_shared_experts()
+        self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
+
+    def _get_num_fused_shared_experts(self):
+        if not hasattr(self.model, "layers"):
+            return 0
+        for layer_id in range(self.model.start_layer, self.model.end_layer):
+            mlp = getattr(self.model.layers[layer_id], "mlp", None)
+            if hasattr(mlp, "num_fused_shared_experts"):
+                return mlp.num_fused_shared_experts
+        return 0
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        text_config = getattr(config, "text_config", config)
+        return ModelConfigForExpertLocation(
+            num_layers=text_config.num_hidden_layers,
+            num_logical_experts=text_config.num_experts,
+            num_groups=None,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -1444,13 +1600,19 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("in_proj_ba.", "in_proj_a.", 1),
         ]
 
+        num_experts = self.config.num_experts
+
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=(
+                num_experts
+                if not self.enable_shared_expert_fusion
+                else num_experts + self.num_fused_shared_experts
+            ),
         )
 
         # Skip loading extra parameters for GPTQ/modelopt models.
@@ -1473,7 +1635,40 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
         ]
 
-        num_experts = self.config.num_experts
+        if self.enable_shared_expert_fusion:
+            """
+            When shared experts are fused, we need to map the shared experts to routed experts.
+
+            mlp.share_expert.gate_up_proj.weight  --> experts.512.gate_up_proj.weight -> experts.w13_weight, expert_id = 512
+            mlp.share_expert.down_proj.weight  --> experts.512.down_proj.weight -> experts.w2_weight, expert_id = 512
+            """
+            fused_expert_params_mapping += [
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts}.gate_up_proj.",
+                    num_experts,
+                    "w1",
+                ),
+                (
+                    "experts.w2_",
+                    f"experts.{num_experts}.down_proj.",
+                    num_experts,
+                    "w2",
+                ),
+                ## shared experts may contain gate_proj and up_proj instead of gate_up_proj
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts}.gate_proj.",
+                    num_experts,
+                    "w1",
+                ),
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts}.up_proj.",
+                    num_experts,
+                    "w3",
+                ),
+            ]
 
         def load_fused_expert_weights(
             name: str,
@@ -1512,6 +1707,17 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if (
+                self.config.tie_word_embeddings
+                and self.pp_group.is_last_rank
+                and "model.embed_tokens.weight" in name
+                and "lm_head.weight" in params_dict
+            ):
+                lm_head_param = params_dict["lm_head.weight"]
+                weight_loader = getattr(
+                    lm_head_param, "weight_loader", default_weight_loader
+                )
+                weight_loader(lm_head_param, loaded_weight)
 
             layer_id = get_layer_id(name)
             if (
@@ -1521,8 +1727,18 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ):
                 continue
 
+            if self.enable_shared_expert_fusion:
+                if "mlp.shared_expert." in name:
+                    # Firstly map mlp.shared_expert.xx_proj to mlp.experts.512.xx_proj
+                    name = name.replace(
+                        "mlp.shared_expert.",
+                        f"mlp.experts.{num_experts}.",
+                    )
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if "experts.gate_up_proj" in name or "experts.down_proj" in name:
+                if name.endswith("experts.gate_up_proj") or name.endswith(
+                    "experts.down_proj"
+                ):
                     is_fused_expert = True
                     expert_params_mapping = fused_expert_params_mapping
 
@@ -1563,7 +1779,10 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
                     if is_fused_expert:
+                        # is_fused_expert is True, the checkpoint contains gate_up_proj and down_proj for each expert
                         if "experts.gate_up_proj" in name:
+                            # experts.gate_up_proj contains all routed experts, excluding shared experts
+                            # split into w1 and w3
                             loaded_weight = loaded_weight.chunk(2, dim=-2)
                             load_fused_expert_weights(
                                 name_mapped,
@@ -1579,7 +1798,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                                 "w3",
                                 num_experts,
                             )
-                        else:
+                        elif "experts.down_proj" in name:
+                            # experts.down_proj contains all routed experts, excluding shared experts
                             load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
@@ -1587,6 +1807,41 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                                 shard_id,
                                 num_experts,
                             )
+                        elif self.enable_shared_expert_fusion:
+                            # shared experts should be loaded to experts.w13_weight and experts.w2_weight
+                            param = params_dict[name_mapped]
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
+                            if f"{num_experts}.gate_up_proj" in name:
+                                # split into w1 and w3
+                                loaded_weight = loaded_weight.chunk(2, dim=-2)
+                                # load to experts.w13_weight, shard_id = w1, expert_id = num_experts
+                                weight_loader(
+                                    param,
+                                    loaded_weight[0],
+                                    name_mapped,
+                                    "w1",
+                                    expert_id,
+                                )
+                                # load to experts.w13_weight, shard_id = w3, expert_id = num_experts
+                                weight_loader(
+                                    param,
+                                    loaded_weight[1],
+                                    name_mapped,
+                                    "w3",
+                                    expert_id,
+                                )
+                            else:
+                                # load down_proj to experts.w2_weight, shard_id = w2, expert_id = num_experts
+                                # Or load gate_proj and up_proj to experts.w13_weight, shard_id = w1/w3, expert_id = num_experts
+                                weight_loader(
+                                    param,
+                                    loaded_weight,
+                                    name_mapped,
+                                    shard_id,
+                                    expert_id,
+                                )
                     else:
                         # Skip loading extra parameters for GPTQ/modelopt models.
                         if (
@@ -1627,21 +1882,29 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
 
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: layer.mlp.get_moe_weights()
+                for layer_id, layer in enumerate(self.model.layers)
+                if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
+            }
+        )
+
         return loaded_params
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
-    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+    packed_modules_mapping = Qwen3_5Model.packed_modules_mapping
     hf_to_sglang_mapper = None
 
-    supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
+    supported_lora_modules = Qwen3_5Model.supported_lora_modules
 
     def __init__(
         self,
         config: Qwen3_5Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        language_model_cls=Qwen3_5ForCausalLM,
+        language_model_cls=Qwen3_5Model,
     ):
         super().__init__(config, quant_config, prefix, language_model_cls)
 
@@ -1789,17 +2052,17 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
 
-    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+    packed_modules_mapping = Qwen3_5Model.packed_modules_mapping
     hf_to_sglang_mapper = None
 
-    supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
+    supported_lora_modules = Qwen3_5Model.supported_lora_modules
 
     def __init__(
         self,
         config: Qwen3_5MoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        language_model_cls=Qwen3_5MoeForCausalLM,
+        language_model_cls=Qwen3_5MoeModel,
     ) -> None:
         super().__init__(config, quant_config, prefix, language_model_cls)
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
@@ -1822,13 +2085,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return module_name.startswith("model.layers.")
 
     def _get_num_fused_shared_experts(self):
-        if not (
-            hasattr(self.model, "layers")
-            and len(self.model.layers) > 0
-            and hasattr(self.model.layers[0].mlp, "num_fused_shared_experts")
-        ):
+        if not hasattr(self.model, "layers"):
             return 0
-        return self.model.layers[0].mlp.num_fused_shared_experts
+        for layer_id in range(self.model.start_layer, self.model.end_layer):
+            mlp = getattr(self.model.layers[layer_id], "mlp", None)
+            if hasattr(mlp, "num_fused_shared_experts"):
+                return mlp.num_fused_shared_experts
+        return 0
 
     def get_embed_and_head(self):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
@@ -2176,4 +2439,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
 
-EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
+EntryClass = [
+    Qwen3_5MoeForConditionalGeneration,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5ForCausalLM,
+]
