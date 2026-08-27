@@ -19,11 +19,20 @@ import sys
 from pathlib import Path
 
 import torch
-from setuptools import find_packages, setup
+from setuptools import Distribution, find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 root = Path(__file__).parent.resolve()
 arch = platform.machine().lower()
+
+
+class RocmDistribution(Distribution):
+    """Keep the CUDA wheel metadata out of the ROCm source-build path."""
+
+    def _get_project_config_files(self, filenames):
+        if filenames is None:
+            return [], []
+        return super()._get_project_config_files(filenames)
 
 
 def _get_version():
@@ -124,6 +133,10 @@ setup(
     version=_get_version(),
     packages=find_packages(where="python"),
     package_dir={"": "python"},
+    # The extension is ABI-bound to the PyTorch used for this local build.
+    # Preserve the ROCm build already supplied by the container.
+    install_requires=[f"torch=={torch.__version__}"],
+    distclass=RocmDistribution,
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
 )
