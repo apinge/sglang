@@ -5889,6 +5889,17 @@ class ServerArgs:
     def _handle_unified_memory_pool(self):
         if not self.enable_unified_memory:
             return
+        if (
+            is_hip()
+            and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
+        ):
+            raise ValueError(
+                "--enable-unified-memory is not compatible with "
+                "SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d on ROCm. The unified "
+                "MHA pool exposes 4-D page-major K/V views, while the AITER "
+                "SHUFFLE 5D path requires physical 5-D K/V buffers. Disable "
+                "either --enable-unified-memory or vectorized_5d."
+            )
         assert self.disaggregation_mode == "null", (
             "--enable-unified-memory is not yet compatible with PD " "disaggregation."
         )
