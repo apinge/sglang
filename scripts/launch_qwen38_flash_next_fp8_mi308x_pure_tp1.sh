@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Launch Qwen3.8-Flash-Next-FP8 with pure TP4 or TP8 on MI308X (gfx942).
+# Launch Qwen3.8-Flash-Next-FP8 with pure TP1 on MI308X (gfx942).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/logs/qwen3.8_flash_next_fp8_mi308x_pure_tp_$(date -u +%Y%m%dT%H%M%SZ).log}"
+PLE_OFFLOAD_EMBEDDING="${PLE_OFFLOAD_EMBEDDING:-1}"
+LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/logs/qwen3.8_flash_next_fp8_mi308x_pure_tp1_pleoffload${PLE_OFFLOAD_EMBEDDING}_$(date -u +%Y%m%dT%H%M%SZ).log}"
 mkdir -p "$(dirname -- "${LOG_FILE}")"
 # Capture both this script's preflight checks and all sglang serve output.
 # Using a process substitution (instead of `command 2>&1 | tee`) preserves the
@@ -17,14 +18,19 @@ HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-7080}"
 TP_SIZE="${TP_SIZE:-1}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.95}"
-#CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
-CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
+CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
+#CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-1}"
 CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-1}"
 #AITER_MOE_PADDING_SIZE="${AITER_MOE_PADDING_SIZE:-128}"
 
 if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
   echo "Model config not found: ${MODEL_PATH}/config.json" >&2
+  exit 1
+fi
+
+if [[ "${PLE_OFFLOAD_EMBEDDING}" != "0" && "${PLE_OFFLOAD_EMBEDDING}" != "1" ]]; then
+  echo "PLE_OFFLOAD_EMBEDDING must be 0 or 1 (got ${PLE_OFFLOAD_EMBEDDING})." >&2
   exit 1
 fi
 
@@ -75,8 +81,6 @@ command=(
   --served-model-name "${SERVED_MODEL_NAME}"
   --host "${HOST}"
   --port "${PORT}"
-  # ROCm PyTorch exposes GPU devices through the torch.cuda API.
-  --device cuda
   --tp-size "${TP_SIZE}"
   --attention-backend triton
   --moe-runner-backend triton
@@ -93,6 +97,14 @@ command=(
   # --speculative-eagle-topk 1
   # --speculative-num-draft-tokens 4
 )
+
+# Use an explicit negative flag for the GPU-resident control case. TP1 needs
+# PLE_OFFLOAD_EMBEDDING=1 to move the full 47.68 GiB n-gram table out of HBM.
+if (( PLE_OFFLOAD_EMBEDDING )); then
+  command+=(--ple-offload-embedding)
+else
+  command+=(--no-ple-offload-embedding)
+fi
 
 if (( $# > 0 )); then
   command+=("$@")

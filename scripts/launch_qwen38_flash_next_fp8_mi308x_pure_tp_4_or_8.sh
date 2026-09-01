@@ -3,7 +3,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/logs/qwen3.8_flash_next_fp8_mi308x_pure_tp_4_or_8_$(date -u +%Y%m%dT%H%M%SZ).log}"
+PLE_OFFLOAD_EMBEDDING="${PLE_OFFLOAD_EMBEDDING:-1}"
+LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/logs/qwen3.8_flash_next_fp8_mi308x_pure_tp_4_or_8_pleoffload${PLE_OFFLOAD_EMBEDDING}_$(date -u +%Y%m%dT%H%M%SZ).log}"
 mkdir -p "$(dirname -- "${LOG_FILE}")"
 # Capture both this script's preflight checks and all sglang serve output.
 # Using a process substitution (instead of `command 2>&1 | tee`) preserves the
@@ -15,7 +16,7 @@ MODEL_PATH="${MODEL_PATH:-/models/Qwen3.8-Flash-Next-FP8}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3.8-Flash-Next-FP8}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-7080}"
-TP_SIZE="${TP_SIZE:-8}"
+TP_SIZE="${TP_SIZE:-4}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
 #CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
@@ -30,6 +31,11 @@ fi
 
 if (( TP_SIZE != 4 && TP_SIZE != 8 )); then
   echo "This pure-TP script supports TP_SIZE=4 or TP_SIZE=8 (got ${TP_SIZE})." >&2
+  exit 1
+fi
+
+if [[ "${PLE_OFFLOAD_EMBEDDING}" != "0" && "${PLE_OFFLOAD_EMBEDDING}" != "1" ]]; then
+  echo "PLE_OFFLOAD_EMBEDDING must be 0 or 1 (got ${PLE_OFFLOAD_EMBEDDING})." >&2
   exit 1
 fi
 
@@ -91,6 +97,14 @@ command=(
   # --speculative-eagle-topk 1
   # --speculative-num-draft-tokens 4
 )
+
+# Use an explicit negative flag for the control run so the A/B result cannot be
+# affected by an upstream model-specific default.
+if (( PLE_OFFLOAD_EMBEDDING )); then
+  command+=(--ple-offload-embedding)
+else
+  command+=(--no-ple-offload-embedding)
+fi
 
 if (( $# > 0 )); then
   command+=("$@")
