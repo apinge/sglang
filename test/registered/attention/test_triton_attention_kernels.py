@@ -328,6 +328,37 @@ class TestTritonAttention(CustomTestCase):
         self.assertEqual(
             ea._get_block_sizes_for_extend_attention(128, 128)[3:], (64, 64, 4)
         )
+        # Qwen3.5-397B DFlash uses a fixed 16-token draft block with
+        # head_dim=128. Keep this optimization behind an explicit DFlash flag
+        # so other short extend/verify workloads retain their established tile.
+        dflash_expected = (16, 128, 4) if ea._is_gfx942 else (64, 64, 4)
+        self.assertEqual(
+            ea._get_block_sizes_for_extend_attention(
+                128,
+                128,
+                max_len_extend=16,
+                is_dflash_draft=True,
+            )[3:],
+            dflash_expected,
+        )
+        self.assertEqual(
+            ea._get_block_sizes_for_extend_attention(
+                128,
+                128,
+                max_len_extend=16,
+                is_dflash_draft=False,
+            )[3:],
+            (64, 64, 4),
+        )
+        self.assertEqual(
+            ea._get_block_sizes_for_extend_attention(
+                128,
+                128,
+                max_len_extend=8,
+                is_dflash_draft=True,
+            )[3:],
+            (64, 64, 4),
+        )
         # 128 < head_dim <= 256: tuned tile on gfx95, default elsewhere
         expected = (128, 64, 8) if ea._is_gfx95 else (64, 64, 4)
         self.assertEqual(
@@ -337,6 +368,105 @@ class TestTritonAttention(CustomTestCase):
         self.assertEqual(
             ea._get_block_sizes_for_extend_attention(576, 576)[3:], (64, 64, 4)
         )
+
+    def test_extend_attention_dflash_gfx942_block16(self):
+        from sglang.srt.layers.attention.triton_ops import extend_attention as ea
+
+        if not ea._is_gfx942:
+            self.skipTest("gfx942-only DFlash tile specialization")
+
+        batch_size = 2
+        extend_len = 16
+        prefix_len = 4095
+        q_heads = 4
+        kv_heads = 1
+        head_dim = 128
+        page_size = 64
+        total_prefix = batch_size * prefix_len
+        num_slots = ((total_prefix + page_size - 1) // page_size) * page_size
+
+        q = torch.randn(
+            batch_size * extend_len,
+            q_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        k = torch.randn(
+            batch_size * extend_len,
+            kv_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        v = torch.randn_like(k)
+        k_buffer = (
+            torch.randn(
+                num_slots,
+                kv_heads,
+                head_dim,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            .to(torch.float8_e4m3fnuz)
+            .view(num_slots // page_size, page_size, kv_heads, head_dim)
+        )
+        v_buffer = (
+            torch.randn(
+                num_slots,
+                kv_heads,
+                head_dim,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            .to(torch.float8_e4m3fnuz)
+            .view(num_slots // page_size, page_size, kv_heads, head_dim)
+        )
+        qo_indptr = torch.arange(
+            0,
+            (batch_size + 1) * extend_len,
+            extend_len,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        kv_indptr = torch.arange(
+            0,
+            (batch_size + 1) * prefix_len,
+            prefix_len,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        kv_indices = torch.arange(total_prefix, dtype=torch.int64, device="cuda")
+
+        for is_causal, sliding_window_size in ((True, 4095), (False, -1)):
+            outputs = []
+            for is_dflash_draft in (False, True):
+                out = torch.empty_like(q)
+                extend_attention_fwd(
+                    q,
+                    k,
+                    v,
+                    out,
+                    k_buffer,
+                    v_buffer,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    custom_mask=None,
+                    is_causal=is_causal,
+                    mask_indptr=None,
+                    max_len_extend=extend_len,
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    sliding_window_size=sliding_window_size,
+                    page_size=page_size,
+                    is_dflash_draft=is_dflash_draft,
+                )
+                outputs.append(out)
+
+            torch.testing.assert_close(
+                outputs[1].float(), outputs[0].float(), atol=2e-2, rtol=1e-2
+            )
 
     def _test_extend_attention_sliding_window_once(
         self, B, N_CTX, H_Q, H_KV, D, WINDOW_SIZE

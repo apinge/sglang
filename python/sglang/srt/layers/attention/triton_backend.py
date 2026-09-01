@@ -158,6 +158,9 @@ class TritonAttnBackend(AttentionBackend):
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.is_dflash_draft = (
+            model_runner.is_draft_worker and model_runner.spec_algorithm.is_dflash()
+        )
         # Split-KV verify is bit-equivalent only for a pure-causal chain (topk==1)
         # and is gfx95-only; else fall back to extend_attention_fwd.
         self.use_verify_splitkv = (
@@ -1364,6 +1367,9 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_offsets=window_kv_offsets,
             xai_temperature_len=layer.xai_temperature_len,
             page_size=self.page_size,
+            is_dflash_draft=(
+                self.is_dflash_draft and forward_batch.forward_mode.is_target_verify()
+            ),
         )
         return o
 

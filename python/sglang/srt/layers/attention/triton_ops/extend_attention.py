@@ -24,23 +24,37 @@ from sglang.srt.layers.attention.triton_ops.decode_attention import _extract_kv_
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
-from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
+from sglang.srt.utils import (
+    is_cuda,
+    is_gfx95_supported,
+    is_gfx942_supported,
+    is_hip,
+)
 
 _is_cuda = is_cuda()
 if _is_cuda:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 _is_hip = is_hip()
+_is_gfx942 = _is_hip and is_gfx942_supported()
 _is_gfx95 = _is_hip and is_gfx95_supported()
 
 
-def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
+def _get_block_sizes_for_extend_attention(
+    Lq: int,
+    Lv: int,
+    *,
+    max_len_extend: int | None = None,
+    is_dflash_draft: bool = False,
+):
     """
     Get block sizes and configuration for extend attention kernels.
 
     Args:
         Lq: Query head dimension
         Lv: Value head dimension
+        max_len_extend: Maximum number of newly appended query tokens per sequence.
+        is_dflash_draft: Whether this launch belongs to a DFlash draft worker.
 
     Returns:
         tuple: (BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps)
@@ -63,7 +77,20 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
 
     # Determine BLOCK_M, BLOCK_N, and num_warps based on hardware
     if _is_hip:
-        if _is_gfx95 and 128 < Lq <= 256:
+        if (
+            _is_gfx942
+            and is_dflash_draft
+            and max_len_extend == 16
+            and Lq == 128
+            and Lv == 128
+        ):
+            # DFlash proposes a fixed 16-token block. The generic 64-row tile
+            # spends most of its QK/PV work and accumulator footprint on masked
+            # rows for this shape. A 16x128 tile is faster on gfx942 while the
+            # explicit DFlash guard leaves generic extend attention unchanged.
+            BLOCK_M, BLOCK_N = (16, 128)
+            num_warps = 4
+        elif _is_gfx95 and 128 < Lq <= 256:
             # gfx950 (CDNA4), 128 < head_dim <= 256: a larger query tile halves KV bytes
             # streamed per call (each workgroup reads the whole prefix); 8 warps
             # hide the loads. Measured on MI350X head_dim 256: -36% kernel time,
@@ -646,6 +673,7 @@ def extend_attention_fwd(
     skip_prefix=False,
     skip_extend=False,
     page_size: int = 1,
+    is_dflash_draft: bool = False,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -665,7 +693,12 @@ def extend_attention_fwd(
 
     # Get block sizes and configuration
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
-        _get_block_sizes_for_extend_attention(Lq, Lv)
+        _get_block_sizes_for_extend_attention(
+            Lq,
+            Lv,
+            max_len_extend=max_len_extend,
+            is_dflash_draft=is_dflash_draft,
+        )
     )
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
