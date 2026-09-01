@@ -774,7 +774,10 @@ def xpu_moe_ld_padding_elems(k_dim: int, itemsize: int) -> int:
 # Unit of padding - context dependent
 def get_moe_padding_size(is_aiter_moe):
     if is_aiter_moe:
-        return AITER_PADDING_SIZE
+        padding_size = int(os.getenv("AITER_MOE_PADDING_SIZE", AITER_PADDING_SIZE))
+        if padding_size <= 0:
+            raise ValueError("AITER_MOE_PADDING_SIZE must be a positive integer")
+        return padding_size
     else:
         return (
             TRITON_PADDING_SIZE

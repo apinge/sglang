@@ -85,6 +85,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_int_env_var,
     is_blackwell_supported,
     is_cpu,
     is_cuda,
@@ -1175,17 +1176,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
             padding_size = get_moe_padding_size(use_aiter_moe)
-            # Padding an entire expert is safe when MoE TP is one: the
-            # checkpoint's block grid still starts at the beginning of the
-            # local tensor and only trailing zeros are added.  An unaligned
-            # MoE-TP split cuts through checkpoint quantization blocks, so a
-            # local trailing pad cannot make its scale grid valid.  Use EP for
-            # that topology instead of silently loading misaligned scales.
+            requested_aiter_padding = get_int_env_var("AITER_MOE_PADDING_SIZE")
+            # An unaligned MoE-TP split cuts through the checkpoint's FP8
+            # block grid. When explicitly enabled, the loader instead pads the
+            # global intermediate dimension before splitting ranks, preserving
+            # each source block and leaving zero-only blocks in the tail.
             can_pad_aiter_block_weight = (
                 use_aiter_moe
-                and moe_tp_size == 1
-                and padding_size == block_n == block_k
+                and requested_aiter_padding == padding_size
+                and padding_size % block_n == 0
+                and padding_size % block_k == 0
+                and weight_padded
             )
+            if can_pad_aiter_block_weight:
+                layer.hidden_pad = 0
+                layer.intermediate_pad = (
+                    w2_up_dim - intermediate_size_per_partition
+                )
             if not can_pad_aiter_block_weight:
                 # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
                 # Required by column parallel or enabling merged weights
@@ -1265,7 +1272,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
         extra_weight_attrs.update(
-            {"weight_padded": weight_padded},
+            {
+                "weight_padded": weight_padded,
+                "aiter_global_block_padding": (
+                    can_pad_aiter_block_weight and moe_tp_size > 1
+                ),
+            },
         )
 
         layer.register_parameter("w13_weight", w13_weight)

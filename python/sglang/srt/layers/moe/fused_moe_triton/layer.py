@@ -542,6 +542,12 @@ class FusedMoE(torch.nn.Module):
             and getattr(self.w2_weight, "weight_padded", False)
         )
 
+    @property
+    def use_aiter_global_block_padded_loading(self) -> bool:
+        return self.use_aiter_padded_loading and getattr(
+            self.w2_weight, "aiter_global_block_padding", False
+        )
+
     @cached_property
     def use_padded_loading(self) -> bool:
         # This handles the case where the loaded weights are smaller than the padded expert_data
@@ -569,6 +575,30 @@ class FusedMoE(torch.nn.Module):
         checkpoint offset would give ranks after zero the wrong slice.
         """
         loaded_size = loaded_weight.shape[shard_dim]
+        param_shard = expert_data.narrow(shard_dim, param_data_start, padded_shard_size)
+        param_shard.zero_()
+
+        if self.use_aiter_global_block_padded_loading:
+            if self.use_presharded_weights:
+                raise ValueError(
+                    "AITER global block padding requires an unsharded checkpoint."
+                )
+
+            # Keep local FP8 blocks aligned with the original checkpoint. For
+            # example, TP4 turns a logical 640-wide expert into four 256-wide
+            # buffers, so only the final two buffers contain zero padding.
+            weight_start = padded_shard_size * tp_rank
+            copy_size = max(
+                min(padded_shard_size, loaded_size - weight_start), 0
+            )
+            loaded_weight = loaded_weight.narrow(
+                shard_dim, min(weight_start, loaded_size), copy_size
+            )
+            return (
+                param_shard.narrow(shard_dim, 0, copy_size),
+                loaded_weight,
+            )
+
         if self.use_presharded_weights:
             logical_shard_size = loaded_size
         else:
@@ -585,9 +615,6 @@ class FusedMoE(torch.nn.Module):
                 f"Logical MoE shard ({logical_shard_size}) exceeds its padded "
                 f"buffer ({padded_shard_size})."
             )
-
-        param_shard = expert_data.narrow(shard_dim, param_data_start, padded_shard_size)
-        param_shard.zero_()
 
         if not self.use_presharded_weights:
             weight_start = logical_shard_size * tp_rank

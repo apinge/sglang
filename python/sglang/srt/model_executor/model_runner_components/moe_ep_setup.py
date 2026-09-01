@@ -15,7 +15,7 @@ from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import will_use_aiter_moe
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import log_info_on_rank0
+from sglang.srt.utils import get_int_env_var, log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -137,7 +137,18 @@ def check_quantized_moe_compatibility(
                 f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({tp_size}) divided by moe_ep_size ({moe_ep_size})."
             )
 
-        can_pad_aiter_block_weight = will_use_aiter_moe() and moe_tp_size == 1
+        can_pad_aiter_block_weight = will_use_aiter_moe() and (
+            moe_tp_size == 1
+            or (
+                quantization_config.get("quant_method") == "fp8"
+                and len(weight_block_size) == 2
+                and get_int_env_var("AITER_MOE_PADDING_SIZE") > 0
+                and get_int_env_var("AITER_MOE_PADDING_SIZE") % weight_block_size_n
+                == 0
+                and get_int_env_var("AITER_MOE_PADDING_SIZE") % weight_block_size[1]
+                == 0
+            )
+        )
         if (
             not envs.SGLANG_SHARED_EXPERT_TP1.get()
             and (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0
@@ -146,8 +157,7 @@ def check_quantized_moe_compatibility(
             raise ValueError(
                 f"For quantized MoE models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
                 f"where moe_tp_size is equal to tp_size ({tp_size}) divided by ep_size ({moe_ep_size}). "
-                "AITER can only pad an unaligned block-quantized intermediate "
-                "dimension when moe_tp_size is 1 because a larger MoE TP size "
-                "would split checkpoint quantization blocks. You can fix this "
-                "by setting arguments `--tp` and `--ep` so moe_tp_size is 1."
+                "AITER can pad this native FP8 path with a larger MoE TP size "
+                "only when AITER_MOE_PADDING_SIZE matches both checkpoint block "
+                "dimensions; otherwise set `--tp` and `--ep` so moe_tp_size is 1."
             )
