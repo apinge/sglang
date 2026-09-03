@@ -82,7 +82,7 @@ command=(
   --host "${HOST}"
   --port "${PORT}"
   --tp-size "${TP_SIZE}"
-  --attention-backend triton
+  --attention-backend aiter
   --moe-runner-backend triton
   --kv-cache-dtype auto
   --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}"

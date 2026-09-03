@@ -16,8 +16,16 @@ MODEL_PATH="${MODEL_PATH:-/models/Qwen3.8-Flash-Next-FP8}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3.8-Flash-Next-FP8}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-7080}"
-TP_SIZE="${TP_SIZE:-4}"
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
+TP_SIZE="${TP_SIZE:-2}"
+# TP2 needs room for HIPBLAS initialization and graph capture after KV sizing;
+# TP4/TP8 have previously been validated with the more conservative 0.85.
+if [[ -z "${MEM_FRACTION_STATIC:-}" ]]; then
+  if (( TP_SIZE == 2 )); then
+    MEM_FRACTION_STATIC=0.95
+  else
+    MEM_FRACTION_STATIC=0.85
+  fi
+fi
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
 #CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-32}"
@@ -29,8 +37,8 @@ if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
   exit 1
 fi
 
-if (( TP_SIZE != 4 && TP_SIZE != 8 )); then
-  echo "This pure-TP script supports TP_SIZE=4 or TP_SIZE=8 (got ${TP_SIZE})." >&2
+if (( TP_SIZE != 4 && TP_SIZE != 8 && TP_SIZE != 2)); then
+  echo "This pure-TP script supports TP_SIZE=4 or TP_SIZE=8 or TP 2(got ${TP_SIZE})." >&2
   exit 1
 fi
 
@@ -91,11 +99,10 @@ command=(
   --mem-fraction-static "${MEM_FRACTION_STATIC}"
   --max-running-requests "${MAX_RUNNING_REQUESTS}"
   --cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE}"
-  #--moe-runner-backend triton 
-  # --speculative-algorithm EAGLE
-  # --speculative-num-steps 3
-  # --speculative-eagle-topk 1
-  # --speculative-num-draft-tokens 4
+  --speculative-algorithm EAGLE
+  --speculative-num-steps 3
+  --speculative-eagle-topk 1
+  --speculative-num-draft-tokens 4
 )
 
 # Use an explicit negative flag for the control run so the A/B result cannot be
