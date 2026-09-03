@@ -1580,6 +1580,21 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "Qwen3_5ForConditionalGeneration",
                 )
             )
+            for arch in ("Qwen3_5ForCausalLM", "Qwen3_5MoeForCausalLM"):
+                self.assertEqual(
+                    _mamba_radix_cache_resolution(
+                        _view(arch, linear_attn_backend="aiter", page_size=16)
+                    ),
+                    {
+                        "uses_mamba_radix_cache": True,
+                        "mamba_radix_cache_strategy": "extra_buffer",
+                    },
+                )
+                self.assertTrue(
+                    supports_mamba_cache_extra_buffer(
+                        SimpleNamespace(linear_attn_backend="aiter"), arch
+                    )
+                )
             self.assertFalse(
                 supports_mamba_cache_extra_buffer(
                     SimpleNamespace(linear_attn_backend="aiter"),
