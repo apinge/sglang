@@ -962,6 +962,8 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "KimiLinearForCausalLM",
         "BailingMoeV2_5ForCausalLM",
         "Qwen3NextForCausalLM",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
@@ -981,6 +983,8 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
 # delegates here.
 _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
     {
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3NextForCausalLM",

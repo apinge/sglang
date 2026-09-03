@@ -12,6 +12,7 @@ from sglang.srt.layers.moe.utils import get_moe_weight_sizes
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.utils import (
     get_bool_env_var,
+    is_gfx942_supported,
     is_gfx95_supported,
     is_hip,
     set_weight_attrs,
@@ -27,16 +28,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
+_is_gfx942 = is_gfx942_supported()
 
 __all__ = ["QuarkW4A4MXFp4MoE"]
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-if _use_aiter:
+if _is_hip:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.utility.fp4_utils import e8m0_shuffle
-
-if _is_hip:
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
 else:
     dynamic_mxfp4_quant = None
@@ -45,7 +45,6 @@ OCP_MX_BLOCK_SIZE = 32
 
 
 class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
-
     def __init__(
         self,
         weight_config: dict[str, Any],
@@ -67,6 +66,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         self.static_input_scales = not self.input_quant.get("is_dynamic")
         self.with_bias = False
+        self.use_aiter_a16w4 = False
 
         if not self.is_checkpoint_mxfp4_serialized:
             if not mxfp_supported():
@@ -93,6 +93,19 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        self.use_aiter_a16w4 = (
+            _use_aiter
+            and _is_gfx942
+            and self.is_checkpoint_mxfp4_serialized
+            and num_experts == 512
+            and hidden_size == 8192
+            and intermediate_size_per_partition == 256
+        )
+        if self.use_aiter_a16w4:
+            logger.info_once(
+                "Using the gfx942 A16W4 MoE path for Qwen3.8 TP8 "
+                "(512 experts, top-k 10, hidden 8192, local intermediate 256)."
+            )
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
@@ -218,6 +231,17 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         return online_mxfp4_moe_weight_loader
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.use_aiter_a16w4:
+            # The gfx942 A16W4 kernel consumes the checkpoint's original E8M0
+            # scale order and column-major transposed views. Do not apply the
+            # CDNA4-oriented scale/weight shuffles used by the existing A4W4
+            # path.
+            if hasattr(layer, "dispatcher"):
+                layer.dispatcher.set_quant_config(
+                    {"weight_dtype": torch.float4_e2m1fn_x2}
+                )
+            return
+
         # Pre-shuffle weight scales
         s0, s1, _ = layer.w13_weight_scale.shape
         w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
@@ -268,6 +292,9 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        if self.use_aiter_a16w4:
+            return self._apply_aiter_a16w4(layer, dispatch_output)
+
         from sglang.srt.layers.moe.moe_runner.aiter import (
             AiterMoeQuantInfo,
             AiterQuantType,
@@ -293,3 +320,74 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             expert_mask=layer.dispatcher.expert_mask_gpu,
         )
         return self.runner.run(dispatch_output, quant_info)
+
+    def _apply_aiter_a16w4(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from aiter import silu_and_mul
+        from aiter.ops.triton.moe.moe_op_gemm_a16w4 import moe_gemm_a16w4
+        from aiter.ops.triton.moe.moe_routing.routing import routing
+
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardCombineInput,
+        )
+
+        hidden_states = dispatch_output.hidden_states
+        if hidden_states.shape[0] == 0:
+            return StandardCombineInput(hidden_states=hidden_states)
+
+        if layer.moe_ep_size != 1 or layer.moe_tp_size != 8:
+            raise NotImplementedError(
+                "The gfx942 Qwen3.8 A16W4 path currently supports TP8/EP1 only. "
+                f"Got TP{layer.moe_tp_size}/EP{layer.moe_ep_size}."
+            )
+        if self.moe_runner_config.top_k != 10:
+            raise ValueError(
+                "The gfx942 Qwen3.8 A16W4 path requires top-k 10, got "
+                f"{self.moe_runner_config.top_k}."
+            )
+
+        router_logits = dispatch_output.topk_output.router_logits
+        routing_data, gather_idx, scatter_idx = routing(
+            router_logits,
+            self.moe_runner_config.top_k,
+            sm_first=False,
+        )
+
+        # Checkpoint layout is [E, N, K/2] / [E, N, K/32]. AITER A16W4
+        # consumes logical column-major [E, K/2, N] / [E, K/32, N] views.
+        w13_weight = layer.w13_weight.view(torch.uint8).transpose(1, 2)
+        w13_scale = layer.w13_weight_scale.view(torch.uint8).transpose(1, 2)
+        w2_weight = layer.w2_weight.view(torch.uint8).transpose(1, 2)
+        w2_scale = layer.w2_weight_scale.view(torch.uint8).transpose(1, 2)
+
+        stage1 = moe_gemm_a16w4(
+            hidden_states,
+            w13_weight,
+            None,
+            w13_scale,
+            routing_data=routing_data,
+            gather_indx=gather_idx,
+            out_dtype=hidden_states.dtype,
+        )
+
+        intermediate = torch.empty(
+            (stage1.shape[0], stage1.shape[1] // 2),
+            dtype=stage1.dtype,
+            device=stage1.device,
+        )
+        silu_and_mul(intermediate, stage1)
+
+        output = moe_gemm_a16w4(
+            intermediate,
+            w2_weight,
+            None,
+            w2_scale,
+            routing_data=routing_data,
+            scatter_indx=scatter_idx,
+            gammas=routing_data.gate_scal,
+            out_dtype=hidden_states.dtype,
+        )
+        return StandardCombineInput(hidden_states=output)
