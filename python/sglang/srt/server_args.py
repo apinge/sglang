@@ -6829,16 +6829,33 @@ class ServerArgs:
         # the COW copy-into-slot path resets the ring cursor) -- so the
         # --disable-radix-cache requirement is dropped.
         #
-        # Both mamba scheduler strategies are wired. no_buffer resets the ReplaySSM
-        # ring cursor in MambaPool.copy_from; extra_buffer donates the track snapshot
-        # via `donate_mamba_ping_pong_slot`, which resets the cursor on the donated
-        # and the replacement slot itself.
+        # GDN extra_buffer tracks a complete checkpoint: decode force-flushes
+        # at tracking boundaries and every slot enters the ping-pong buffer
+        # with an empty ring. KDA does not yet wire tracking force-flush, so
+        # its extra_buffer snapshots would omit pending ring entries.
         if cfg.enable_linear_replayssm:
             if decode not in {"triton", "helion"}:
                 raise ValueError(
                     "--enable-linear-replayssm requires Triton, or Helion for "
                     "KDA, as the linear-attn decode backend; got "
                     f"--linear-attn-decode-backend={decode!r}."
+                )
+            from sglang.srt.arg_groups.overrides import (
+                mamba_extra_buffer_of,
+            )
+            from sglang.srt.configs.hybrid_arch import kimi_linear_config
+
+            # Read the architecture predicate rather than building cache params:
+            # their TP shapes require process groups that do not exist yet.
+            if (
+                mamba_extra_buffer_of(resolved_view(self))
+                and kimi_linear_config(self.get_model_config()) is not None
+            ):
+                raise ValueError(
+                    "--enable-linear-replayssm on a KDA model requires "
+                    "--mamba-radix-cache-strategy no_buffer; extra_buffer does "
+                    "not force-flush the KDA ring at radix tracking boundaries. Got "
+                    f"--mamba-radix-cache-strategy={cfg.mamba_radix_cache_strategy!r}."
                 )
             if cfg.disaggregation_mode != "null":
                 # The disaggregated decode pool (HybridMambaDecodeReqToTokenPool)
