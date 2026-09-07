@@ -9,10 +9,11 @@ from sglang.srt.layers.hc_mix_triton import (
     fused_hc_mix,
     fused_hc_mix_supported,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 HC_COUNT = 4
 HIDDEN_SIZE = 2560
@@ -53,7 +54,7 @@ _TOLERANCES = {
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("num_tokens", [1, 4, 7, _FUSED_MIX_MAX_ROWS])
+@pytest.mark.parametrize("num_tokens", range(1, _FUSED_MIX_MAX_ROWS + 1))
 def test_fused_hc_mix_matches_reference(dtype, num_tokens):
     x, w_down, w_up = _make_inputs(num_tokens, dtype)
     assert fused_hc_mix_supported(x, w_down, w_up)
@@ -79,6 +80,27 @@ def test_fused_hc_mix_no_less_accurate_than_eager():
 def test_fused_hc_mix_gate_rejects_prefill_rows():
     x, w_down, w_up = _make_inputs(_FUSED_MIX_MAX_ROWS + 1, torch.bfloat16)
     assert not fused_hc_mix_supported(x, w_down, w_up)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 4, 7, 8, _FUSED_MIX_MAX_ROWS])
+def test_fused_hc_mix_graph_replay(num_tokens):
+    """Reusing the persistent barrier must observe each replay's new input."""
+    x, w_down, w_up = _make_inputs(num_tokens, torch.bfloat16)
+    for _ in range(3):
+        fused_hc_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = fused_hc_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
+
+    for _ in range(6):
+        x.add_(0.03125)
+        graph.replay()
+        ref = _reference_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
+        torch.testing.assert_close(
+            out.to(torch.float64), ref, **_TOLERANCES[torch.bfloat16]
+        )
 
 
 if __name__ == "__main__":

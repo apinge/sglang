@@ -32,6 +32,23 @@ import triton.language as tl
 
 _FUSED_MIX_MAX_ROWS = 16
 
+_DEFAULT_MIX_CONFIG = dict(BLOCK_N=32, BLOCK_K=256, BLOCK_J=32, BLOCK_R=64, num_warps=8)
+# Measured on an 80-CU MI308X with Qwen3.8's BF16 HC weights. Keep the
+# one-CTA-per-CU barrier contract; only specialize the validated shape/device.
+# Graph replay over the checkpoint's HC weights improves from ~77 to ~32-36 us.
+_GFX942_MIX_CONFIG = dict(
+    BLOCK_N=32,
+    BLOCK_K=256,
+    BLOCK_J=32,
+    BLOCK_R=64,
+    num_warps=2,
+    num_stages=1,
+    waves_per_eu=1,
+    matrix_instr_nonkdim=16,
+    kpack=2,
+    WEIGHT_CACHE_MODIFIER=".cg",
+)
+
 
 @triton.jit
 def _grid_barrier(counter_ptr, num_ctas):
@@ -60,6 +77,7 @@ def _hc_mix_persistent_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_J: tl.constexpr,
     BLOCK_R: tl.constexpr,
+    WEIGHT_CACHE_MODIFIER: tl.constexpr = "",
 ):
     pid = tl.program_id(0)
     offs_m = tl.arange(0, ROWS)
@@ -91,6 +109,7 @@ def _hc_mix_persistent_kernel(
             w_down_ptr + n[:, None] * K + k[None, :],
             mask=mask_n[:, None],
             other=0.0,
+            cache_modifier=WEIGHT_CACHE_MODIFIER,
         )
         acc = tl.dot(xt, tl.trans(w))
         tl.atomic_add(
@@ -129,6 +148,7 @@ def _hc_mix_persistent_kernel(
                 w_up_ptr + gj_flat[:, None] * LOWRANK + r[None, :],
                 mask=mask_gj[:, None] & mask_r[None, :],
                 other=0.0,
+                cache_modifier=WEIGHT_CACHE_MODIFIER,
             )
             acc = tl.dot(t, tl.trans(w), acc)
         gate = tl.sigmoid(tl.reshape(acc, (ROWS, HC, BLOCK_J)))
@@ -214,7 +234,19 @@ def fused_hc_mix(
     lowrank = w_down.shape[0]
     rows_pad = 16
     device = hyper_input_normed.device
-    num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
+    props = torch.cuda.get_device_properties(device)
+    num_ctas = props.multi_processor_count
+    launch_config = _DEFAULT_MIX_CONFIG
+    if (
+        torch.version.hip is not None
+        and props.gcnArchName.split(":", 1)[0] == "gfx942"
+        and num_ctas == 80
+        and hyper_input_normed.dtype == torch.bfloat16
+        and (hc, hs, lowrank, k) == (4, 2560, 320, 10240)
+        and rows <= _FUSED_MIX_MAX_ROWS
+    ):
+        rows_pad = max(2, triton.next_power_of_2(rows))
+        launch_config = _GFX942_MIX_CONFIG
     t_raw = torch.empty((rows_pad, lowrank), dtype=torch.float32, device=device)
     out = torch.empty((rows, hs), dtype=hyper_input_normed.dtype, device=device)
     if rows == 0:
@@ -234,10 +266,6 @@ def fused_hc_mix(
         1.0 / hc,
         ROWS=rows_pad,
         HC=hc,
-        BLOCK_N=32,
-        BLOCK_K=256,
-        BLOCK_J=32,
-        BLOCK_R=64,
-        num_warps=8,
+        **launch_config,
     )
     return out
