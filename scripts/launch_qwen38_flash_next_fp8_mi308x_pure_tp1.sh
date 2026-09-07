@@ -20,8 +20,8 @@ TP_SIZE="${TP_SIZE:-1}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.95}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
 #CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
-MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-1}"
-CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-1}"
+MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
+CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-16}"
 #AITER_MOE_PADDING_SIZE="${AITER_MOE_PADDING_SIZE:-128}"
 
 if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
@@ -82,7 +82,7 @@ command=(
   --host "${HOST}"
   --port "${PORT}"
   --tp-size "${TP_SIZE}"
-  --attention-backend aiter
+  --attention-backend triton
   --moe-runner-backend triton
   --kv-cache-dtype auto
   --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}"
@@ -91,11 +91,10 @@ command=(
   --mem-fraction-static "${MEM_FRACTION_STATIC}"
   --max-running-requests "${MAX_RUNNING_REQUESTS}"
   --cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE}"
-  #--moe-runner-backend triton 
-  # --speculative-algorithm EAGLE
-  # --speculative-num-steps 3
-  # --speculative-eagle-topk 1
-  # --speculative-num-draft-tokens 4
+  --speculative-algorithm EAGLE
+  --speculative-num-steps 3
+  --speculative-eagle-topk 1
+  --speculative-num-draft-tokens 4
 )
 
 # Use an explicit negative flag for the GPU-resident control case. TP1 needs
