@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PLE_OFFLOAD_EMBEDDING="${PLE_OFFLOAD_EMBEDDING:-1}"
+PLE_OFFLOAD_EMBEDDING="${PLE_OFFLOAD_EMBEDDING:-0}"
 LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/logs/qwen3.8_flash_next_fp8_mi308x_pure_tp_4_or_8_pleoffload${PLE_OFFLOAD_EMBEDDING}_$(date -u +%Y%m%dT%H%M%SZ).log}"
 mkdir -p "$(dirname -- "${LOG_FILE}")"
 # Capture both this script's preflight checks and all sglang serve output.
@@ -99,10 +99,11 @@ command=(
   --mem-fraction-static "${MEM_FRACTION_STATIC}"
   --max-running-requests "${MAX_RUNNING_REQUESTS}"
   --cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE}"
-  --speculative-algorithm EAGLE
-  --speculative-num-steps 3
-  --speculative-eagle-topk 1
-  --speculative-num-draft-tokens 4
+  --disable-custom-all-reduce 
+  # --speculative-algorithm EAGLE
+  # --speculative-num-steps 3
+  # --speculative-eagle-topk 1
+  # --speculative-num-draft-tokens 4
 )
 
 # Use an explicit negative flag for the control run so the A/B result cannot be
