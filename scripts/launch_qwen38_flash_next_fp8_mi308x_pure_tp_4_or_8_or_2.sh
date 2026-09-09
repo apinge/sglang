@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PLE_OFFLOAD_EMBEDDING="${PLE_OFFLOAD_EMBEDDING:-0}"
+PLE_OFFLOAD_EMBEDDING="${PLE_OFFLOAD_EMBEDDING:-1}"
 LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/logs/qwen3.8_flash_next_fp8_mi308x_pure_tp_4_or_8_pleoffload${PLE_OFFLOAD_EMBEDDING}_$(date -u +%Y%m%dT%H%M%SZ).log}"
 mkdir -p "$(dirname -- "${LOG_FILE}")"
 # Capture both this script's preflight checks and all sglang serve output.
@@ -21,15 +21,17 @@ TP_SIZE="${TP_SIZE:-2}"
 # TP4/TP8 have previously been validated with the more conservative 0.85.
 if [[ -z "${MEM_FRACTION_STATIC:-}" ]]; then
   if (( TP_SIZE == 2 )); then
-    MEM_FRACTION_STATIC=0.95
+    MEM_FRACTION_STATIC=1.0
   else
     MEM_FRACTION_STATIC=0.85
   fi
 fi
-CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
-#CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
-MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-32}"
-CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-32}"
+CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-32768}"
+MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-32768}"
+MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-65}"
+CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-64}"
+MAMBA_SSM_DTYPE="${MAMBA_SSM_DTYPE:-bfloat16}"
+MAX_MAMBA_CACHE_SIZE="${MAX_MAMBA_CACHE_SIZE:-325}"
 AITER_MOE_PADDING_SIZE="${AITER_MOE_PADDING_SIZE:-128}"
 
 if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
@@ -77,10 +79,10 @@ for index in range(tp_size):
         )
 PY
 
-# Match the AMD nightly correctness configuration. Explicit AITER backends are
-# selected below while this disables the unreleased global paged-QSA path.
-#unset SGLANG_USE_AITER
-export SGLANG_USE_AITER=0
+# Use global AITER and INT6 QuickReduce by default; callers can still override.
+export SGLANG_USE_AITER="${SGLANG_USE_AITER:-1}"
+export ROCM_QUICK_REDUCE_QUANTIZATION="${ROCM_QUICK_REDUCE_QUANTIZATION:-INT6}"
+export ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16="${ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16:-1}"
 export AITER_MOE_PADDING_SIZE
 
 command=(
@@ -99,6 +101,9 @@ command=(
   --mem-fraction-static "${MEM_FRACTION_STATIC}"
   --max-running-requests "${MAX_RUNNING_REQUESTS}"
   --cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE}"
+  --max-prefill-tokens "${MAX_PREFILL_TOKENS}"
+  --mamba-ssm-dtype "${MAMBA_SSM_DTYPE}"
+  --max-mamba-cache-size "${MAX_MAMBA_CACHE_SIZE}"
   # --speculative-algorithm EAGLE
   # --speculative-num-steps 3
   # --speculative-eagle-topk 1
