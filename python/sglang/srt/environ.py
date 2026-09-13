@@ -1015,6 +1015,9 @@ class Envs:
     SGLANG_BF16_GEMM_LOG_SHAPES = EnvBool(False)
     # Split the HC combine gate dot across CTAs instead of one CTA per row.
     SGLANG_HC_COMBINE_SPLIT = EnvBool(True)
+    # Qwen4-Exp ordinary prefill only: shard GR read rows across the TP group.
+    SGLANG_GR_READ_TP_SPLIT = EnvBool(False)
+    SGLANG_GR_READ_TP_SPLIT_MIN_T = EnvInt(4096)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
