@@ -60,12 +60,41 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5LinearDecoderLayer,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import logger
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
 _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
+
+
+def _qwen4_exp_gr_read_tp_enabled(forward_batch: ForwardBatch) -> bool:
+    if (
+        not envs.SGLANG_GR_READ_TP_SPLIT.get()
+        or forward_batch.forward_mode != ForwardMode.EXTEND
+    ):
+        return False
+    parallel = get_parallel()
+    config = parallel.config
+    return (
+        parallel.tp_size in (2, 4, 8)
+        and parallel.pp_size == 1
+        and config.dp_size == 1
+        and parallel.attn_tp_size == parallel.tp_size
+        and parallel.attn_cp_size == 1
+        and config.dcp_size == 1
+        and parallel.moe_ep_size == 1
+        and parallel.moe_dp_size == 1
+        and not config.enable_dp_attention
+        and not config.enable_prefill_cp
+        and not config.enable_prefill_context_parallel
+        and not config.enable_dsa_prefill_context_parallel
+        and not get_attn_tp_context().input_scattered
+        and get_moe_a2a_backend().is_none()
+        and get_exec().graph.cuda_graph_config.prefill.backend == "disabled"
+        and not get_is_capture_mode()
+    )
+
 
 _QWEN4_EXP_FUSED_SHARED_EXPERT_MAPPING = (
     ("gate_proj", "w13", "w1"),
@@ -1330,7 +1359,9 @@ class Qwen4ExpLayerExtensionMixin:
                     ple_query, forward_batch, ple_batch
                 )
 
-        hidden_states, residual = self.attn_hyper_connection.mix(hidden_states)
+        hidden_states, residual = self.attn_hyper_connection.mix(
+            hidden_states, split_tokens=_qwen4_exp_gr_read_tp_enabled(forward_batch)
+        )
         return hidden_states, residual
 
     def _prepare_qwen4_exp_mlp(
@@ -1342,7 +1373,9 @@ class Qwen4ExpLayerExtensionMixin:
         if not forward_batch.forward_mode.is_idle():
             hidden_states = attn_tp_all_reduce(hidden_states)
         hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
-        hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
+        hidden_states, residual = self.mlp_hyper_connection.mix(
+            hidden_states, split_tokens=_qwen4_exp_gr_read_tp_enabled(forward_batch)
+        )
         return hidden_states, residual
 
     def _qwen4_exp_use_dp_moe_gather(self) -> bool:
@@ -1692,7 +1725,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         _commit_ple_batch(ple_batch, forward_batch)
 
         hc_hidden_states = hidden_states
-        hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
+        hidden_states, _ = self.hyper_connection_mixer.mix(
+            hidden_states, split_tokens=_qwen4_exp_gr_read_tp_enabled(forward_batch)
+        )
         if not forward_batch.forward_mode.is_idle():
             return hidden_states, hc_hidden_states
 

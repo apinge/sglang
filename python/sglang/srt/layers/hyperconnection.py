@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Callable, Optional
 
 import msgspec
 import torch
@@ -228,7 +228,44 @@ class GatedResidual(HyperConnectionBase):
         self._mix_compute = torch.compile(_mix_compute)
         self._combine_compute = torch.compile(_combine_compute)
 
-    def mix(self, hyper_input: torch.Tensor):
+    def _mix_compute_tp(
+        self,
+        x: torch.Tensor,
+        *,
+        all_gather: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None,
+    ) -> torch.Tensor:
+        from sglang.srt.distributed import get_attn_tp_group
+
+        group = get_attn_tp_group()
+        tokens = x.shape[0]
+        rows = (tokens + group.world_size - 1) // group.world_size
+        start = min(group.rank_in_group * rows, tokens)
+        valid = min(rows, tokens - start)
+        if valid:
+            local = self._mix_compute(
+                x.narrow(0, start, valid),
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+                self.hidden_size,
+            ).to(self.params_dtype)
+        else:
+            local = x.new_empty((0, self.hidden_size), dtype=self.params_dtype)
+
+        # Fixed-width rank intervals put all padding at the global tail.
+        if valid != rows:
+            send = local.new_zeros((rows, self.hidden_size))
+            send[:valid].copy_(local)
+        else:
+            send = local.contiguous()
+        output = local.new_empty((group.world_size * rows, self.hidden_size))
+        gather = group.all_gather_into_tensor if all_gather is None else all_gather
+        gather(output, send)
+        return output[:tokens]
+
+    def mix(self, hyper_input: torch.Tensor, *, split_tokens: bool = False):
+        from sglang.srt.environ import envs
+
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
             mixed_input = hyper_input.new_empty(
@@ -243,6 +280,16 @@ class GatedResidual(HyperConnectionBase):
                 hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
             ).flatten(-2)
         if (
+            split_tokens
+            and hyper_input_normed.dim() == 2
+            and hyper_input_normed.is_cuda
+            and hyper_input_normed.is_contiguous()
+            and hyper_input_normed.dtype == self.params_dtype
+            and hyper_input_normed.shape[0]
+            >= max(1, envs.SGLANG_GR_READ_TP_SPLIT_MIN_T.get())
+        ):
+            mixed_input = self._mix_compute_tp(hyper_input_normed)
+        elif (
             self._jit_mix_ok
             and hyper_input_normed.is_cuda
             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
