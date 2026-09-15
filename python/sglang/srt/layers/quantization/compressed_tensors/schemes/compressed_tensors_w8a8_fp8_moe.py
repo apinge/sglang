@@ -387,6 +387,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     )
                     torch.cuda.empty_cache()
 
+                # torch.nn.Parameter does not preserve custom tensor attributes.
+                # Restore the marker consumed by AITER whole-graph MoE dispatch.
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
+
         if (
             self.weight_quant.strategy == QuantizationStrategy.BLOCK
             and self.use_flashinfer_trtllm
