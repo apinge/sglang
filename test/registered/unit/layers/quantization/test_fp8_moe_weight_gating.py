@@ -219,6 +219,154 @@ class TestFp8MoEWeightGating(CustomTestCase):
                 is_hip=True,
             )
 
+    def test_compressed_tensors_fp8_ptpc_preserves_aiter_shuffle_marker(self):
+        from compressed_tensors.quantization import QuantizationStrategy
+        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+            compressed_tensors_w8a8_fp8_moe as compressed_fp8_moe,
+        )
+
+        scheme = object.__new__(compressed_fp8_moe.CompressedTensorsW8A8Fp8MoE)
+        scheme.static_input_scales = False
+        scheme.input_quant = SimpleNamespace(strategy=QuantizationStrategy.TOKEN)
+        scheme.weight_quant = SimpleNamespace(strategy=QuantizationStrategy.CHANNEL)
+        scheme.use_flashinfer_trtllm = False
+
+        def fake_shuffle(weight, _layout):
+            shuffled = weight.clone()
+            shuffled.is_shuffled = True
+            return shuffled
+
+        def fake_normalize(weight, weight_scale, input_scale):
+            return weight, weight_scale, input_scale
+
+        for use_fnuz in (False, True):
+            for padding_size in (0, 16):
+                with self.subTest(use_fnuz=use_fnuz, padding_size=padding_size):
+                    normalizer = MagicMock(side_effect=fake_normalize)
+                    layer = SimpleNamespace(
+                        w13_weight=torch.nn.Parameter(torch.randn(2, 8, 4)),
+                        w2_weight=torch.nn.Parameter(torch.randn(2, 4, 4)),
+                        w13_weight_scale=torch.nn.Parameter(torch.ones(2, 8, 1)),
+                        w2_weight_scale=torch.nn.Parameter(torch.ones(2, 4, 1)),
+                        w13_input_scale=None,
+                        w2_input_scale=None,
+                    )
+                    with (
+                        patch.object(
+                            compressed_fp8_moe,
+                            "will_use_aiter_moe",
+                            return_value=True,
+                        ),
+                        patch.object(
+                            compressed_fp8_moe,
+                            "is_fp8_fnuz",
+                            return_value=use_fnuz,
+                        ),
+                        patch.object(
+                            compressed_fp8_moe,
+                            "normalize_e4m3fn_to_e4m3fnuz",
+                            normalizer,
+                        ),
+                        patch.object(
+                            compressed_fp8_moe,
+                            "get_int_env_var",
+                            return_value=padding_size,
+                        ),
+                        patch.object(
+                            compressed_fp8_moe,
+                            "_get_aiter_shuffle_weight",
+                            return_value=fake_shuffle,
+                        ),
+                        patch.object(torch.cuda, "empty_cache"),
+                    ):
+                        scheme.process_weights_after_loading(layer)
+
+                    self.assertEqual(normalizer.call_count, 2 if use_fnuz else 0)
+                    self.assertTrue(layer.w13_weight.is_shuffled)
+                    self.assertTrue(layer.w2_weight.is_shuffled)
+
+    def test_compressed_tensors_fp8_ptpc_skips_aiter_shuffle_for_triton(self):
+        from compressed_tensors.quantization import QuantizationStrategy
+        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+            compressed_tensors_w8a8_fp8_moe as compressed_fp8_moe,
+        )
+
+        scheme = object.__new__(compressed_fp8_moe.CompressedTensorsW8A8Fp8MoE)
+        scheme.static_input_scales = False
+        scheme.input_quant = SimpleNamespace(strategy=QuantizationStrategy.TOKEN)
+        scheme.weight_quant = SimpleNamespace(strategy=QuantizationStrategy.CHANNEL)
+        scheme.use_flashinfer_trtllm = False
+        layer = SimpleNamespace(
+            w13_weight=torch.nn.Parameter(torch.randn(2, 8, 4)),
+            w2_weight=torch.nn.Parameter(torch.randn(2, 4, 4)),
+            w13_weight_scale=torch.nn.Parameter(torch.ones(2, 8, 1)),
+            w2_weight_scale=torch.nn.Parameter(torch.ones(2, 4, 1)),
+            w13_input_scale=None,
+            w2_input_scale=None,
+        )
+
+        with (
+            patch.object(
+                compressed_fp8_moe,
+                "will_use_aiter_moe",
+                return_value=False,
+            ),
+            patch.object(compressed_fp8_moe, "is_fp8_fnuz", return_value=False),
+            patch.object(
+                compressed_fp8_moe,
+                "_get_aiter_shuffle_weight",
+                side_effect=AssertionError("Triton must not request AITER shuffle"),
+            ),
+        ):
+            scheme.process_weights_after_loading(layer)
+
+        self.assertFalse(hasattr(layer.w13_weight, "is_shuffled"))
+        self.assertFalse(hasattr(layer.w2_weight, "is_shuffled"))
+
+    def test_compressed_tensors_fp8_ptpc_allocation_uses_effective_runner(self):
+        from compressed_tensors.quantization import QuantizationStrategy
+        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+            compressed_tensors_w8a8_fp8_moe as compressed_fp8_moe,
+        )
+
+        scheme = object.__new__(compressed_fp8_moe.CompressedTensorsW8A8Fp8MoE)
+        scheme.static_input_scales = False
+        scheme.input_quant = SimpleNamespace(strategy=QuantizationStrategy.TOKEN)
+        scheme.weight_quant = SimpleNamespace(strategy=QuantizationStrategy.CHANNEL)
+        scheme.weight_block_size = None
+        scheme.block_quant = False
+
+        for use_aiter_moe in (False, True):
+            with self.subTest(use_aiter_moe=use_aiter_moe):
+                layer = torch.nn.Module()
+                get_sizes = MagicMock(return_value=(8, 4, False))
+                with (
+                    patch.object(
+                        compressed_fp8_moe,
+                        "will_use_aiter_moe",
+                        return_value=use_aiter_moe,
+                    ),
+                    patch.object(
+                        compressed_fp8_moe,
+                        "get_moe_weight_sizes",
+                        get_sizes,
+                    ),
+                ):
+                    scheme.create_weights(
+                        layer=layer,
+                        num_experts=2,
+                        hidden_size=4,
+                        intermediate_size_per_partition=4,
+                        params_dtype=torch.bfloat16,
+                    )
+
+                get_sizes.assert_called_once_with(
+                    4,
+                    is_aiter_moe=use_aiter_moe,
+                    is_concat=True,
+                    is_packed=False,
+                )
+
     def test_effective_aiter_moe_honors_explicit_runner(self):
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe import utils as moe_utils
