@@ -122,6 +122,9 @@ class GatedResidual(HyperConnectionBase):
     ):
         super().__init__(config, use_mix, use_combine, role)
 
+        self._gr_read = None
+        self._gr_read_pack_count = 0
+
         norm_dim = (
             self.config.hidden_size * self.hc_count
             if self.config.hc_per_branch_norm
@@ -164,6 +167,23 @@ class GatedResidual(HyperConnectionBase):
                 and lowrank % 8 == 0
             )
             self._mix_up_weight_padded = None
+
+            if (
+                torch.version.hip is not None
+                and envs.SGLANG_GR_READ_FLYDSL.get()
+                and (self.hc_count, self.hidden_size, lowrank) == (4, 2560, 320)
+            ):
+                if not envs.SGLANG_USE_AITER.get():
+                    raise RuntimeError("GR read requires SGLANG_USE_AITER=1")
+                from sglang.srt.layers.gr_read.runtime import GRReadMethod
+
+                self.quant_method = GRReadMethod()
+                self.input_mix_weight_down.weight.weight_loader = (
+                    self._load_gr_read_weight
+                )
+                self.input_mix_weight_up.weight.weight_loader = (
+                    self._load_gr_read_weight
+                )
 
         if use_combine:
             self.block_inject_weight = nn.Linear(
@@ -228,6 +248,23 @@ class GatedResidual(HyperConnectionBase):
         self._mix_compute = torch.compile(_mix_compute)
         self._combine_compute = torch.compile(_combine_compute)
 
+    def _apply(self, fn, recurse=True):
+        if self._gr_read is not None:
+            raise RuntimeError(
+                "Moving or converting packed GR weights requires a fresh model and graphs"
+            )
+        return super()._apply(fn, recurse=recurse)
+
+    @torch.no_grad()
+    def _load_gr_read_weight(self, param, loaded_weight):
+        if self._gr_read is not None:
+            raise RuntimeError(
+                "Reloading packed GR weights requires a fresh model and graphs"
+            )
+        if param.shape != loaded_weight.shape:
+            raise ValueError("GR checkpoint weight shape mismatch")
+        param.copy_(loaded_weight)
+
     def mix(self, hyper_input: torch.Tensor):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
@@ -242,7 +279,11 @@ class GatedResidual(HyperConnectionBase):
             hyper_input_normed = self.hc_norm(
                 hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
             ).flatten(-2)
-        if (
+        if self._gr_read is not None:
+            mixed_input = self._gr_read(hyper_input_normed)
+        elif hasattr(self, "quant_method"):
+            raise RuntimeError("GR read weights were not prepared by the model loader")
+        elif (
             self._jit_mix_ok
             and hyper_input_normed.is_cuda
             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)

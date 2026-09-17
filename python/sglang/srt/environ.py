@@ -1011,6 +1011,8 @@ class Envs:
     # Route decode-size HC mix through the fused CuTe split-K GEMM pair
     # instead of the persistent Triton mix.
     SGLANG_HC_MIX_CUDA = EnvBool(True)
+    # ROCm Qwen GR read: one AITER-packed weight layout for all token counts.
+    SGLANG_GR_READ_FLYDSL = EnvBool(True)
     # Log each distinct (m, n, k) the BF16 GEMM dispatch sees (allowlist tuning).
     SGLANG_BF16_GEMM_LOG_SHAPES = EnvBool(False)
     # Split the HC combine gate dot across CTAs instead of one CTA per row.
