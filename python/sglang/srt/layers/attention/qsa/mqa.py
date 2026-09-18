@@ -1,14 +1,17 @@
-"""Weight-free TileLang MQA operators for the simple QSA indexer.
+"""Weight-free MQA operators for the simple QSA indexer.
 
-The CUDA kernels are reduced versions of the previously validated Qwen MQA
+The TileLang kernels are reduced versions of the previously validated Qwen MQA
 kernels: the per-head weight input and all unrelated feature branches are
-removed. Torch implementations are kept as the only fallback and reference.
+removed. Decode also has a Triton kernel for builds without TileLang. Torch
+implementations are kept as the only fallback and reference.
 """
 
 import math
 from typing import Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.utils.common import is_hip
 
@@ -26,6 +29,13 @@ except ImportError:
     tilelang = None
     T = None
     HAS_TILELANG = False
+
+
+# Measured on gfx942 (MI308X, wave64) with a 64x128 key tile and 1024 pages;
+# the page-group count tracks the 80 CUs. Re-tune when the tile shape changes.
+_QSA_MQA_DECODE_NUM_WARPS = 4
+_QSA_MQA_DECODE_PAGE_GROUPS = 64
+_QSA_MQA_DECODE_BLOCK_FILL = 512
 
 
 def _validate_q(q: torch.Tensor) -> None:
@@ -109,6 +119,140 @@ def torch_qsa_mqa_decode(
     copy_len = min(total, max_model_len)
     if copy_len:
         logits[:, :copy_len] = scores[:, :copy_len]
+    return logits
+
+
+@triton.jit
+def _triton_qsa_mqa_decode_kernel(
+    q,
+    k_cache,
+    page_table,
+    context_lens,
+    logits,
+    scale,
+    valid_limit,
+    max_model_len,
+    sq_b,
+    sq_h,
+    sq_d,
+    sk_p,
+    sk_t,
+    sk_d,
+    spt_b,
+    sl_b,
+    HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_F: tl.constexpr,
+):
+    group = tl.program_id(0)
+    batch = tl.program_id(1)
+    groups = tl.num_programs(0)
+    row = logits + batch * sl_b
+    context_len = tl.minimum(tl.load(context_lens + batch).to(tl.int32), valid_limit)
+
+    # Fill [context_len, max_model_len) with -inf in wide tiles: at a 64-wide
+    # compressed page the tail is ~20x the scored region, and a page-wide store
+    # moves only 256 B per program.
+    fill_start = (context_len // BLOCK_F) * BLOCK_F
+    offs_f = tl.arange(0, BLOCK_F)
+    fill_tiles = (max_model_len - fill_start + BLOCK_F - 1) // BLOCK_F
+    for tile in range(group, fill_tiles, groups):
+        positions = fill_start + tile * BLOCK_F + offs_f
+        tl.store(
+            row + positions,
+            float("-inf"),
+            mask=(positions >= context_len) & (positions < max_model_len),
+        )
+
+    pages = (context_len + PAGE_SIZE - 1) // PAGE_SIZE
+    if group < pages:
+        offs_t = tl.arange(0, BLOCK_T)
+        offs_h = tl.arange(0, BLOCK_H)
+        offs_d = tl.arange(0, BLOCK_D)
+        dim_mask = offs_d < HEAD_DIM
+        q_values = tl.load(
+            q + batch * sq_b + offs_h[:, None] * sq_h + offs_d[None, :] * sq_d,
+            mask=(offs_h < HEADS)[:, None] & dim_mask[None, :],
+            other=0.0,
+        )
+        for page in range(group, pages, groups):
+            # A negative page id marks unused page-table padding; the torch
+            # reference clamps it to page 0 and masks the row by context length.
+            page_id = tl.maximum(tl.load(page_table + batch * spt_b + page), 0).to(
+                tl.int64
+            )
+            keys = tl.load(
+                k_cache
+                + page_id * sk_p
+                + offs_t[:, None] * sk_t
+                + offs_d[None, :] * sk_d,
+                mask=(offs_t < PAGE_SIZE)[:, None] & dim_mask[None, :],
+                other=0.0,
+            )
+            # Zero-padded heads and dims contribute relu(0) = 0 to the head sum.
+            scores = tl.maximum(tl.dot(keys, tl.trans(q_values)), 0.0)
+            positions = page * PAGE_SIZE + offs_t
+            tl.store(
+                row + positions,
+                tl.sum(scores, axis=1) / scale,
+                mask=(offs_t < PAGE_SIZE) & (positions < context_len),
+            )
+
+
+def triton_qsa_mqa_decode(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    max_model_len: int,
+    score_scale: Optional[float] = None,
+) -> torch.Tensor:
+    """Triton paged decode MQA, scoring one compressed page per program step."""
+
+    _validate_decode_inputs(q, k_cache, page_table, context_lens)
+    batch, heads, head_dim = q.shape
+    page_size = int(k_cache.shape[1])
+    logits = torch.empty((batch, max_model_len), dtype=torch.float32, device=q.device)
+    if not batch or not max_model_len:
+        return logits
+    # Positions past the page table are -inf regardless of the context length.
+    valid_limit = min(max_model_len, page_table.shape[1] * page_size)
+    q_kernel = q.to(torch.bfloat16)
+    groups = max(
+        1, min(_QSA_MQA_DECODE_PAGE_GROUPS, triton.cdiv(max_model_len, page_size))
+    )
+    _triton_qsa_mqa_decode_kernel[(groups, batch)](
+        q_kernel,
+        k_cache,
+        page_table,
+        context_lens,
+        logits,
+        float(score_scale or math.sqrt(head_dim)),
+        valid_limit,
+        max_model_len,
+        q_kernel.stride(0),
+        q_kernel.stride(1),
+        q_kernel.stride(2),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(3),
+        page_table.stride(0),
+        logits.stride(0),
+        HEADS=heads,
+        HEAD_DIM=head_dim,
+        PAGE_SIZE=page_size,
+        BLOCK_T=triton.next_power_of_2(page_size),
+        # MFMA needs a 16-wide N dimension; CUDA MMA accepts 8 but 16 is legal too.
+        BLOCK_H=max(16, triton.next_power_of_2(heads)),
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        BLOCK_F=_QSA_MQA_DECODE_BLOCK_FILL,
+        num_warps=_QSA_MQA_DECODE_NUM_WARPS,
+        num_stages=1,
+    )
     return logits
 
 
@@ -412,6 +556,10 @@ def qsa_mqa_decode(
         return tilelang_qsa_mqa_decode(
             q, k_cache, page_table, context_lens, max_model_len, score_scale
         )
+    if q.is_cuda:
+        return triton_qsa_mqa_decode(
+            q, k_cache, page_table, context_lens, max_model_len, score_scale
+        )
     return torch_qsa_mqa_decode(
         q, k_cache, page_table, context_lens, max_model_len, score_scale
     )
@@ -423,6 +571,7 @@ __all__ = [
     "qsa_mqa_prefill",
     "tilelang_qsa_mqa_decode",
     "tilelang_qsa_mqa_prefill",
+    "triton_qsa_mqa_decode",
     "torch_qsa_mqa_decode",
     "torch_qsa_mqa_prefill",
 ]
