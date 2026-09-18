@@ -866,6 +866,12 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
                     "output_dir": output_dir,
                     "profile_prefix": getattr(args, "profile_prefix", None),
                 }
+                for env_name, field in (
+                    ("SGLANG_PROFILE_WITH_STACK", "with_stack"),
+                    ("SGLANG_PROFILE_RECORD_SHAPES", "record_shapes"),
+                ):
+                    if os.getenv(env_name) is not None:
+                        body[field] = _get_bool_env_var(env_name)
             else:
                 # stop_profile doesn't need any parameters
                 body = {}
