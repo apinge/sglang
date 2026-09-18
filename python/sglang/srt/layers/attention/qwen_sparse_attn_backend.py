@@ -1706,21 +1706,19 @@ class QwenSparseAttnBackend(AttentionBackend):
             topk,
         )
         if is_hip():
-            relative_indices = torch.arange(
-                topk, dtype=torch.int32, device=q.device
-            ).expand(batch, -1)
-            relative_indices = relative_indices.masked_fill(
-                relative_indices >= valid_counts[:, None], -1
-            ).contiguous()
+            # The compaction above packs the selected rows in order, so every
+            # index row is [0, 1, ..., valid_counts[row] - 1, -1, ...]; the
+            # kernel reconstructs it from valid_counts.
             output = sparse_gqa_packed_decode_triton(
-                q.contiguous(),
+                q,
                 packed_k,
                 packed_v,
-                relative_indices,
+                None,
                 cu_seqlens_q,
                 cu_seqlens_k,
                 valid_counts,
                 layer.scaling,
+                identity_topk=topk,
             )
             return output.reshape(q.shape[0], -1)
 
