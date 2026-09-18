@@ -47,7 +47,7 @@ def test_explicit_aiter_runner_selects_aiter_topk(monkeypatch):
 
 @pytest.mark.skipif(not is_hip(), reason="AITER routing is ROCm-only")
 def test_explicit_aiter_runner_selects_unquantized_aiter_moe(monkeypatch):
-    """BF16 MoE must honor the explicit runner without the global AITER flag."""
+    """Explicit AITER must allow BF16 FlyDSL shapes that are not 128-aligned."""
     from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
     from sglang.srt.layers.quantization import unquant
 
@@ -69,7 +69,7 @@ def test_explicit_aiter_runner_selects_unquantized_aiter_moe(monkeypatch):
     monkeypatch.setattr(unquant, "get_moe_a2a_backend", lambda: MoeA2ABackend.NONE)
 
     config = SimpleNamespace()
-    layer = SimpleNamespace(intermediate_size_per_partition=640)
+    layer = SimpleNamespace(intermediate_size_per_partition=320, intermediate_pad=0)
     method.create_moe_runner(layer, config)
 
     assert method.runner.runner_backend is MoeRunnerBackend.TRITON
@@ -78,6 +78,42 @@ def test_explicit_aiter_runner_selects_unquantized_aiter_moe(monkeypatch):
         MoeRunnerBackend.TRITON,
         MoeRunnerBackend.AITER,
     ]
+
+
+@pytest.mark.skipif(not is_hip(), reason="AITER routing is ROCm-only")
+def test_unquantized_aiter_moe_marks_unaligned_weights_shuffled(monkeypatch):
+    """FlyDSL dispatch must recognize shuffled BF16 weights at inter-dim 320."""
+    from sglang.srt.layers.quantization import unquant
+
+    method = unquant.UnquantizedFusedMoEMethod()
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "w13_weight",
+        torch.nn.Parameter(torch.empty((1, 640, 16), device="cuda")),
+    )
+    layer.register_parameter(
+        "w2_weight",
+        torch.nn.Parameter(torch.empty((1, 16, 320), device="cuda")),
+    )
+    layer._skip_aiter_moe_shuffle = False
+
+    shuffled = []
+
+    def fake_shuffle(weight, layout):
+        shuffled.append((weight.shape, layout))
+        return weight.clone()
+
+    monkeypatch.setattr(unquant, "will_use_aiter_moe", lambda: True)
+    monkeypatch.setattr(unquant, "_get_aiter_shuffle_weight", lambda: fake_shuffle)
+
+    method.process_weights_after_loading(layer)
+
+    assert shuffled == [
+        (torch.Size([1, 640, 16]), (16, 16)),
+        (torch.Size([1, 16, 320]), (16, 16)),
+    ]
+    assert layer.w13_weight.is_shuffled
+    assert layer.w2_weight.is_shuffled
 
 
 @pytest.mark.skipif(not is_hip(), reason="AITER routing is ROCm-only")
@@ -141,8 +177,8 @@ def test_unquantized_aiter_moe_pads_and_loads_tp_shards(monkeypatch):
 
 
 @pytest.mark.skipif(not is_hip(), reason="AITER routing is ROCm-only")
-def test_unquantized_aiter_quant_info_carries_padding(monkeypatch):
-    """The AITER runner must receive the physical padding metadata."""
+def test_unquantized_aiter_quant_info_uses_physical_intermediate_size(monkeypatch):
+    """AITER receives padded BF16 weights as their physical dimensions."""
     from sglang.srt.layers.moe.utils import MoeRunnerBackend
     from sglang.srt.layers.quantization import unquant
 
@@ -175,4 +211,4 @@ def test_unquantized_aiter_quant_info_carries_padding(monkeypatch):
     assert len(captured) == 1
     assert captured[0].expert_mask is None
     assert captured[0].hidden_pad == 0
-    assert captured[0].intermediate_pad == 64
+    assert captured[0].intermediate_pad == 0

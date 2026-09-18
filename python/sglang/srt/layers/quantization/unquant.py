@@ -652,9 +652,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         _should_use_aiter_moe = (
-            will_use_aiter_moe()
-            and self._aiter_ck_moe_supported(layer)
-            and not layer._skip_aiter_moe_shuffle
+            will_use_aiter_moe() and not layer._skip_aiter_moe_shuffle
         )
         if _should_use_aiter_moe:
             shuffle_weight = _get_aiter_shuffle_weight()
@@ -666,6 +664,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 layer, "w2_weight", shuffle_weight(layer.w2_weight.data, (16, 16))
             )
             torch.cuda.empty_cache()
+
+            # torch.nn.Parameter does not preserve custom tensor attributes.
+            # Restore the marker consumed by AITER whole-graph MoE dispatch.
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
 
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
@@ -865,14 +868,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
         param.data = param.data.reshape(expected_shape)
 
-    def _aiter_ck_moe_supported(self, layer) -> bool:
-        # aiter CK fused-MoE requires intermediate_size_per_partition to be 128-aligned
-        # (GemmSpec=Default; otherwise CK raises "not support this GEMM problem").
-        physical_intermediate_size = layer.intermediate_size_per_partition + getattr(
-            layer, "intermediate_pad", 0
-        )
-        return physical_intermediate_size % 128 == 0
-
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -900,25 +895,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             backend = MoeRunnerBackend.TRITON
         self.runner = MoeRunner(backend, moe_runner_config)
 
-        # aiter CK fused-MoE only supports 128-aligned shapes; otherwise use triton.
         self._aiter_runner: Optional[MoeRunner] = None
         if will_use_aiter_moe():
-            if self._aiter_ck_moe_supported(layer):
-                self._aiter_runner = MoeRunner(
-                    MoeRunnerBackend.AITER, moe_runner_config
-                )
-            elif get_moe_runner_backend().is_aiter():
-                raise ValueError(
-                    "moe_runner_backend=aiter is not supported for "
-                    f"intermediate_size_per_partition={layer.intermediate_size_per_partition}; "
-                    "use --moe-runner-backend triton."
-                )
-            else:
-                logger.warning_once(
-                    "aiter CK fused-MoE does not support "
-                    f"intermediate_size_per_partition={layer.intermediate_size_per_partition}; "
-                    "using triton MoE runner."
-                )
+            self._aiter_runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
 
     @property
     def load_up_proj_weight_first(self) -> bool:
@@ -1019,7 +998,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                     w2_weight=layer.w2_weight,
                     expert_mask=getattr(layer.dispatcher, "expert_mask_gpu", None),
                     hidden_pad=getattr(layer, "hidden_pad", 0),
-                    intermediate_pad=getattr(layer, "intermediate_pad", 0),
+                    # The BF16 weights already include zero-filled padding, and
+                    # AITER selects tuned kernels from their physical shape.
+                    # Forwarding the checkpoint-only pad would make whole-graph
+                    # FlyDSL reject an otherwise supported physical dimension.
+                    intermediate_pad=0,
                 )
                 return self._aiter_runner.run(dispatch_output, quant_info)
 
