@@ -748,7 +748,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         _should_use_aiter_moe = (
             will_use_aiter_moe()
-            and self._aiter_ck_moe_supported(layer)
+            and self._aiter_ck_moe_unsupported_reason(layer) is None
             and not layer._skip_aiter_moe_shuffle
         )
         if _should_use_aiter_moe:
@@ -761,6 +761,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 layer, "w2_weight", shuffle_weight(layer.w2_weight.data, (16, 16))
             )
             torch.cuda.empty_cache()
+
+            # torch.nn.Parameter does not preserve custom tensor attributes.
+            # Restore the marker consumed by AITER whole-graph MoE dispatch.
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
 
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
@@ -972,17 +977,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         param.data = param.data.reshape(expected_shape)
 
     def _aiter_ck_moe_unsupported_reason(self, layer) -> Optional[str]:
-        # aiter CK fused-MoE requires intermediate_size_per_partition to be 128-aligned
-        # (GemmSpec=Default; otherwise CK raises "not support this GEMM problem").
-        if (
-            layer.intermediate_size_per_partition
-            + getattr(layer, "intermediate_pad", 0)
-        ) % 128 != 0:
-            return (
-                "intermediate_size_per_partition="
-                f"{layer.intermediate_size_per_partition} is not 128-aligned"
-            )
-
         if not is_gfx95_supported():
             return None
 
@@ -997,9 +991,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 "implemented by the aiter CK bf16 fused-MoE kernels"
             )
         return None
-
-    def _aiter_ck_moe_supported(self, layer) -> bool:
-        return self._aiter_ck_moe_unsupported_reason(layer) is None
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -1153,7 +1144,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 quant_info = AiterMoeQuantInfo(
                     w13_weight=layer.w13_weight,
                     w2_weight=layer.w2_weight,
-                    expert_mask=layer.dispatcher.expert_mask_gpu,
+                    expert_mask=getattr(layer.dispatcher, "expert_mask_gpu", None),
+                    hidden_pad=getattr(layer, "hidden_pad", 0),
+                    # The BF16 weights already include zero-filled padding, and
+                    # AITER selects tuned kernels from their physical shape.
+                    # Forwarding the checkpoint-only pad would make whole-graph
+                    # FlyDSL reject an otherwise supported physical dimension.
+                    intermediate_pad=0,
                     swiglu_limit=aiter_swiglu_oai_limit(self.moe_runner_config) or 0.0,
                 )
                 return self._aiter_runner.run(dispatch_output, quant_info)

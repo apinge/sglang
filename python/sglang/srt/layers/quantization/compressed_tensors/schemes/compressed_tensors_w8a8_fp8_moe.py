@@ -14,9 +14,9 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
-    get_moe_a2a_backend,
     get_moe_runner_backend,
     get_moe_weight_sizes,
+    will_use_aiter_moe,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
@@ -28,7 +28,10 @@ from sglang.srt.layers.quantization.utils import (
     swap_w13_to_w31,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip, set_weight_attrs
+from sglang.srt.utils import (
+    get_int_env_var,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -39,14 +42,13 @@ if TYPE_CHECKING:
 
 __all__ = ["CompressedTensorsW8A8Fp8MoE"]
 
-_is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+logger = logging.getLogger(__name__)
 
-if _use_aiter:
+
+def _get_aiter_shuffle_weight():
     from aiter.ops.shuffle import shuffle_weight
 
-
-logger = logging.getLogger(__name__)
+    return shuffle_weight
 
 
 class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
@@ -122,9 +124,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     f"weight quantization block_k = {block_k}."
                 )
 
+        use_aiter_moe = will_use_aiter_moe()
         w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
-            is_aiter_moe=_use_aiter,
+            is_aiter_moe=use_aiter_moe,
             is_concat=True,
             is_packed=False,
         )
@@ -313,7 +316,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 max_w13_scales, requires_grad=False
             )
 
-        if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
+        if (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and will_use_aiter_moe()
+        ):
+            shuffle_weight = _get_aiter_shuffle_weight()
             padding_size = get_int_env_var("AITER_MOE_PADDING_SIZE")
             N = layer.w2_weight.shape[-1]
             if padding_size:
@@ -381,6 +388,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     )
                     torch.cuda.empty_cache()
 
+                # torch.nn.Parameter does not preserve custom tensor attributes.
+                # Restore the marker consumed by AITER whole-graph MoE dispatch.
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
+
         if (
             self.weight_quant.strategy == QuantizationStrategy.BLOCK
             and self.use_flashinfer_trtllm
@@ -401,9 +413,8 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto():
             if (
-                _use_aiter
+                will_use_aiter_moe()
                 and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-                and get_moe_a2a_backend().supports_aiter()
             ):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
