@@ -12,8 +12,8 @@ mkdir -p "$(dirname -- "${LOG_FILE}")"
 exec > >(tee "${LOG_FILE}") 2>&1
 printf 'Logging to: %s\n' "${LOG_FILE}"
 
-MODEL_PATH="${MODEL_PATH:-/models/Qwen3.8-Flash-Next-FP8}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3.8-Flash-Next-FP8}"
+MODEL_PATH="${MODEL_PATH:-/models/Qwen3.8-Flash-Next-PTPC-FP8}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3.8-Flash-Next-PTPC-FP8}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-7080}"
 TP_SIZE="${TP_SIZE:-2}"
@@ -30,7 +30,7 @@ CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
 #CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-32}"
 CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-32}"
-AITER_MOE_PADDING_SIZE="${AITER_MOE_PADDING_SIZE:-128}"
+AITER_MOE_PADDING_SIZE="${AITER_MOE_PADDING_SIZE:-64}"
 
 if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
   echo "Model config not found: ${MODEL_PATH}/config.json" >&2
@@ -49,10 +49,10 @@ fi
 
 # Qwen3.8's native FP8 MoE uses 128-wide checkpoint blocks. This makes the
 # local MoE buffers 160 -> 256 for TP4 and 80 -> 128 for TP8.
-if (( AITER_MOE_PADDING_SIZE != 128 )); then
-  echo "AITER_MOE_PADDING_SIZE must be 128 for pure TP4/TP8 (got ${AITER_MOE_PADDING_SIZE})." >&2
-  exit 1
-fi
+# if (( AITER_MOE_PADDING_SIZE != 128 )); then
+#   echo "AITER_MOE_PADDING_SIZE must be 128 for pure TP4/TP8 (got ${AITER_MOE_PADDING_SIZE})." >&2
+#   exit 1
+# fi
 
 python - "${TP_SIZE}" <<'PY'
 import sys
@@ -80,9 +80,10 @@ PY
 # Match the AMD nightly correctness configuration. Explicit AITER backends are
 # selected below while this disables the unreleased global paged-QSA path.
 #unset SGLANG_USE_AITER
-export SGLANG_USE_AITER=0
+export SGLANG_USE_AITER=1
 export AITER_MOE_PADDING_SIZE
-
+# export CUDA_VISIBLE_DEVICES=4,5,6,7
+# export HIP_VISIBLE_DEVICES=4,5,6,7
 command=(
   sglang serve
   --model-path "${MODEL_PATH}"
@@ -99,7 +100,6 @@ command=(
   --mem-fraction-static "${MEM_FRACTION_STATIC}"
   --max-running-requests "${MAX_RUNNING_REQUESTS}"
   --cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE}"
-  --disable-custom-all-reduce 
   # --speculative-algorithm EAGLE
   # --speculative-num-steps 3
   # --speculative-eagle-topk 1
