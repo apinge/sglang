@@ -20,8 +20,8 @@ TP_SIZE="${TP_SIZE:-1}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.95}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
 #CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
-MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-1}"
-CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-1}"
+MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
+CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-16}"
 AITER_MOE_PADDING_SIZE="${AITER_MOE_PADDING_SIZE:-64}"
 
 if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
@@ -34,17 +34,7 @@ if [[ "${PLE_OFFLOAD_EMBEDDING}" != "0" && "${PLE_OFFLOAD_EMBEDDING}" != "1" ]];
   exit 1
 fi
 
-# if (( TP_SIZE != 4 && TP_SIZE != 8 )); then
-#   echo "This pure-TP script supports TP_SIZE=4 or TP_SIZE=8 (got ${TP_SIZE})." >&2
-#   exit 1
-# fi
 
-# Qwen3.8's native FP8 MoE uses 128-wide checkpoint blocks. This128 makes the
-# local MoE buffers 160 -> 256 for TP4 and 80 -> 128 for TP8.
-# if (( AITER_MOE_PADDING_SIZE != 128 )); then
-#   echo "AITER_MOE_PADDING_SIZE must be 128 for pure TP4/TP8 (got ${AITER_MOE_PADDING_SIZE})." >&2
-#   exit 1
-# fi
 
 python - "${TP_SIZE}" <<'PY'
 import sys
@@ -114,3 +104,4 @@ printf 'Launching: '
 printf '%q ' "${command[@]}"
 printf '\n'
 exec "${command[@]}"
+

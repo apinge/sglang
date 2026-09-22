@@ -47,12 +47,6 @@ if [[ "${PLE_OFFLOAD_EMBEDDING}" != "0" && "${PLE_OFFLOAD_EMBEDDING}" != "1" ]];
   exit 1
 fi
 
-# Qwen3.8's native FP8 MoE uses 128-wide checkpoint blocks. This makes the
-# local MoE buffers 160 -> 256 for TP4 and 80 -> 128 for TP8.
-# if (( AITER_MOE_PADDING_SIZE != 128 )); then
-#   echo "AITER_MOE_PADDING_SIZE must be 128 for pure TP4/TP8 (got ${AITER_MOE_PADDING_SIZE})." >&2
-#   exit 1
-# fi
 
 python - "${TP_SIZE}" <<'PY'
 import sys
