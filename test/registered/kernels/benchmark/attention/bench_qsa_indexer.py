@@ -122,7 +122,8 @@ def _build(num_tokens, num_groups, device):
     group_locs = torch.randint(1, 8192, (num_groups, RATIO), device=device).to(
         torch.int32
     )
-    write_locs = torch.randperm(4096, device=device)[:num_groups].to(torch.int32)
+    # Slot 0 is the no-op sentinel; benchmark only active compression groups.
+    write_locs = torch.randperm(4095, device=device)[:num_groups].to(torch.int32) + 1
     pool = FakePool(8192, 4096, device, dtype)
     return indexer, pool, qk, token_k, positions, cache_loc, group_locs, write_locs
 

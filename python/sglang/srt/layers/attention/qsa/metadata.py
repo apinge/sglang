@@ -68,12 +68,14 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     block_topk: int
     req_pool_indices: Optional[torch.Tensor] = None
     # One entry per compressed group to (re)write this forward: the
-    # slot, the group-end token position (sequence-local) and the metadata
-    # row owning it. For extend forwards, compress_member_rows additionally
-    # holds each group's first member as a token-row index into this
-    # forward's packed tensors (extend chunks are group-aligned, so every
-    # member is in-chunk); paged forwards leave it None and source members
-    # from the per-request pending ring instead.
+    # destination slot, the group-end token position (sequence-local), and
+    # the metadata row owning it. Compressed slot 0 is reserved as the no-op
+    # sentinel for padded/non-boundary entries; every active write uses a slot
+    # >= 1. For extend forwards, compress_member_rows additionally holds each
+    # group's first member as a token-row index into this forward's packed
+    # tensors (extend chunks are group-aligned, so every member is in-chunk);
+    # paged forwards leave it None and source members from the per-request
+    # pending ring instead.
     write_locs: Optional[torch.Tensor] = None
     compress_group_positions: Optional[torch.Tensor] = None
     compress_sequence_ids: Optional[torch.Tensor] = None

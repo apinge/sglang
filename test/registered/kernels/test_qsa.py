@@ -8,6 +8,7 @@ from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
 from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.qsa import dsa_indexer as dsa_indexer_module
+from sglang.srt.layers.attention.qsa import mqa as mqa_module
 from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
@@ -25,6 +26,7 @@ from sglang.srt.layers.attention.qsa.mqa import (
     qsa_mqa_decode,
     qsa_mqa_prefill,
     torch_qsa_mqa_decode,
+    triton_qsa_mqa_decode,
 )
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qsa.sparse_attn import (
@@ -1671,6 +1673,41 @@ def test_qsa_fast_topk_returns_sequence_relative_indices():
     assert 333 in decode_indices[1].tolist()
 
 
+def test_qsa_decode_selection_ignores_dirty_full_tail(monkeypatch):
+    logits = torch.tensor(
+        [[1.0, 2.0, 3.0, 4.0, 1.0e9, 1.0e9, 1.0e9, 1.0e9]],
+        dtype=torch.float32,
+    )
+    clean_tail_args = []
+
+    def fake_mqa_decode(*args, _clean_tail=True, **kwargs):
+        clean_tail_args.append(_clean_tail)
+        return logits
+
+    monkeypatch.setattr(qsa_indexer_module, "qsa_mqa_decode", fake_mqa_decode)
+    monkeypatch.setattr(
+        qsa_indexer_module,
+        "expand_qsa_block_indices",
+        lambda block_indices, *args, **kwargs: block_indices,
+    )
+    indexer = SimpleNamespace(block_topk=2, compress_ratio=4, token_topk=8)
+    compressed_lengths = torch.tensor([4], dtype=torch.int32)
+
+    selected = QSAIndexer.select_decode_tokens(
+        indexer,
+        torch.empty(1, 4, 128),
+        torch.empty(1, 1, 1, 128),
+        torch.zeros(1, 1, dtype=torch.int32),
+        compressed_lengths,
+        logits.shape[1],
+        torch.tensor([15]),
+        torch.tensor([16]),
+    )
+
+    assert clean_tail_args == [False]
+    assert set(selected[0].tolist()) == {2, 3}
+
+
 def test_qsa_reranks_wider_candidate_set():
     from sglang.srt.layers.attention.qsa.kernel import (
         _rerank_qsa_topk_candidates,
@@ -1760,6 +1797,49 @@ def test_qsa_decode_mqa_reads_paged_cache():
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.parametrize(
+    "q_dtype,k_dtype",
+    [
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float16, torch.bfloat16),
+    ],
+)
+def test_qsa_decode_mqa_prefers_triton_over_tilelang_on_gfx942(
+    monkeypatch, q_dtype, k_dtype
+):
+    """The ROCm replacement must win dispatch even when TileLang is present."""
+
+    sentinel = object()
+    calls = []
+    q = SimpleNamespace(is_cuda=True, dtype=q_dtype)
+    cache = SimpleNamespace(dtype=k_dtype)
+
+    def fake_triton(*args, **kwargs):
+        calls.append(kwargs)
+        return sentinel
+
+    def tilelang_must_not_run(*args, **kwargs):
+        pytest.fail("gfx942 decode unexpectedly dispatched to TileLang")
+
+    monkeypatch.setattr(mqa_module, "is_hip", lambda: True)
+    monkeypatch.setattr(mqa_module, "is_gfx942_supported", lambda: True)
+    monkeypatch.setattr(mqa_module, "HAS_TILELANG", True)
+    monkeypatch.setattr(mqa_module, "_launch_triton_qsa_mqa_decode", fake_triton)
+    monkeypatch.setattr(mqa_module, "tilelang_qsa_mqa_decode", tilelang_must_not_run)
+
+    result = mqa_module.qsa_mqa_decode(
+        q,
+        cache,
+        object(),
+        object(),
+        512,
+        _clean_tail=False,
+    )
+
+    assert result is sentinel
+    assert calls == [{"clean_tail": False, "skip_full_tail": True}]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_qsa_decode_mqa_four_heads_gpu():
     """The released Qwen3.8 indexer shape must compile on CUDA and ROCm."""
@@ -1785,6 +1865,217 @@ def test_qsa_decode_mqa_four_heads_gpu():
         max_model_len=192,
     )
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(
+    torch.version.hip is None or not torch.cuda.is_available(), reason="requires ROCm"
+)
+def test_qsa_triton_decode_mqa_short_and_cross_page_matches_reference_on_rocm():
+    torch.manual_seed(17)
+    batch, pages, page_size, heads, head_dim = 3, 17, 16, 4, 128
+    q = torch.randn(batch, heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    cache = torch.randn(
+        batch * pages,
+        page_size,
+        1,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    page_table = torch.arange(batch * pages, dtype=torch.int32, device="cuda").reshape(
+        batch, pages
+    )
+    context_lens = torch.tensor([1, 17, 271], dtype=torch.int32, device="cuda")
+    max_model_len = pages * page_size
+
+    actual = triton_qsa_mqa_decode(q, cache, page_table, context_lens, max_model_len)
+    expected = torch_qsa_mqa_decode(q, cache, page_table, context_lens, max_model_len)
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    assert torch.isneginf(actual[0, 1:]).all()
+    assert torch.isneginf(actual[1, 17:]).all()
+
+
+@pytest.mark.skipif(
+    torch.version.hip is None or not torch.cuda.is_available(), reason="requires ROCm"
+)
+@pytest.mark.parametrize(
+    "q_dtype",
+    [torch.bfloat16, torch.float16],
+)
+def test_qsa_triton_decode_mqa_casts_inputs_to_bf16_on_rocm(q_dtype):
+    """Match TileLang by widening/narrowing Q and compressed-K to BF16."""
+
+    torch.manual_seed(18)
+    batch, pages, page_size, heads, head_dim = 3, 17, 16, 4, 128
+    q = torch.randn(batch, heads, head_dim, dtype=q_dtype, device="cuda")
+    cache = torch.randn(
+        batch * pages,
+        page_size,
+        1,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    page_table = torch.arange(batch * pages, dtype=torch.int32, device="cuda").reshape(
+        batch, pages
+    )
+    context_lens = torch.tensor([1, 17, 271], dtype=torch.int32, device="cuda")
+    max_model_len = pages * page_size
+
+    actual = triton_qsa_mqa_decode(q, cache, page_table, context_lens, max_model_len)
+    expected = torch_qsa_mqa_decode(
+        q.to(torch.bfloat16), cache, page_table, context_lens, max_model_len
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    assert torch.isneginf(actual[0, 1:]).all()
+    assert torch.isneginf(actual[1, 17:]).all()
+
+
+@pytest.mark.skipif(
+    torch.version.hip is None or not torch.cuda.is_available(), reason="requires ROCm"
+)
+def test_qsa_triton_decode_mqa_cast_stays_inside_kernel_on_rocm():
+    """FP16 Q with BF16 compressed-K must not launch a Torch cast kernel."""
+
+    torch.manual_seed(19)
+    batch, pages, page_size, heads, head_dim = 2, 17, 16, 4, 128
+    q = torch.randn(batch, heads, head_dim, dtype=torch.float16, device="cuda")
+    cache = torch.randn(
+        batch * pages,
+        page_size,
+        1,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    page_table = torch.arange(batch * pages, dtype=torch.int64, device="cuda").reshape(
+        batch, pages
+    )
+    context_lens = torch.tensor([17, 271], dtype=torch.int64, device="cuda")
+    max_model_len = pages * page_size
+
+    triton_qsa_mqa_decode(q, cache, page_table, context_lens, max_model_len)
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as profiler:
+        actual = triton_qsa_mqa_decode(
+            q, cache, page_table, context_lens, max_model_len
+        )
+        torch.cuda.synchronize()
+
+    expected = torch_qsa_mqa_decode(
+        q.to(torch.bfloat16), cache, page_table, context_lens, max_model_len
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    kernel_names = [event.name for event in profiler.events()]
+    assert kernel_names.count("_triton_qsa_mqa_decode_kernel.kd") == 1
+    assert not any("copyBuffer" in name for name in kernel_names)
+
+
+@pytest.mark.skipif(
+    torch.version.hip is None or not torch.cuda.is_available(), reason="requires ROCm"
+)
+def test_qsa_triton_decode_mqa_rejects_out_of_range_pages_on_rocm():
+    q = torch.randn(1, 4, 128, dtype=torch.bfloat16, device="cuda")
+    cache = torch.randn(2, 16, 1, 128, dtype=torch.bfloat16, device="cuda")
+    page_table = torch.tensor([[0, 7]], dtype=torch.int32, device="cuda")
+    context_lens = torch.tensor([32], dtype=torch.int32, device="cuda")
+
+    actual = triton_qsa_mqa_decode(q, cache, page_table, context_lens, max_model_len=32)
+    assert torch.isfinite(actual[0, :16]).all()
+    assert torch.isneginf(actual[0, 16:]).all()
+
+
+@pytest.mark.skipif(
+    torch.version.hip is None or not torch.cuda.is_available(), reason="requires ROCm"
+)
+def test_qsa_triton_decode_mqa_supports_rocm_graph_replay():
+    torch.manual_seed(21)
+    batch, pages, page_size, heads, head_dim = 4, 32, 16, 4, 128
+    max_model_len = pages * page_size
+    q = torch.randn(batch, heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    cache = torch.randn(
+        batch * pages,
+        page_size,
+        1,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    page_table = torch.arange(batch * pages, dtype=torch.int32, device="cuda").reshape(
+        batch, pages
+    )
+    context_lens = torch.tensor([1, 129, 271, 500], device="cuda")
+
+    triton_qsa_mqa_decode(q, cache, page_table, context_lens, max_model_len)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = triton_qsa_mqa_decode(
+            q, cache, page_table, context_lens, max_model_len
+        )
+
+    q.copy_(torch.randn_like(q))
+    context_lens.copy_(torch.tensor([17, 96, 255, 511], device="cuda"))
+    graph.replay()
+    torch.cuda.synchronize()
+    expected = torch_qsa_mqa_decode(q, cache, page_table, context_lens, max_model_len)
+    torch.testing.assert_close(captured, expected, rtol=2e-2, atol=2e-2)
+
+    # Shrinking lengths must clean logits written by the previous replay. The
+    # tail decision therefore has to use the device-resident lengths at replay
+    # time rather than a host-derived launch bound.
+    context_lens.copy_(torch.tensor([0, 3, 32, 257], device="cuda"))
+    graph.replay()
+    torch.cuda.synchronize()
+    expected = torch_qsa_mqa_decode(q, cache, page_table, context_lens, max_model_len)
+    torch.testing.assert_close(captured, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(
+    torch.version.hip is None or not torch.cuda.is_available(), reason="requires ROCm"
+)
+def test_qsa_triton_decode_mqa_matches_tilelang_when_available():
+    """Keep the gfx942 replacement aligned with the retained CUDA DSL path."""
+
+    if not mqa_module.HAS_TILELANG:
+        pytest.skip("requires TileLang")
+    if not mqa_module.is_gfx942_supported():
+        pytest.skip("requires gfx942")
+
+    torch.manual_seed(22)
+    batch, pages, page_size, heads, head_dim = 4, 32, 16, 4, 128
+    max_model_len = pages * page_size
+    q = torch.randn(batch, heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    cache = torch.randn(
+        batch * pages,
+        page_size,
+        1,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    page_table = torch.arange(batch * pages, dtype=torch.int32, device="cuda").reshape(
+        batch, pages
+    )
+    context_lens = torch.tensor([1, 17, 255, 511], device="cuda")
+
+    triton_logits = triton_qsa_mqa_decode(
+        q, cache, page_table, context_lens, max_model_len
+    )
+    tilelang_logits = mqa_module.tilelang_qsa_mqa_decode(
+        q, cache, page_table, context_lens, max_model_len
+    )
+    triton_finite = torch.isfinite(triton_logits)
+    tilelang_finite = torch.isfinite(tilelang_logits)
+    assert torch.equal(triton_finite, tilelang_finite)
+    torch.testing.assert_close(
+        triton_logits[triton_finite],
+        tilelang_logits[tilelang_finite],
+        rtol=2e-2,
+        atol=2e-2,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")

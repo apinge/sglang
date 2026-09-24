@@ -22,6 +22,10 @@ from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
     parse_qsa_profile,
 )
+from sglang.srt.layers.attention.qsa.direct_paged_one_cta import (
+    is_sparse_gqa_direct_paged_one_cta_supported,
+    sparse_gqa_direct_paged_decode_one_cta_triton,
+)
 from sglang.srt.layers.attention.qsa.kernel import qsa_sparse_attention
 from sglang.srt.layers.attention.qsa.metadata import (
     QSAIndexerMetadata,
@@ -494,8 +498,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         one block a ratio-multiple length completes, extend rows contribute
         their chunk's blocks. The rows are compacted into ``capacity``
         entries (a shape-derived worst case, so no device-to-host sync) and
-        the tail is padded with row 0 / block 0 writing the reserved slot 0,
-        matching the CUDA-graph path's inert-write convention.
+        the tail is padded with row 0 / block 0 and the reserved slot-0 no-op
+        sentinel, matching the CUDA-graph path's fixed-shape convention.
 
         A group's compressed slot is its first raw slot // ratio (DSV4-style
         addressing over the page-aligned full-KV cache).
@@ -1166,7 +1170,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         metadata.graph_compressed_lengths.copy_(compressed_lengths.to(torch.int32))
 
         # Boundary rows write their group's slot (last raw slot // ratio);
-        # every other row keeps the inert reserved slot 0.
+        # every other row keeps the reserved slot-0 no-op sentinel.
         boundary = (lengths % ratio == 0) & (lengths > 0)
         last_locs = self.req_to_token[req_indices, current_positions].long()
         write_locs = torch.where(
@@ -1504,6 +1508,75 @@ class QwenSparseAttnBackend(AttentionBackend):
             self._fa2_scratch[key] = buffers
         return buffers[0][:capacity], buffers[1][:capacity]
 
+    @staticmethod
+    def _get_direct_full_kv_page_table(
+        metadata: QwenSparseAttnMetadata,
+    ) -> Optional[torch.Tensor]:
+        """Return the existing per-row table of full-KV physical page IDs.
+
+        The indexer names these buffers ``compressed_page_table`` because its
+        consumer addresses the compressed cache. Their stored values are
+        nevertheless full-KV page IDs, so sparse attention can reuse them
+        directly with the raw cache's 64-token page size.
+        """
+
+        indexer = metadata.indexer_metadata
+        if metadata.is_cuda_graph:
+            return indexer.graph_compressed_page_table
+        return indexer.decode_page_table
+
+    def _forward_direct_paged_one_cta(
+        self,
+        q: torch.Tensor,
+        k_buffer: torch.Tensor,
+        v_buffer: torch.Tensor,
+        layer,
+        metadata: QwenSparseAttnMetadata,
+        topk_indices: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Try the narrow MI308X direct-paged path before compacting K/V."""
+
+        if not is_hip():
+            return None
+        indexer = getattr(metadata, "indexer_metadata", None)
+        if indexer is None:
+            return None
+        page_table = self._get_direct_full_kv_page_table(metadata)
+        if page_table is None:
+            return None
+        row_to_page_table = metadata.token_to_batch_idx
+        sequence_lens = metadata.sequence_lengths
+        full_kv_page_size = (
+            indexer.token_to_kv_pool.qsa_compressed_page_size * indexer.compress_ratio
+        )
+        q = q.contiguous()
+        if not is_sparse_gqa_direct_paged_one_cta_supported(
+            q,
+            k_buffer,
+            v_buffer,
+            topk_indices,
+            page_table,
+            row_to_page_table,
+            sequence_lens,
+            full_kv_page_size=full_kv_page_size,
+            compress_ratio=indexer.compress_ratio,
+            block_topk=indexer.block_topk,
+        ):
+            return None
+        return sparse_gqa_direct_paged_decode_one_cta_triton(
+            q,
+            k_buffer,
+            v_buffer,
+            topk_indices,
+            page_table,
+            row_to_page_table,
+            sequence_lens,
+            layer.scaling,
+            full_kv_page_size=full_kv_page_size,
+            compress_ratio=indexer.compress_ratio,
+            block_topk=indexer.block_topk,
+        )
+
     def _get_trtllm_sparse_tables(self, batch, pages_per_row, page, device):
         key = (batch, pages_per_row, device)
         cached = self._trtllm_sparse_tables.get(key)
@@ -1643,6 +1716,16 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = topk_indices.to(torch.int32).contiguous()
+        direct_output = self._forward_direct_paged_one_cta(
+            q,
+            k_buffer,
+            v_buffer,
+            layer,
+            metadata,
+            topk_indices,
+        )
+        if direct_output is not None:
+            return direct_output.reshape(q.shape[0], -1)
         trtllm_decode = _resolve_trtllm_sparse_decode()
         if trtllm_decode is not None:
             return self._forward_trtllm_sparse(

@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_gfx942_supported
+
 _H20_CONFIGS = [
     (32, (32, 8, 2)),
     (64, (64, 8, 2)),
@@ -24,6 +26,34 @@ _L20_CONFIGS = [
 def _get_best_config(total_q: int):
     table = _H20_CONFIGS if "H20" in torch.cuda.get_device_name(0) else _L20_CONFIGS
     return next(cfg for limit, cfg in table if total_q <= limit)
+
+
+def _get_sparse_gqa_packed_decode_launch_config(
+    total_q: int,
+    topk: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    q_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    v_dtype: torch.dtype,
+):
+    """Return the launch configuration for packed one-row decode."""
+
+    if (
+        is_gfx942_supported()
+        and "MI308X" in torch.cuda.get_device_name(0)
+        and topk == 2051
+        and num_q_heads == 12
+        and num_kv_heads == 1
+        and head_dim == 256
+        and q_dtype == torch.bfloat16
+        and k_dtype == q_dtype
+        and v_dtype == q_dtype
+    ):
+        return 64, 4, 1, {"kpack": 2}
+    block_n, warps, stages = _get_best_config(total_q)
+    return block_n, warps, stages, {}
 
 
 @triton.jit
@@ -324,7 +354,16 @@ def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
     block_m = max(16, triton.next_power_of_2(group_size))
-    block_n, warps, stages = _get_best_config(total_q)
+    block_n, warps, stages, launch_kwargs = _get_sparse_gqa_packed_decode_launch_config(
+        total_q,
+        indices.shape[-1],
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        q.dtype,
+        k.dtype,
+        v.dtype,
+    )
     out = torch.empty_like(q)
     _sparse_gqa_chunk_prefill[(1, (cu_q.shape[0] - 1) * num_kv_heads)](
         q,
@@ -359,6 +398,7 @@ def sparse_gqa_packed_decode_triton(q, k, v, indices, cu_q, cu_k, kv_lens, scale
         HEAD_DIM=head_dim,
         num_warps=warps,
         num_stages=stages,
+        **launch_kwargs,
     )
     return out
 

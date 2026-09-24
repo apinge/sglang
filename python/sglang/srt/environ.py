@@ -973,6 +973,10 @@ class Envs:
     # (parity with flash-attn's ragged-aware launch). The feature checks _is_hip
     # explicitly in code; this env var allows override (0=force off, 1=force on).
     SGLANG_TRITON_COMPACT_EXTEND_ATTENTION = EnvBool(True)
+    # Fused QSA indexer preparation backend. "auto" keeps the established
+    # JIT C++/CUDA path on NVIDIA and eager path on ROCm; "jit" opts supported
+    # ROCm configurations into the existing C++ kernels compiled with hipcc.
+    SGLANG_QSA_INDEXER_BACKEND = EnvStr("auto")
     # Raise if Triton loads a kernel after the engine starts serving. This
     # verifies that startup warmup covers every kernel specialization used at
     # serving time.
