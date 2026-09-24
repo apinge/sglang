@@ -3,22 +3,19 @@
 `GatedResidual._mix_compute` lowers to a five-kernel chain per call
 (down GEMV + splitK reduce, silu, up GEMV, sigmoid-mul-mean); at bs=1
 speculative decode that chain runs ~100 times per iteration on the GPU
-critical path between allreduces, and at these sizes every kernel is
-latency-bound, so the win comes from kernel count, not bandwidth.
+critical path between allreduces.
 
-One persistent kernel replaces the chain.  A grid of one CTA per SM is
-resident by construction, which makes the software grid barrier
-deadlock-free:
+Three ordinary launches replace the chain.  ``out_j`` needs the whole
+low-rank vector, so the down and up projections cannot share a kernel
+without a device-wide dependency; the split expresses that dependency
+with launch boundaries instead of a software grid barrier, which frees
+the grid to be sized for bandwidth rather than pinned to one CTA per CU:
 
-* phase 0 — zero the fp32 accumulator ``t_raw`` (strided across CTAs)
-* phase A — grid-strided (n-block, k-chunk) tiles of ``x @ W_down^T``
-  accumulated into ``t_raw`` with device-scope atomics
-* phase B — grid-strided output blocks: ``t = silu(t_raw / hc)`` on the
-  fly, one ``tl.dot`` covering all hc groups, then
+* down  — one CTA per (n-block, k-chunk) tile of ``x @ W_down^T``,
+  writing per-chunk fp32 partials (no atomics, no accumulator zeroing)
+* reduce — sums the partials and applies ``silu(t_raw / hc)``
+* up    — one CTA per output block:
   ``out_j = mean_g(sigmoid(t @ W_up[g,j]^T) * x[g,j])``
-
-The barrier counters are reset by the last CTA to finish, so a captured
-CUDA graph replays with the buffers back in their initial state.
 
 Row counts beyond ``_FUSED_MIX_MAX_ROWS`` (prefill) keep the
 torch.compile path, which uses proper GEMM kernels.
@@ -30,159 +27,159 @@ import torch
 import triton
 import triton.language as tl
 
-_FUSED_MIX_MAX_ROWS = 16
+_FUSED_MIX_MAX_ROWS = 32
 
-_DEFAULT_MIX_CONFIG = dict(BLOCK_N=32, BLOCK_K=256, BLOCK_J=32, BLOCK_R=64, num_warps=8)
-# Measured on an 80-CU MI308X with Qwen3.8's BF16 HC weights. Keep the
-# one-CTA-per-CU barrier contract; only specialize the validated shape/device.
-# Graph replay over the checkpoint's HC weights improves from ~77 to ~32-36 us.
-_GFX942_MIX_CONFIG = dict(
-    BLOCK_N=32,
-    BLOCK_K=256,
-    BLOCK_J=32,
-    BLOCK_R=64,
-    num_warps=2,
+_DEFAULT_DOWN_CONFIG = dict(BLOCK_N=32, BLOCK_K=256, num_warps=4)
+_DEFAULT_REDUCE_CONFIG = dict(BLOCK_R=64, num_warps=4)
+_DEFAULT_UP_CONFIG = dict(BLOCK_J=32, BLOCK_R=64, num_warps=4)
+
+# Tuned on an 80-CU MI308X against Qwen3.8's BF16 HC weights (hc=4, hs=2560,
+# lowrank=320, k=10240); re-tune when the shape changes. num_warps=1 (one
+# wave64) wins on both projections: the grids are already 200-320 CTAs, so
+# extra warps only add per-CTA scheduling without adding memory parallelism.
+_GFX942_MFMA_CONFIG = dict(
     num_stages=1,
     waves_per_eu=1,
     matrix_instr_nonkdim=16,
     kpack=2,
     WEIGHT_CACHE_MODIFIER=".cg",
 )
+_GFX942_DOWN_CONFIG = dict(BLOCK_N=32, BLOCK_K=512, num_warps=1, **_GFX942_MFMA_CONFIG)
+# The 32-row tile doubles the MFMA work per CTA; one wave stops covering it.
+_GFX942_DOWN_CONFIG_WIDE = dict(
+    BLOCK_N=32, BLOCK_K=512, num_warps=2, **_GFX942_MFMA_CONFIG
+)
+_GFX942_REDUCE_CONFIG = dict(BLOCK_R=32, num_warps=2, num_stages=1)
+_GFX942_UP_CONFIG = dict(BLOCK_J=8, BLOCK_R=64, num_warps=1, **_GFX942_MFMA_CONFIG)
 
 
 @triton.jit
-def _grid_barrier(counter_ptr, num_ctas):
-    tl.atomic_add(counter_ptr, 1, sem="acq_rel", scope="gpu")
-    while tl.atomic_add(counter_ptr, 0, sem="acq_rel", scope="gpu") < num_ctas:
-        pass
-
-
-@triton.jit
-def _hc_mix_persistent_kernel(
+def _hc_mix_down_kernel(
     x_ptr,
     w_down_ptr,
-    w_up_ptr,
-    t_raw_ptr,
-    out_ptr,
-    counters_ptr,
+    partials_ptr,
     K,
+    LOWRANK,
+    num_rows,
+    ROWS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    WEIGHT_CACHE_MODIFIER: tl.constexpr = "",
+):
+    n_blocks = tl.cdiv(LOWRANK, BLOCK_N)
+    pid = tl.program_id(0)
+    nb = pid % n_blocks
+    kc = pid // n_blocks
+
+    offs_m = tl.arange(0, ROWS)
+    mask_m = offs_m < num_rows
+    n = nb * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_n = n < LOWRANK
+    k = kc * BLOCK_K + tl.arange(0, BLOCK_K)
+
+    xt = tl.load(
+        x_ptr + offs_m[:, None] * K + k[None, :],
+        mask=mask_m[:, None],
+        other=0.0,
+    )
+    w = tl.load(
+        w_down_ptr + n[:, None] * K + k[None, :],
+        mask=mask_n[:, None],
+        other=0.0,
+        cache_modifier=WEIGHT_CACHE_MODIFIER,
+    )
+    acc = tl.dot(xt, tl.trans(w))
+    tl.store(
+        partials_ptr + kc * (ROWS * LOWRANK) + offs_m[:, None] * LOWRANK + n[None, :],
+        acc,
+        mask=mask_n[None, :],
+    )
+
+
+@triton.jit
+def _hc_mix_reduce_kernel(
+    partials_ptr,
+    t_ptr,
+    LOWRANK,
+    inv_hc,
+    ROWS: tl.constexpr,
+    KSPLIT: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    offs_m = tl.arange(0, ROWS)
+    r = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+    mask_r = r < LOWRANK
+    idx = offs_m[:, None] * LOWRANK + r[None, :]
+
+    acc = tl.zeros((ROWS, BLOCK_R), dtype=tl.float32)
+    for s in tl.static_range(KSPLIT):
+        acc += tl.load(
+            partials_ptr + s * (ROWS * LOWRANK) + idx, mask=mask_r[None, :], other=0.0
+        )
+    a = acc * inv_hc
+    t = a * tl.sigmoid(a)
+    tl.store(t_ptr + idx, t.to(t_ptr.dtype.element_ty), mask=mask_r[None, :])
+
+
+@triton.jit
+def _hc_mix_up_kernel(
+    x_ptr,
+    w_up_ptr,
+    t_ptr,
+    out_ptr,
     LOWRANK,
     HS,
     num_rows,
-    num_ctas,
     inv_hc,
     ROWS: tl.constexpr,
     HC: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
     BLOCK_J: tl.constexpr,
     BLOCK_R: tl.constexpr,
     WEIGHT_CACHE_MODIFIER: tl.constexpr = "",
 ):
-    pid = tl.program_id(0)
     offs_m = tl.arange(0, ROWS)
     mask_m = offs_m < num_rows
+    offs_g = tl.arange(0, HC)
+    j = tl.program_id(0) * BLOCK_J + tl.arange(0, BLOCK_J)
+    mask_j = j < HS
 
-    zero_span = ROWS * LOWRANK
-    offs_z = tl.arange(0, 256)
-    for z0 in range(pid * 256, zero_span, num_ctas * 256):
-        idx = z0 + offs_z
-        tl.store(t_raw_ptr + idx, 0.0, mask=idx < zero_span)
-    _grid_barrier(counters_ptr + 0, num_ctas)
+    gj_flat = tl.reshape(offs_g[:, None] * HS + j[None, :], (HC * BLOCK_J,))
+    mask_gj = tl.reshape(
+        tl.broadcast_to(mask_j[None, :], (HC, BLOCK_J)), (HC * BLOCK_J,)
+    )
 
-    offs_k = tl.arange(0, BLOCK_K)
-    offs_n = tl.arange(0, BLOCK_N)
-    n_blocks = tl.cdiv(LOWRANK, BLOCK_N)
-    k_chunks = tl.cdiv(K, BLOCK_K)
-    for tile in range(pid, n_blocks * k_chunks, num_ctas):
-        nb = tile % n_blocks
-        kc = tile // n_blocks
-        n = nb * BLOCK_N + offs_n
-        k = kc * BLOCK_K + offs_k
-        mask_n = n < LOWRANK
-        xt = tl.load(
-            x_ptr + offs_m[:, None] * K + k[None, :],
-            mask=mask_m[:, None],
+    acc = tl.zeros((ROWS, HC * BLOCK_J), dtype=tl.float32)
+    for r0 in range(0, LOWRANK, BLOCK_R):
+        r = r0 + tl.arange(0, BLOCK_R)
+        mask_r = r < LOWRANK
+        t = tl.load(
+            t_ptr + offs_m[:, None] * LOWRANK + r[None, :],
+            mask=mask_r[None, :],
             other=0.0,
         )
         w = tl.load(
-            w_down_ptr + n[:, None] * K + k[None, :],
-            mask=mask_n[:, None],
+            w_up_ptr + gj_flat[:, None] * LOWRANK + r[None, :],
+            mask=mask_gj[:, None] & mask_r[None, :],
             other=0.0,
             cache_modifier=WEIGHT_CACHE_MODIFIER,
         )
-        acc = tl.dot(xt, tl.trans(w))
-        tl.atomic_add(
-            t_raw_ptr + offs_m[:, None] * LOWRANK + n[None, :],
-            acc,
-            mask=mask_n[None, :],
-            sem="relaxed",
-            scope="gpu",
-        )
-    _grid_barrier(counters_ptr + 1, num_ctas)
+        acc = tl.dot(t, tl.trans(w), acc)
 
-    offs_j = tl.arange(0, BLOCK_J)
-    offs_r = tl.arange(0, BLOCK_R)
-    offs_g = tl.arange(0, HC)
-    j_blocks = tl.cdiv(HS, BLOCK_J)
-    for jb in range(pid, j_blocks, num_ctas):
-        j = jb * BLOCK_J + offs_j
-        mask_j = j < HS
-        gj = offs_g[:, None] * HS + j[None, :]
-        gj_flat = tl.reshape(gj, (HC * BLOCK_J,))
-        mask_gj = tl.reshape(
-            tl.broadcast_to(mask_j[None, :], (HC, BLOCK_J)), (HC * BLOCK_J,)
-        )
-        acc = tl.zeros((ROWS, HC * BLOCK_J), dtype=tl.float32)
-        for r0 in range(0, LOWRANK, BLOCK_R):
-            r = r0 + offs_r
-            mask_r = r < LOWRANK
-            a = tl.load(
-                t_raw_ptr + offs_m[:, None] * LOWRANK + r[None, :],
-                mask=mask_r[None, :],
-                other=0.0,
-            )
-            a = a * inv_hc
-            t = (a * tl.sigmoid(a)).to(x_ptr.dtype.element_ty)
-            w = tl.load(
-                w_up_ptr + gj_flat[:, None] * LOWRANK + r[None, :],
-                mask=mask_gj[:, None] & mask_r[None, :],
-                other=0.0,
-                cache_modifier=WEIGHT_CACHE_MODIFIER,
-            )
-            acc = tl.dot(t, tl.trans(w), acc)
-        gate = tl.sigmoid(tl.reshape(acc, (ROWS, HC, BLOCK_J)))
-        xg = tl.load(
-            x_ptr
-            + offs_m[:, None, None] * (HC * HS)
-            + offs_g[None, :, None] * HS
-            + j[None, None, :],
-            mask=mask_m[:, None, None] & mask_j[None, None, :],
-            other=0.0,
-        ).to(tl.float32)
-        out = tl.sum(gate * xg, axis=1) * inv_hc
-        tl.store(
-            out_ptr + offs_m[:, None] * HS + j[None, :],
-            out.to(out_ptr.dtype.element_ty),
-            mask=mask_m[:, None] & mask_j[None, :],
-        )
-
-    ticket = tl.atomic_add(counters_ptr + 2, 1, sem="acq_rel", scope="gpu")
-    if ticket == num_ctas - 1:
-        tl.store(counters_ptr + 0, 0)
-        tl.store(counters_ptr + 1, 0)
-        tl.store(counters_ptr + 2, 0)
-
-
-_counters_cache = {}
-
-
-def _get_counters(device: torch.device) -> torch.Tensor:
-    buf = _counters_cache.get(device)
-    if buf is None:
-        buf = torch.zeros(3, dtype=torch.int32, device=device)
-        _counters_cache[device] = buf
-    return buf
+    gate = tl.sigmoid(tl.reshape(acc, (ROWS, HC, BLOCK_J)))
+    xg = tl.load(
+        x_ptr
+        + offs_m[:, None, None] * (HC * HS)
+        + offs_g[None, :, None] * HS
+        + j[None, None, :],
+        mask=mask_m[:, None, None] & mask_j[None, None, :],
+        other=0.0,
+    ).to(tl.float32)
+    out = tl.sum(gate * xg, axis=1) * inv_hc
+    tl.store(
+        out_ptr + offs_m[:, None] * HS + j[None, :],
+        out.to(out_ptr.dtype.element_ty),
+        mask=mask_m[:, None] & mask_j[None, :],
+    )
 
 
 _deterministic_inference_cached = None
@@ -205,8 +202,8 @@ def _deterministic_inference() -> bool:
 def fused_hc_mix_supported(
     hyper_input_normed: torch.Tensor, w_down: torch.Tensor, w_up: torch.Tensor
 ) -> bool:
-    # The persistent kernel accumulates the down projection with
-    # device-scope atomics, so summation order varies across replays.
+    # Reproducible run to run, but the launch config is picked from the row
+    # count, so the summation order is not batch-invariant.
     if _deterministic_inference():
         return False
     return (
@@ -223,6 +220,27 @@ def fused_hc_mix_supported(
     )
 
 
+def _select_configs(
+    *,
+    props,
+    rows_pad: int,
+    dtype: torch.dtype,
+    hc: int,
+    hs: int,
+    lowrank: int,
+    k: int,
+):
+    if (
+        torch.version.hip is not None
+        and props.gcnArchName.split(":", 1)[0] == "gfx942"
+        and dtype == torch.bfloat16
+        and (hc, hs, lowrank, k) == (4, 2560, 320, 10240)
+    ):
+        down = _GFX942_DOWN_CONFIG if rows_pad <= 16 else _GFX942_DOWN_CONFIG_WIDE
+        return down, _GFX942_REDUCE_CONFIG, _GFX942_UP_CONFIG
+    return _DEFAULT_DOWN_CONFIG, _DEFAULT_REDUCE_CONFIG, _DEFAULT_UP_CONFIG
+
+
 def fused_hc_mix(
     hyper_input_normed: torch.Tensor,
     w_down: torch.Tensor,
@@ -232,40 +250,61 @@ def fused_hc_mix(
 ) -> torch.Tensor:
     rows, k = hyper_input_normed.shape
     lowrank = w_down.shape[0]
-    rows_pad = 16
     device = hyper_input_normed.device
-    props = torch.cuda.get_device_properties(device)
-    num_ctas = props.multi_processor_count
-    launch_config = _DEFAULT_MIX_CONFIG
-    if (
-        torch.version.hip is not None
-        and props.gcnArchName.split(":", 1)[0] == "gfx942"
-        and num_ctas == 80
-        and hyper_input_normed.dtype == torch.bfloat16
-        and (hc, hs, lowrank, k) == (4, 2560, 320, 10240)
-        and rows <= _FUSED_MIX_MAX_ROWS
-    ):
-        rows_pad = max(2, triton.next_power_of_2(rows))
-        launch_config = _GFX942_MIX_CONFIG
-    t_raw = torch.empty((rows_pad, lowrank), dtype=torch.float32, device=device)
-    out = torch.empty((rows, hs), dtype=hyper_input_normed.dtype, device=device)
+    dtype = hyper_input_normed.dtype
+    out = torch.empty((rows, hs), dtype=dtype, device=device)
     if rows == 0:
         return out
-    _hc_mix_persistent_kernel[(num_ctas,)](
+
+    # tl.dot needs a 16-row operand; below that the MFMA tile is padded anyway.
+    rows_pad = max(16, triton.next_power_of_2(rows))
+    down_cfg, reduce_cfg, up_cfg = _select_configs(
+        props=torch.cuda.get_device_properties(device),
+        rows_pad=rows_pad,
+        dtype=dtype,
+        hc=hc,
+        hs=hs,
+        lowrank=lowrank,
+        k=k,
+    )
+    k_chunks = triton.cdiv(k, down_cfg["BLOCK_K"])
+
+    partials = torch.empty(
+        (k_chunks, rows_pad, lowrank), dtype=torch.float32, device=device
+    )
+    t = torch.empty((rows_pad, lowrank), dtype=dtype, device=device)
+
+    n_blocks = triton.cdiv(lowrank, down_cfg["BLOCK_N"])
+    _hc_mix_down_kernel[(n_blocks * k_chunks,)](
         hyper_input_normed,
         w_down,
-        w_up,
-        t_raw,
-        out,
-        _get_counters(device),
+        partials,
         k,
+        lowrank,
+        rows,
+        ROWS=rows_pad,
+        **down_cfg,
+    )
+    _hc_mix_reduce_kernel[(triton.cdiv(lowrank, reduce_cfg["BLOCK_R"]),)](
+        partials,
+        t,
+        lowrank,
+        1.0 / hc,
+        ROWS=rows_pad,
+        KSPLIT=k_chunks,
+        **reduce_cfg,
+    )
+    _hc_mix_up_kernel[(triton.cdiv(hs, up_cfg["BLOCK_J"]),)](
+        hyper_input_normed,
+        w_up,
+        t,
+        out,
         lowrank,
         hs,
         rows,
-        num_ctas,
         1.0 / hc,
         ROWS=rows_pad,
         HC=hc,
-        **launch_config,
+        **up_cfg,
     )
     return out
