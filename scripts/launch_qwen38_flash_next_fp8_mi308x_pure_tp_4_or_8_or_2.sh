@@ -75,9 +75,13 @@ PY
 # selected below while this disables the unreleased global paged-QSA path.
 #unset SGLANG_USE_AITER
 export SGLANG_USE_AITER=1
+export SGLANG_GR_READ_FLYDSL="${SGLANG_GR_READ_FLYDSL:-1}"
 export AITER_MOE_PADDING_SIZE
-# export CUDA_VISIBLE_DEVICES=4,5,6,7
-# export HIP_VISIBLE_DEVICES=4,5,6,7
+printf 'GR read: installed PyHIP enabled=%s; TP=%s; AITER_MOE_PADDING_SIZE=%s\n' \
+  "${SGLANG_GR_READ_FLYDSL}" "${TP_SIZE}" "${AITER_MOE_PADDING_SIZE}"
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+export HIP_VISIBLE_DEVICES=4,5,6,7
+export SGLANG_GR_READ_FLYDSL=1
 command=(
   sglang serve
   --model-path "${MODEL_PATH}"

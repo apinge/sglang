@@ -1084,6 +1084,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # backend's `ForwardMetadata.out_cache_loc_full_physical` (-> KVWriteLoc.full_loc).
 
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
+        if is_hip():
+            from sglang.srt.layers.gr_read_pyhip import warmup_pyhip_gr_read
+
+            warmup_pyhip_gr_read(
+                self.model_runner.model,
+                rows=[bs * self.captured_req_width for bs in self.capture_bs],
+            )
         avail_mem = get_available_gpu_memory(
             self.model_runner.device,
             self.model_runner.gpu_id,
