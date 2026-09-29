@@ -125,6 +125,7 @@ class GatedResidual(HyperConnectionBase):
         self._gr_read_enabled = False
         self._gr_read_weights = None
         self._gr_read_fn = None
+       # Used only for logging and tracking the number of packaging runs in test statistics
         self._gr_read_pack_count = 0
 
         norm_dim = (

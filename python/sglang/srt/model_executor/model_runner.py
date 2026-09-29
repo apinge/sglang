@@ -1239,7 +1239,7 @@ class ModelRunner:
 
     def maybe_precompile_model_kernels_after_loading(self) -> None:
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
-        if torch.version.hip is not None:
+        if torch.version.hip is not None and envs.SGLANG_GR_READ_FLYDSL.get():
             from sglang.srt.layers.gr_read_pyhip import warmup_pyhip_gr_read
 
             warmup_pyhip_gr_read(self.model)

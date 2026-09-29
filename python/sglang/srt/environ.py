@@ -1012,7 +1012,7 @@ class Envs:
     # instead of the persistent Triton mix.
     SGLANG_HC_MIX_CUDA = EnvBool(True)
     # Optional installed PyHIP GR read for BF16 Qwen HC mix on gfx942.
-    SGLANG_GR_READ_FLYDSL = EnvBool(True)
+    SGLANG_GR_READ_FLYDSL = EnvBool(False)
     # Log each distinct (m, n, k) the BF16 GEMM dispatch sees (allowlist tuning).
     SGLANG_BF16_GEMM_LOG_SHAPES = EnvBool(False)
     # Split the HC combine gate dot across CTAs instead of one CTA per row.
