@@ -49,6 +49,10 @@ class PyHIPGRReadMethod:
 
     @torch.no_grad()
     def process_weights_after_loading(self, module):
+        # TODO: ShardedStateLoader and Remote KV are currently unsupported by this
+        # PyHIP GR read integration. They invoke this hook before copying saved state.
+        # Add layout validation and a post-copy packing lifecycle that distinguishes
+        # raw weights from already-packed weights before enabling these loaders.
         if module._gr_read_weights is not None:
             return
         wd = module.input_mix_weight_down.weight
