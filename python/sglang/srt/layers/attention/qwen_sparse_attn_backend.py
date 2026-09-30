@@ -16,6 +16,7 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
     QSA_VARIANT_COMPRESSED,
@@ -244,6 +245,27 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
+        self._pyhip_attention = None
+        profile = self.qsa_profile
+        if (
+            is_hip()
+            and envs.SGLANG_USE_PYHIP_QSA.get()
+            and runner is not None
+            and not runner.is_draft_worker
+            and runner.ps.attn_cp_size == runner.ps.attn_dcp_size == 1
+            and runner.kv_cache_dtype == torch.bfloat16
+            and profile is not None
+            and profile.variant == QSA_VARIANT_COMPRESSED
+            and (profile.compress_ratio, profile.block_topk, profile.budget)
+            == (4, 512, 2048)
+            and torch.cuda.get_device_properties(self.device).gcnArchName.startswith(
+                "gfx942"
+            )
+        ):
+            from sglang.srt.layers.attention.qsa.pyhip_backend import PyHIPAttention
+
+            self._pyhip_attention = PyHIPAttention()
+            logger.info("Using installed PyHIP for gfx942 QSA prefill attention")
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -1420,11 +1442,39 @@ class QwenSparseAttnBackend(AttentionBackend):
         prefix_lens = [
             sequence_lens[i] - extend_lens[i] for i in range(len(extend_lens))
         ]
-        cu_seqlens_q = F.pad(
-            forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
-            (1, 0),
-        ).contiguous()
+        use_pyhip = (
+            self._pyhip_attention is not None
+            and self._pyhip_attention.supports(
+                q=q,
+                k=k,
+                v=v,
+                indices=topk_indices,
+                layer=layer,
+                forward_mode=forward_batch.forward_mode,
+                kwargs=kwargs,
+            )
+        )
+        cu_seqlens_q = (
+            None
+            if use_pyhip
+            else F.pad(
+                forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
+                (1, 0),
+            ).contiguous()
+        )
         if not any(prefix_lens):
+            if use_pyhip:
+                output = self._pyhip_attention.forward(
+                    q=q.contiguous(),
+                    k=k[:num_valid_rows].contiguous(),
+                    v=v[:num_valid_rows].contiguous(),
+                    indices=topk_indices,
+                    query_lens=extend_lens,
+                    prefix_lens=prefix_lens,
+                    scale=layer.scaling,
+                    layer_id=layer.layer_id,
+                )
+                return self._pad_extend_output(output, num_output_rows)
             output = sparse_gqa_fwd_interface_triton(
                 q.contiguous(),
                 k[:num_valid_rows].contiguous(),
@@ -1455,6 +1505,18 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             for i in range(len(sequence_lens))
         ]
+        if use_pyhip:
+            output = self._pyhip_attention.forward(
+                q=q.contiguous(),
+                k=torch.cat(k_parts),
+                v=torch.cat(v_parts),
+                indices=topk_indices,
+                query_lens=extend_lens,
+                prefix_lens=prefix_lens,
+                scale=layer.scaling,
+                layer_id=layer.layer_id,
+            )
+            return self._pad_extend_output(output, num_output_rows)
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )

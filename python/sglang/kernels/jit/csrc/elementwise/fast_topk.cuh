@@ -19,8 +19,7 @@ namespace sglang {
 namespace fast_topk_detail {
 
 constexpr uint32_t kThreadsPerBlock = 1024;
-// Each radix pass needs at most ~kTopK candidates in the threshold bin, so
-// 4K entries per round (2 rounds = 8K entries = 32KB) is sufficient.
+// Larger threshold buckets use a full-row radix scan instead of truncated scratch.
 constexpr size_t kSmemBytes = 8 * 1024 * sizeof(uint32_t);  // 32KB
 
 struct FastTopKParams {
@@ -144,6 +143,48 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
       }
     }
     __syncthreads();
+  }
+
+  if (s_num_input[0] > int(SMEM_INPUT_SIZE)) {
+    uint32_t prefix = 0;
+    uint32_t prefix_mask = 0;
+    int32_t remaining = kTopK;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+      if (tx < RADIX + 1) s_histogram[tx] = 0;
+      __syncthreads();
+      for (int32_t idx = tx; idx < length; idx += BLOCK_SIZE) {
+        const auto key = convert_to_uint32(input[idx + row_start]);
+        if ((key & prefix_mask) == prefix) {
+          ::atomicAdd(&s_histogram[(key >> shift) & 0xFF], 1);
+        }
+      }
+      __syncthreads();
+      run_cumsum();
+      if (tx < RADIX && s_histogram[tx] >= remaining && s_histogram[tx + 1] < remaining) {
+        s_threshold_bin_id = tx;
+        s_num_input[0] = s_histogram[tx + 1];
+      }
+      __syncthreads();
+      remaining -= s_num_input[0];
+      prefix |= static_cast<uint32_t>(s_threshold_bin_id) << shift;
+      prefix_mask |= 0xFFu << shift;
+    }
+    if (tx == 0) {
+      s_counter = 0;
+      s_num_input[0] = 0;
+    }
+    __syncthreads();
+    for (int32_t idx = tx; idx < length; idx += BLOCK_SIZE) {
+      const auto key = convert_to_uint32(input[idx + row_start]);
+      if (key > prefix) {
+        index[::atomicAdd(&s_counter, 1)] = idx;
+      } else if (key == prefix) {
+        const auto position = ::atomicAdd(&s_num_input[0], 1);
+        if (position < remaining) index[kTopK - remaining + position] = idx;
+      }
+    }
+    __syncthreads();
+    return;
   }
 
   // stage 2: refine with 8bit radix passes

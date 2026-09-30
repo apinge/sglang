@@ -907,6 +907,7 @@ def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
         qsa_backend_module, "sparse_gqa_fwd_interface_triton", fake_sparse_gqa
     )
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend._pyhip_attention = None
 
     class Pool:
         def set_kv_buffer(self, layer, loc, k, v):
