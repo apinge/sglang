@@ -16,6 +16,7 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
     QSA_VARIANT_COMPRESSED,
@@ -199,6 +200,12 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     def __init__(self, runner=None) -> None:
         self.runner = runner
+        self._sparse_impl = envs.SGLANG_QSA_SPARSE_IMPL.get()
+        if self._sparse_impl not in ("legacy", "pr2311"):
+            raise ValueError("SGLANG_QSA_SPARSE_IMPL must be legacy or pr2311")
+        self._paged_gqa_workspace = None
+        self._paged_gqa_logged = False
+        self._paged_gqa_fallback_logged = False
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
         self.device = getattr(runner, "device", None)
         model_config = getattr(runner, "model_config", None)
@@ -1643,6 +1650,43 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = topk_indices.to(torch.int32).contiguous()
+        if self._sparse_impl == "pr2311" and is_hip():
+            from sglang.srt.layers.attention.qsa.sparse_attn_decode import (
+                SparsePagedGQAWorkspace,
+                qsa_sparse_paged_gqa,
+                supports_sparse_paged_gqa,
+            )
+
+            if supports_sparse_paged_gqa(q, k_buffer, v_buffer):
+                if self._paged_gqa_workspace is None:
+                    self._paged_gqa_workspace = SparsePagedGQAWorkspace()
+                if not self._paged_gqa_logged:
+                    logger.info("QSA sparse implementation: pr2311 (direct paged GQA)")
+                    self._paged_gqa_logged = True
+                row_requests = (
+                    metadata.row_req_pool_indices
+                    if metadata.row_req_pool_indices is not None
+                    else forward_batch.req_pool_indices
+                )
+                output = qsa_sparse_paged_gqa(
+                    q,
+                    k_buffer,
+                    v_buffer,
+                    topk_indices,
+                    self.req_to_token_pool.req_to_token,
+                    row_requests,
+                    layer.scaling,
+                    sequence_lengths=metadata.sequence_lengths,
+                    workspace=self._paged_gqa_workspace,
+                )
+                return output.reshape(q.shape[0], -1)
+            if not self._paged_gqa_fallback_logged:
+                logger.warning(
+                    "QSA pr2311 requires gfx942 BF16 GQA with head_dim 128/256; "
+                    "using legacy sparse attention for this layout"
+                )
+                self._paged_gqa_fallback_logged = True
+
         trtllm_decode = _resolve_trtllm_sparse_decode()
         if trtllm_decode is not None:
             return self._forward_trtllm_sparse(
