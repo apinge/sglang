@@ -149,20 +149,31 @@ class IndexerValidation:
         self.decode_checks = None
 
     def prefill(
-        self, *, indexer, runtime, hidden, positions, logical, metadata, inputs
+        self,
+        *,
+        indexer,
+        hidden,
+        positions,
+        logical,
+        metadata,
+        state_slots,
+        seq_lens,
+        extend_lens,
+        run,
     ):
+        pool = metadata.token_to_kv_pool
         q_ref, token_k, stored = indexer.project_qk(
             hidden,
             positions,
-            pool=metadata.token_to_kv_pool,
-            cache_loc=inputs["state_slots"],
+            pool=pool,
+            cache_loc=state_slots,
         )
         indexer.update_key_state_and_compress(
             token_k,
             logical,
             positions,
             metadata,
-            state_slots=inputs["state_slots"],
+            state_slots=state_slots,
             state_stored=stored,
         )
         keys, starts, ends, lengths = metadata.get_prefill_mqa_inputs(
@@ -177,20 +188,24 @@ class IndexerValidation:
             metadata.req_pool_indices.long()[:, None] * ring_size
             + torch.arange(ring_size, device=hidden.device)
         ).flatten()
-        written = inputs["write_locs"][inputs["write_locs"] != 0].long()
-        reference = (
-            inputs["key_state"][ring],
-            inputs["rope_state"][ring],
-            inputs["compressed"][written],
+        key_state = pool.get_qsa_key_state_buffer(indexer.layer_id)
+        rope_state = pool.qsa_rope_position_buffer
+        compressed = pool.get_qsa_compressed_k_buffer(indexer.layer_id)
+        written = metadata.write_locs[metadata.write_locs != 0].long()
+        reference = (key_state[ring], rope_state[ring], compressed[written])
+        q = torch.empty_like(q_ref, memory_format=torch.contiguous_format)
+        actual = run(q_out=q)
+        ratio, table = indexer.compress_ratio, metadata.token_slot_table
+        # Keys PyHIP's logits read: a group's key is at its first token's slot // ratio.
+        packed = torch.cat(
+            [
+                compressed[table[s, : n // ratio * ratio : ratio].long() // ratio, 0]
+                for s, n in enumerate(seq_lens)
+            ]
         )
-        actual, q, packed = runtime._prefill(**inputs)
         torch.testing.assert_close(q, q_ref, rtol=0, atol=0)
         torch.testing.assert_close(packed[: keys.shape[0]], keys[:, 0], rtol=0, atol=0)
-        current = (
-            inputs["key_state"][ring],
-            inputs["rope_state"][ring],
-            inputs["compressed"][written],
-        )
+        current = (key_state[ring], rope_state[ring], compressed[written])
         for value, wanted in zip(current, reference):
             torch.testing.assert_close(value, wanted, rtol=0, atol=0)
         _prefill_selection(
@@ -198,10 +213,10 @@ class IndexerValidation:
             expected=expected,
             q=q_ref,
             keys=keys,
-            seq_lens=inputs["seq_lens"],
-            extend_lens=inputs["extend_lens"],
+            seq_lens=seq_lens,
+            extend_lens=extend_lens,
         )
-        self.prefill_layouts.add((inputs["seq_lens"], inputs["extend_lens"]))
+        self.prefill_layouts.add((seq_lens, extend_lens))
         self.prefill_checks += 1
         logger.info(
             "PyHIP QSA indexer checked: layer=%s prefill=%s decode=%s rows=%s",
@@ -212,50 +227,66 @@ class IndexerValidation:
         )
         return actual
 
-    def decode(self, *, indexer, runtime, hidden, positions, logical, metadata, inputs):
+    def decode(
+        self,
+        *,
+        indexer,
+        hidden,
+        positions,
+        logical,
+        metadata,
+        state_slots,
+        write_locs,
+        cache,
+        page_table,
+        lengths,
+        logical_positions,
+        seq_lens,
+        run,
+    ):
         if self.decode_checks is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Warm PyHIP QSA validation before capture")
             self.decode_checks = torch.zeros(
                 (), dtype=torch.int64, device=hidden.device
             )
+        pool = metadata.token_to_kv_pool
         q_ref, token_k, stored = indexer.project_qk(
             hidden,
             positions,
-            pool=metadata.token_to_kv_pool,
-            cache_loc=inputs["state_slots"],
+            pool=pool,
+            cache_loc=state_slots,
         )
         indexer.update_key_state_and_compress(
             token_k,
             logical,
             positions,
             metadata,
-            state_slots=inputs["state_slots"],
+            state_slots=state_slots,
             state_stored=stored,
         )
+        rows, width = page_table.shape[0], page_table.shape[1] * 16
         expected = indexer.select_decode_tokens(
             q_ref,
-            inputs["cache"],
-            inputs["page_table"],
-            inputs["lengths"],
-            inputs["page_table"].shape[1] * 16,
-            inputs["query_positions"],
-            inputs["sequence_lengths"],
+            cache,
+            page_table,
+            lengths,
+            width,
+            logical_positions,
+            seq_lens,
         )
-        slots, locs = inputs["state_slots"], inputs["write_locs"].long()
-        reference = (
-            q_ref,
-            inputs["key_state"][slots],
-            inputs["rope_state"][slots],
-            inputs["compressed"][locs],
-        )
-        actual, q, logits = runtime._decode_forward(**inputs)
-        current = (
-            q,
-            inputs["key_state"][slots],
-            inputs["rope_state"][slots],
-            inputs["compressed"][locs],
-        )
+        key_state = pool.get_qsa_key_state_buffer(indexer.layer_id)
+        rope_state = pool.qsa_rope_position_buffer
+        compressed = pool.get_qsa_compressed_k_buffer(indexer.layer_id)
+        slots, locs = state_slots, write_locs.long()
+        reference = (q_ref, key_state[slots], rope_state[slots], compressed[locs])
+        q = torch.empty_like(q_ref, memory_format=torch.contiguous_format)
+        # PyHIP's top-k may read up to 512 values past the logits.
+        logits = torch.empty(
+            rows * width + 512, dtype=torch.float32, device=hidden.device
+        )[: rows * width].view(rows, width)
+        actual = run(q_out=q, logits_out=logits)
+        current = (q, key_state[slots], rope_state[slots], compressed[locs])
         real = slots >= qsa_ring_slots_per_request(indexer.compress_ratio)
         valid = torch.ones((), dtype=torch.bool, device=hidden.device)
         for field, (value, wanted) in enumerate(zip(current, reference)):
@@ -263,7 +294,7 @@ class IndexerValidation:
             valid &= ~((value != wanted).flatten(1).any(1) & mask).any()
         valid &= _selection_valid(
             logits=logits,
-            lengths=inputs["lengths"],
+            lengths=lengths,
             actual=actual,
             expected=expected,
             real=real,

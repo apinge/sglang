@@ -1,4 +1,4 @@
-"""Direct PyHIP wiring: cache ownership, ragged prefill and graph decode."""
+"""Direct PyHIP wiring: cache ownership, ragged prefill, graph decode and graph verify."""
 
 import importlib.util
 import unittest
@@ -7,7 +7,12 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.qsa.metadata import QSAIndexerMetadata
+from sglang.srt.layers.attention.qsa.metadata import (
+    QSAIndexerMetadata,
+    build_group_ring_slots,
+    build_pending_ring_slots,
+    qsa_ring_slots_per_request,
+)
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
@@ -35,16 +40,17 @@ def _config():
 
 
 def _pool(device):
+    ring = 3 * qsa_ring_slots_per_request(4)
     pool = QSATokenToKVPool.__new__(QSATokenToKVPool)
     pool.full_attention_layer_id_mapping = {3: 0}
     pool.qsa_key_state_buffer_pool = [
-        torch.zeros((12, 1, 128), dtype=torch.bfloat16, device=device)
+        torch.zeros((ring, 1, 128), dtype=torch.bfloat16, device=device)
     ]
     pool.qsa_compressed_k_buffer_pool = [
         torch.randn((2112, 1, 128), dtype=torch.bfloat16, device=device)
     ]
     pool.qsa_rope_position_buffer = torch.zeros(
-        (12, 3), dtype=torch.int64, device=device
+        (ring, 3), dtype=torch.int64, device=device
     )
     pool.qsa_compress_ratio = 4
     pool.qsa_index_head_dim = 128
@@ -77,6 +83,26 @@ def _indexer(device):
         module.q_layernorm.weight.normal_(std=0.1)
         module.k_layernorm.weight.normal_(std=0.1)
     return module
+
+
+def _ring_slots(requests, logical):
+    """Graph rows' pending-ring store slots and group member slots, as SGLang builds them."""
+    rows = torch.arange(len(logical), device=logical.device)
+    slots = build_pending_ring_slots(
+        token_to_batch_idx=rows,
+        req_pool_indices=requests,
+        sequence_lengths=logical + 1,
+        logical_positions=logical,
+        compress_ratio=4,
+        is_extend=False,
+    )
+    groups = build_group_ring_slots(
+        req_pool_indices=requests,
+        group_end_positions=logical.long(),
+        sequence_ids=rows,
+        compress_ratio=4,
+    )
+    return slots, groups.int()
 
 
 class _AttentionPool:
@@ -380,6 +406,7 @@ class TestPyHIPQSA(CustomTestCase):
         self.assertEqual(output.shape, (sum(extends), 2051))
         self.assertEqual(module._pyhip_indexer.validation.prefill_checks, 1)
         self._check_graph_decode(module, pool, table, lengths)
+        self._check_graph_verify(module, pool, table, (lengths[0] + 2, lengths[1] + 2))
 
     def _check_graph_decode(self, module, pool, table, lengths):
         seq = torch.tensor(
@@ -387,12 +414,7 @@ class TestPyHIPQSA(CustomTestCase):
         )
         logical = seq - 1
         requests = torch.tensor([1, 2], dtype=torch.int64, device=self.device)
-        slots = requests * 4 + logical.long() % 4
-        groups = (
-            requests[:, None] * 4
-            + (logical.long()[:, None] - torch.arange(3, -1, -1, device=self.device))
-            % 4
-        ).int()
+        slots, groups = _ring_slots(requests, logical.long())
         writes = (table[torch.arange(2, device=self.device), logical.long()] // 4).int()
         metadata = QSAIndexerMetadata(
             sequence_lengths=seq,
@@ -423,12 +445,10 @@ class TestPyHIPQSA(CustomTestCase):
             output = module.forward_cuda(hidden, positions, batch, metadata)
         seq.add_(1)
         logical.add_(1)
-        slots.copy_(requests * 4 + logical.long() % 4)
-        groups.copy_(
-            requests[:, None] * 4
-            + (logical.long()[:, None] - torch.arange(3, -1, -1, device=self.device))
-            % 4
-        )
+        for buffer, value in zip(
+            (slots, groups), _ring_slots(requests, logical.long())
+        ):
+            buffer.copy_(value)
         writes.zero_()
         positions.add_(1)
         hidden.neg_()
@@ -437,6 +457,73 @@ class TestPyHIPQSA(CustomTestCase):
         self.assertEqual(output.shape, (2, 2051))
         self.assertGreater(
             int(module._pyhip_indexer.validation.decode_checks.item()), 1
+        )
+
+    def _check_graph_verify(self, module, pool, table, bases):
+        """Four-row TARGET_VERIFY windows that cross a compression boundary must match
+        native prep, ring writes, compression and selection, eager and in a graph."""
+        rows = 8
+        owner = torch.arange(2, device=self.device).repeat_interleave(4)
+        requests = owner + 1
+        offsets = torch.arange(4, device=self.device).repeat(2)
+        seq = torch.empty(rows, dtype=torch.int32, device=self.device)
+        logical = torch.empty(rows, dtype=torch.int64, device=self.device)
+        slots = torch.empty(rows, dtype=torch.int64, device=self.device)
+        groups = torch.empty((rows, 4), dtype=torch.int32, device=self.device)
+        writes = torch.empty(rows, dtype=torch.int32, device=self.device)
+        compressed = torch.empty(rows, dtype=torch.int32, device=self.device)
+        positions = torch.empty((3, rows), dtype=torch.int64, device=self.device)
+        hidden = torch.empty((rows, 2560), device=self.device, dtype=torch.bfloat16)
+
+        def step(window_bases):
+            seq.copy_(
+                torch.tensor(window_bases, device=self.device).repeat_interleave(4)
+                + 1
+                + offsets
+            )
+            logical.copy_(seq - 1)
+            for buffer, value in zip((slots, groups), _ring_slots(requests, logical)):
+                buffer.copy_(value)
+            boundary = table[owner, logical] // 4
+            writes.copy_(torch.where(seq % 4 == 0, boundary, 0))
+            compressed.copy_(seq // 4)
+            positions.copy_(torch.stack([logical, logical + 3, logical + 7]))
+            hidden.normal_()
+
+        step(bases)
+        metadata = QSAIndexerMetadata(
+            sequence_lengths=seq,
+            token_to_batch_idx=torch.arange(
+                rows, dtype=torch.int32, device=self.device
+            ),
+            token_slot_table=table[owner].contiguous(),
+            out_cache_loc=torch.zeros(rows, dtype=torch.int64, device=self.device),
+            token_to_kv_pool=pool,
+            compress_ratio=4,
+            block_topk=512,
+            req_pool_indices=requests,
+            is_cuda_graph=True,
+            graph_write_locs=writes,
+            graph_compressed_page_table=(table[owner, ::64] // 64).contiguous(),
+            graph_compressed_lengths=compressed,
+            decode_logical_positions=logical,
+            pending_ring_slots=slots,
+            graph_ring_group_locs=groups,
+        )
+        batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+        checks = int(module._pyhip_indexer.validation.decode_checks.item())
+        module.forward_cuda(hidden, positions, batch, metadata)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with model_capture_mode(), torch.cuda.graph(graph):
+            output = module.forward_cuda(hidden, positions, batch, metadata)
+        # One request accepts its whole window, the other rewrites its rejected tail.
+        step((bases[0] + 4, bases[1] + 1))
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(output.shape, (rows, 2051))
+        self.assertEqual(
+            int(module._pyhip_indexer.validation.decode_checks.item()), checks + 2
         )
 
 

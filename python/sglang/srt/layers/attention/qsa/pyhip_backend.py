@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 
 import torch
@@ -160,7 +161,7 @@ class PyHIPIndexer:
         )
 
     @staticmethod
-    def _common_inputs(*, indexer, hidden, positions, metadata, state_slots):
+    def _state_buffers(*, indexer, hidden, metadata):
         pool = metadata.token_to_kv_pool
         key_state = pool.get_qsa_key_state_buffer(indexer.layer_id)
         compressed = pool.get_qsa_compressed_k_buffer(indexer.layer_id)
@@ -179,19 +180,7 @@ class PyHIPIndexer:
             or rope_state.device != hidden.device
         ):
             return None
-        return dict(
-            positions=positions,
-            state_slots=state_slots[: len(hidden)].contiguous(),
-            key_state=key_state,
-            rope_state=rope_state,
-            compressed=compressed,
-            cos_sin_cache=indexer.rotary_emb.cos_sin_cache,
-            axis_map=indexer._rope_axis_map(hidden.device),
-            q_weight=indexer.q_layernorm.weight.data,
-            k_weight=indexer.k_layernorm.weight.data,
-            q_eps=indexer.q_layernorm.variance_epsilon,
-            k_eps=indexer.k_layernorm.variance_epsilon,
-        )
+        return key_state, rope_state, compressed
 
     def forward(
         self, *, indexer, hidden, positions, logical, batch, metadata, state_slots
@@ -262,28 +251,36 @@ class PyHIPIndexer:
             or max(lengths) // 4 > self.runtime.MAX_COMPRESSED_KEYS
         ):
             return None
-        inputs = self._common_inputs(
-            indexer=indexer,
-            hidden=hidden,
-            positions=positions,
-            metadata=metadata,
-            state_slots=state_slots,
-        )
-        if inputs is None:
+        buffers = self._state_buffers(indexer=indexer, hidden=hidden, metadata=metadata)
+        if buffers is None:
             return None
+        key_state, rope_state, compressed = buffers
         rope = metadata.extend_rope_matrix
         if rope is None:
             rope = build_rope_position_matrix(positions, len(hidden))
-        inputs.update(
-            qk=indexer.index_qk_proj(hidden)[0].contiguous(),
+        state_slots = state_slots[: len(hidden)].contiguous()
+        run = functools.partial(
+            self.runtime.prefill_indexer,
+            indexer.index_qk_proj(hidden)[0].contiguous(),
             heads=4,
+            positions=positions,
             logical_positions=logical.contiguous(),
+            state_slots=state_slots,
+            key_state=key_state,
+            rope_state=rope_state,
             write_locs=metadata.write_locs,
             member_rows=metadata.compress_member_rows,
             group_sequences=metadata.compress_sequence_ids,
             group_ends=metadata.compress_group_positions,
             rope_matrix=rope[: len(hidden)].contiguous(),
+            compressed=compressed,
             token_slot_table=metadata.token_slot_table,
+            cos_sin_cache=indexer.rotary_emb.cos_sin_cache,
+            axis_map=indexer._rope_axis_map(hidden.device),
+            q_weight=indexer.q_layernorm.weight.data,
+            k_weight=indexer.k_layernorm.weight.data,
+            q_eps=indexer.q_layernorm.variance_epsilon,
+            k_eps=indexer.k_layernorm.variance_epsilon,
             seq_lens=lengths,
             extend_lens=extends,
         )
@@ -294,14 +291,16 @@ class PyHIPIndexer:
             ):
                 return self.validation.prefill(
                     indexer=indexer,
-                    runtime=self.runtime,
                     hidden=hidden,
                     positions=positions,
                     logical=logical,
                     metadata=metadata,
-                    inputs=inputs,
+                    state_slots=state_slots,
+                    seq_lens=lengths,
+                    extend_lens=extends,
+                    run=run,
                 )
-            return self.runtime.prefill_indexer(**inputs)
+            return run()
 
     @staticmethod
     def _supports_decode(*, rows, device, cache, table, lengths):
@@ -360,24 +359,33 @@ class PyHIPIndexer:
             or not writes.is_contiguous()
         ):
             return None
-        inputs = self._common_inputs(
-            indexer=indexer,
-            hidden=hidden,
-            positions=positions,
-            metadata=metadata,
-            state_slots=state_slots,
-        )
-        if inputs is None:
+        buffers = self._state_buffers(indexer=indexer, hidden=hidden, metadata=metadata)
+        if buffers is None:
             return None
-        inputs.update(
-            qk=indexer.index_qk_proj(hidden)[0].contiguous(),
-            group_locs=groups,
+        key_state, rope_state, compressed = buffers
+        state_slots = state_slots[:rows].contiguous()
+        logical_positions = metadata.decode_logical_positions[:rows]
+        seq_lens = metadata.get_seqlens_int32()
+        run = functools.partial(
+            self.runtime.decode_indexer,
+            indexer.index_qk_proj(hidden)[0].contiguous(),
+            positions=positions,
+            logical_positions=logical_positions,
+            state_slots=state_slots,
+            key_state=key_state,
+            rope_state=rope_state,
             write_locs=writes,
-            cache=cache,
+            group_locs=groups,
+            compressed=compressed,
             page_table=table,
             lengths=lengths,
-            query_positions=metadata.decode_logical_positions[:rows],
-            sequence_lengths=metadata.get_seqlens_int32(),
+            cos_sin_cache=indexer.rotary_emb.cos_sin_cache,
+            axis_map=indexer._rope_axis_map(hidden.device),
+            q_weight=indexer.q_layernorm.weight.data,
+            k_weight=indexer.k_layernorm.weight.data,
+            q_eps=indexer.q_layernorm.variance_epsilon,
+            k_eps=indexer.k_layernorm.variance_epsilon,
+            seq_lens=seq_lens,
             verify=verify,
         )
         with torch.profiler.record_function(
@@ -386,11 +394,17 @@ class PyHIPIndexer:
             if self.validation is not None:
                 return self.validation.decode(
                     indexer=indexer,
-                    runtime=self.runtime,
                     hidden=hidden,
                     positions=positions,
                     logical=logical,
                     metadata=metadata,
-                    inputs=inputs,
+                    state_slots=state_slots,
+                    write_locs=writes,
+                    cache=cache,
+                    page_table=table,
+                    lengths=lengths,
+                    logical_positions=logical_positions,
+                    seq_lens=seq_lens,
+                    run=run,
                 )
-            return self.runtime.decode_forward(**inputs)
+            return run()
