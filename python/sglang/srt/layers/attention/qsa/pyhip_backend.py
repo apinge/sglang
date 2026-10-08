@@ -210,7 +210,10 @@ class PyHIPIndexer:
                 metadata=metadata,
                 state_slots=state_slots,
             )
-        if batch.forward_mode == ForwardMode.DECODE and metadata.is_cuda_graph:
+        if metadata.is_cuda_graph and batch.forward_mode in (
+            ForwardMode.DECODE,
+            ForwardMode.TARGET_VERIFY,
+        ):
             return self._decode(
                 indexer=indexer,
                 hidden=hidden,
@@ -218,6 +221,7 @@ class PyHIPIndexer:
                 logical=logical,
                 metadata=metadata,
                 state_slots=state_slots,
+                verify=batch.forward_mode == ForwardMode.TARGET_VERIFY,
             )
         return None
 
@@ -319,7 +323,9 @@ class PyHIPIndexer:
             and all(t.device == device for t in (cache, table, lengths))
         )
 
-    def _decode(self, *, indexer, hidden, positions, logical, metadata, state_slots):
+    def _decode(
+        self, *, indexer, hidden, positions, logical, metadata, state_slots, verify
+    ):
         if any(
             t is None
             for t in (
@@ -372,8 +378,11 @@ class PyHIPIndexer:
             lengths=lengths,
             query_positions=metadata.decode_logical_positions[:rows],
             sequence_lengths=metadata.get_seqlens_int32(),
+            verify=verify,
         )
-        with torch.profiler.record_function("pyhip_qsa.indexer.decode"):
+        with torch.profiler.record_function(
+            "pyhip_qsa.indexer.verify" if verify else "pyhip_qsa.indexer.decode"
+        ):
             if self.validation is not None:
                 return self.validation.decode(
                     indexer=indexer,
