@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.qsa.metadata import qsa_ring_slots_per_request
 
 logger = logging.getLogger(__name__)
 
@@ -171,9 +172,10 @@ class IndexerValidation:
         expected = indexer.select_prefill_tokens(
             q_ref, keys, starts, ends, logical, row_lengths
         )
+        ring_size = qsa_ring_slots_per_request(indexer.compress_ratio)
         ring = (
-            metadata.req_pool_indices.long()[:, None] * 4
-            + torch.arange(4, device=hidden.device)
+            metadata.req_pool_indices.long()[:, None] * ring_size
+            + torch.arange(ring_size, device=hidden.device)
         ).flatten()
         written = inputs["write_locs"][inputs["write_locs"] != 0].long()
         reference = (
@@ -254,7 +256,7 @@ class IndexerValidation:
             inputs["rope_state"][slots],
             inputs["compressed"][locs],
         )
-        real = slots >= 4
+        real = slots >= qsa_ring_slots_per_request(indexer.compress_ratio)
         valid = torch.ones((), dtype=torch.bool, device=hidden.device)
         for field, (value, wanted) in enumerate(zip(current, reference)):
             mask = real & (locs != 0) if field == 3 else real
