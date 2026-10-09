@@ -48,6 +48,12 @@ def _unsupported_derived_weight_cache_error(
     update never proceeds on some workers while rejected on others.
     """
     if model is not None and any(
+        getattr(module, "_gr_read_weights", None) is not None
+        for module in model.modules()
+    ):
+        return "Online updates of packed PyHIP GR read weights require a fresh model and graphs."
+
+    if model is not None and any(
         getattr(module, "_hc_attn_tf32_parts", None) is not None
         or getattr(module, "_hc_ffn_tf32_parts", None) is not None
         for module in model.modules()
