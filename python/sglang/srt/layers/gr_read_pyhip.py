@@ -2,6 +2,7 @@
 
 import importlib
 import logging
+import time
 from functools import lru_cache
 from importlib import metadata
 
@@ -11,9 +12,21 @@ from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
-# Public PyHIP warmup examples for gfx942/80CU, covering T33..65536.
-# These are startup probe shapes; kernel selection stays inside PyHIP.
-_PREFILL_WARMUP_ROWS = (128, 256, 512, 1024, 2048, 2560, 3072, 4096, 5120, 7680, 10240)
+# Post-load warmup rows. Decode capture sizes are passed separately.
+# Kernel selection stays inside PyHIP.
+_WARMUP_ROWS = tuple(range(1, 33)) + (
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    2560,
+    3072,
+    4096,
+    5120,
+    7680,
+    10240,
+)
 
 
 @lru_cache(maxsize=1)
@@ -90,22 +103,34 @@ def warmup_pyhip_gr_read(model, rows=None):
         by_device.setdefault(packed[0].device, packed)
     _, gr_read = get_pyhip_ops()
     requested_rows = tuple(sorted({int(r) for r in rows if r > 0})) if rows is not None else None
-    for device, (packed_down, packed_up) in by_device.items():
-        with torch.cuda.device(device):
-            if requested_rows is None:
-                selected_rows = tuple(range(1, 33))
-                if torch.cuda.get_device_properties(device).multi_processor_count == 80:
-                    selected_rows += _PREFILL_WARMUP_ROWS
-            else:
-                selected_rows = requested_rows
-            for count in selected_rows:
-                x = torch.zeros((count, 10240), dtype=torch.bfloat16, device=device)
-                gr_read(x, packed_down, packed_up)
-            torch.cuda.current_stream(device).synchronize()
-            logger.info(
-                "PyHIP GR read prepared: modules=%d, device=%s, rows=%s, pack_counts=%s",
-                len(modules),
-                device,
-                selected_rows,
-                sorted({m._gr_read_pack_count for m in modules}),
-            )
+    logger.info(
+        "PyHIP GR read warmup begin: ts=%s, modules=%d, devices=%d",
+        time.strftime("%Y-%m-%d %H:%M:%S"),
+        len(modules),
+        len(by_device),
+    )
+    started = time.perf_counter()
+    try:
+        for device, (packed_down, packed_up) in by_device.items():
+            with torch.cuda.device(device):
+                if requested_rows is None:
+                    selected_rows = _WARMUP_ROWS
+                else:
+                    selected_rows = requested_rows
+                for count in selected_rows:
+                    x = torch.zeros((count, 10240), dtype=torch.bfloat16, device=device)
+                    gr_read(x, packed_down, packed_up)
+                torch.cuda.current_stream(device).synchronize()
+                logger.info(
+                    "PyHIP GR read prepared: modules=%d, device=%s, rows=%s, pack_counts=%s",
+                    len(modules),
+                    device,
+                    selected_rows,
+                    sorted({m._gr_read_pack_count for m in modules}),
+                )
+    finally:
+        logger.info(
+            "PyHIP GR read warmup end: ts=%s, elapsed=%.2f s",
+            time.strftime("%Y-%m-%d %H:%M:%S"),
+            time.perf_counter() - started,
+        )
