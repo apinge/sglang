@@ -66,6 +66,7 @@ export SGLANG_USE_AITER=1
 export AITER_MOE_PADDING_SIZE
 # export CUDA_VISIBLE_DEVICES=7
 # export HIP_VISIBLE_DEVICES=7
+export SGLANG_GR_READ_FLYDSL="${SGLANG_GR_READ_FLYDSL:-0}"
 command=(
   sglang serve
   --model-path "${MODEL_PATH}"
