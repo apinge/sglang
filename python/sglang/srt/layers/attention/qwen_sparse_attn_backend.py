@@ -1488,27 +1488,20 @@ class QwenSparseAttnBackend(AttentionBackend):
         # The validated chunk-prefill kernel consumes tightly packed full-context
         # K/V. Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
-        k_buffer = pool.get_key_buffer(layer.layer_id)
-        v_buffer = pool.get_value_buffer(layer.layer_id)
-        req_to_token = self.req_to_token_pool.req_to_token
-        req_indices = forward_batch.req_pool_indices.tolist()
-        k_parts = [
-            k_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
-        v_parts = [
-            v_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
+        batch_size = len(sequence_lens)
+        slots = self._packed_kv_slots(
+            req_to_token=self.req_to_token_pool.req_to_token,
+            req_pool_indices=forward_batch.req_pool_indices[:batch_size],
+            seq_lens=forward_batch.seq_lens[:batch_size],
+            total=sum(sequence_lens),
+        )
+        packed_k = pool.get_key_buffer(layer.layer_id).index_select(0, slots)
+        packed_v = pool.get_value_buffer(layer.layer_id).index_select(0, slots)
         if use_pyhip:
             output = self._pyhip_attention.forward(
                 q=q.contiguous(),
-                k=torch.cat(k_parts),
-                v=torch.cat(v_parts),
+                k=packed_k,
+                v=packed_v,
                 indices=topk_indices,
                 query_lens=extend_lens,
                 prefix_lens=prefix_lens,
@@ -1522,8 +1515,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
-            torch.cat(k_parts),
-            torch.cat(v_parts),
+            packed_k,
+            packed_v,
             topk_indices,
             cu_seqlens_q,
             cu_seqlens_k,
@@ -1545,6 +1538,22 @@ class QwenSparseAttnBackend(AttentionBackend):
         padded = output.new_zeros((num_rows, output.shape[1]))
         padded[: output.shape[0]].copy_(output)
         return padded
+
+    @staticmethod
+    def _packed_kv_slots(
+        *,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        total: int,
+    ) -> torch.Tensor:
+        # searchsorted is parallel over tokens; repeat_interleave serializes one
+        # long request. total is host-known, so nothing reads back from the device.
+        ends = torch.cumsum(seq_lens, 0)
+        tokens = torch.arange(total, device=seq_lens.device)
+        requests = torch.searchsorted(ends, tokens, right=True)
+        columns = tokens - (ends - seq_lens)[requests]
+        return req_to_token[req_pool_indices[requests].long(), columns]
 
     def _get_fa2_scratch(
         self,
