@@ -11,6 +11,7 @@ from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
@@ -650,6 +651,158 @@ def _verify_coins(
     return coins, coins_for_final_sampling
 
 
+def _renorm_target_probs_torch(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+) -> torch.Tensor:
+    """Apply top-k then top-p renormalization for the HIP Torch verifier."""
+    vocab_size = probs.shape[-1]
+    top_ks = top_ks.to(device=probs.device, dtype=torch.int64).view(-1)
+    top_ps = top_ps.to(device=probs.device, dtype=probs.dtype).view(-1)
+
+    need_top_k = torch.any(top_ks < vocab_size)
+    need_top_p = torch.any(top_ps < 1.0)
+    if not need_top_k and not need_top_p:
+        return probs
+
+    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    if need_top_k:
+        clamped_top_ks = top_ks.clamp(min=1, max=vocab_size)
+        ranks = torch.arange(vocab_size, device=probs.device).view(1, -1)
+        probs_sort = probs_sort.masked_fill(
+            ranks >= clamped_top_ks.view(-1, 1), 0.0
+        )
+        renorm = probs_sort.sum(dim=-1, keepdim=True)
+        probs_sort = probs_sort / renorm.clamp_min(
+            torch.finfo(probs_sort.dtype).tiny
+        )
+
+    if need_top_p:
+        probs_sum = torch.cumsum(probs_sort, dim=-1)
+        probs_sort = probs_sort.masked_fill(
+            (probs_sum - probs_sort) > top_ps.view(-1, 1), 0.0
+        )
+        renorm = probs_sort.sum(dim=-1, keepdim=True)
+        probs_sort = probs_sort / renorm.clamp_min(
+            torch.finfo(probs_sort.dtype).tiny
+        )
+
+    out = torch.zeros_like(probs)
+    out.scatter_(dim=-1, index=probs_idx, src=probs_sort)
+    return out
+
+
+def _sample_from_weights_with_coin(
+    weights: torch.Tensor,
+    coins: torch.Tensor,
+) -> torch.Tensor:
+    """Sample one token per row using pre-generated half-open [0, 1) coins."""
+    weights = weights.clamp_min(0.0)
+    sums = weights.sum(dim=-1, keepdim=True)
+    empty = sums.squeeze(-1) <= 0
+    if torch.any(empty):
+        weights = weights.clone()
+        weights[empty] = 0.0
+        weights[empty, -1] = 1.0
+        sums = weights.sum(dim=-1, keepdim=True)
+
+    cdf = torch.cumsum(weights, dim=-1)
+    thresholds = coins.to(device=weights.device, dtype=weights.dtype).view(-1, 1)
+    thresholds = thresholds * sums
+    sampled = (cdf <= thresholds).sum(dim=-1)
+    return sampled.clamp(max=weights.shape[-1] - 1).to(torch.int64)
+
+
+def _tree_speculative_sampling_target_only_topk1_torch(
+    *,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
+    threshold_single: float,
+    threshold_acc: float,
+) -> None:
+    """Target-only stochastic verification for a topk=1 EAGLE chain on HIP."""
+    bs, _ = candidates.shape
+    max_tree_depth = accept_index.shape[1]
+    device = candidates.device
+    row_ids = torch.arange(bs, device=device, dtype=torch.long)
+
+    threshold_acc = max(float(threshold_acc), 1e-9)
+    threshold_single = float(threshold_single)
+
+    accept_index.fill_(-1)
+    num_correct_drafts.zero_()
+    accept_index[:, 0] = retrieve_index[:, 0].to(torch.int32)
+
+    cur_index = torch.zeros((bs,), dtype=torch.long, device=device)
+    last_accepted_retrieve_idx = retrieve_index[:, 0].to(torch.long)
+    prob_acc = torch.zeros((bs,), dtype=target_probs.dtype, device=device)
+    active = torch.ones((bs,), dtype=torch.bool, device=device)
+
+    for depth in range(1, max_tree_depth):
+        next_index = retrieve_next_token[row_ids, cur_index].to(torch.long)
+        can_test = active & (next_index >= 0)
+        if not torch.any(can_test):
+            break
+
+        safe_next_index = next_index.clamp(min=0)
+        draft_token_ids = candidates[row_ids, safe_next_index].to(torch.long)
+        target_prob_single = target_probs[row_ids, cur_index, draft_token_ids]
+        prob_acc = torch.where(can_test, prob_acc + target_prob_single, prob_acc)
+
+        coins = uniform_samples[row_ids, cur_index].to(dtype=target_probs.dtype)
+        accept = can_test & (
+            (coins <= (prob_acc / threshold_acc))
+            | (target_prob_single >= threshold_single)
+        )
+
+        if torch.any(accept):
+            accept_rows = row_ids[accept]
+            accepted_retrieve_idx = retrieve_index[
+                accept_rows, safe_next_index[accept]
+            ].to(torch.long)
+            accepted_token_ids = draft_token_ids[accept].to(torch.int32)
+            predict[last_accepted_retrieve_idx[accept]] = accepted_token_ids
+            num_correct_drafts[accept] += 1
+            accept_index[accept, depth] = accepted_retrieve_idx.to(torch.int32)
+            last_accepted_retrieve_idx[accept] = accepted_retrieve_idx
+            cur_index[accept] = safe_next_index[accept]
+            prob_acc[accept] = 0.0
+
+        reject = can_test & ~accept
+        if torch.any(reject):
+            reject_rows = row_ids[reject]
+            draft_probs[
+                reject_rows, cur_index[reject], draft_token_ids[reject]
+            ] = target_prob_single[reject]
+            active[reject] = False
+
+        active = active & (next_index >= 0)
+
+    final_weights = target_probs[row_ids, cur_index]
+    accepted_all_drafts = num_correct_drafts == (max_tree_depth - 1)
+    if not torch.all(accepted_all_drafts):
+        final_weights = torch.where(
+            accepted_all_drafts.view(-1, 1),
+            final_weights,
+            (final_weights - draft_probs[row_ids, cur_index]).clamp_min(0.0),
+        )
+
+    sampled_ids = _sample_from_weights_with_coin(
+        final_weights,
+        uniform_samples_for_final_sampling,
+    ).to(torch.int32)
+    predict[last_accepted_retrieve_idx] = sampled_ids
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -727,7 +880,15 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
-    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
+    use_hip_py_stochastic_verify = (
+        _is_hip
+        and not sampling_info.is_all_greedy
+        and envs.SGLANG_MIMO_EAGLE_HIP_NONGREEDY_VERIFY.get()
+        and verify_input.tree_topk == 1
+    )
+    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_xpu or (
+        _is_hip and not use_hip_py_stochastic_verify
+    ):
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
@@ -756,6 +917,56 @@ def eagle_sample(
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
+    elif use_hip_py_stochastic_verify:
+        expanded_temperature = torch.repeat_interleave(
+            sampling_info.temperatures, verify_input.draft_token_num, dim=0
+        )
+        target_probs = F.softmax(next_token_logits / expanded_temperature, dim=-1)
+        maybe_detect_nan(target_probs, "v2 verify: hip target_probs after softmax")
+        target_probs = _renorm_target_probs_torch(
+            target_probs,
+            torch.repeat_interleave(
+                sampling_info.top_ks, verify_input.draft_token_num, dim=0
+            ),
+            torch.repeat_interleave(
+                sampling_info.top_ps, verify_input.draft_token_num, dim=0
+            ),
+        )
+        maybe_detect_nan(
+            target_probs, "v2 verify: hip target_probs after top-k/top-p"
+        )
+        target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
+        draft_probs = torch.zeros_like(target_probs)
+        coins, coins_for_final_sampling = _verify_coins(
+            sampling_info=sampling_info,
+            seq_lens=batch.seq_lens,
+            draft_token_num=verify_input.draft_token_num,
+            candidates=candidates,
+            device=device,
+        )
+        _tree_speculative_sampling_target_only_topk1_torch(
+            predict=predict,
+            accept_index=accept_index,
+            num_correct_drafts=num_correct_drafts,
+            candidates=candidates,
+            retrieve_index=verify_input.retrieve_index,
+            retrieve_next_token=verify_input.retrieve_next_token,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            uniform_samples=coins,
+            uniform_samples_for_final_sampling=coins_for_final_sampling,
+            threshold_single=get_spec().speculative_accept_threshold_single,
+            threshold_acc=get_spec().speculative_accept_threshold_acc,
+        )
+        tp_group = (
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_tp_group()
+        )
+        if tp_group.world_size > 1:
+            tp_group.broadcast(predict, src=0)
+            tp_group.broadcast(accept_index, src=0)
+            tp_group.broadcast(num_correct_drafts, src=0)
     else:
         from sgl_kernel import (
             top_k_renorm_prob,
