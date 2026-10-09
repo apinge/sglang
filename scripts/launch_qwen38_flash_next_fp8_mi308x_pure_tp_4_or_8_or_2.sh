@@ -81,7 +81,6 @@ printf 'GR read: installed PyHIP enabled=%s; TP=%s; AITER_MOE_PADDING_SIZE=%s\n'
   "${SGLANG_GR_READ_FLYDSL}" "${TP_SIZE}" "${AITER_MOE_PADDING_SIZE}"
 # export CUDA_VISIBLE_DEVICES=4,5,6,7
 # export HIP_VISIBLE_DEVICES=4,5,6,7
-
 command=(
   sglang serve
   --model-path "${MODEL_PATH}"
