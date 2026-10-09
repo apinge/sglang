@@ -1,4 +1,4 @@
-"""Correctness and graph replay for the opt-in gfx942 QSA decode path."""
+"""Correctness and automatic dispatch for the gfx942 QSA decode path."""
 
 from types import SimpleNamespace
 
@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn_decode import (
     _kernel_config,
     _kv_splits_heuristic,
     qsa_sparse_paged_gqa,
+    supports_sparse_paged_gqa,
 )
 from sglang.test.ci.ci_register import register_amd_ci
 
@@ -104,6 +105,7 @@ def assert_reference(actual, inputs):
         (8, 2051, None),
         (16, 2051, None),
         (32, 2051, None),
+        (128, 2051, None),
         (4, 2051, 1),
         (4, 2051, 8),
         (4, 2051, 16),
@@ -180,7 +182,6 @@ def test_graph_replay_refreshes_metadata_and_partials():
 def test_backend_dispatch_uses_real_pool_and_mtp_rows(monkeypatch):
     from sglang.srt.layers.attention import qwen_sparse_attn_backend as module
 
-    monkeypatch.setenv("SGLANG_QSA_SPARSE_IMPL", "pr2311")
     inputs = make_inputs(tokens=8)
     q, k, v, indices, table, requests, lengths = inputs
     pool = SimpleNamespace(get_key_buffer=lambda _: k, get_value_buffer=lambda _: v)
@@ -199,7 +200,7 @@ def test_backend_dispatch_uses_real_pool_and_mtp_rows(monkeypatch):
     monkeypatch.setattr(backend, "_resolve_metadata", lambda _: metadata)
 
     def reject_compact(*args, **kwargs):
-        pytest.fail("pr2311 unexpectedly entered legacy compact path")
+        pytest.fail("compatible input unexpectedly entered legacy compact path")
 
     monkeypatch.setattr(
         module, "qwen_sparse_kv_extraction_compact_triton", reject_compact
@@ -211,16 +212,41 @@ def test_backend_dispatch_uses_real_pool_and_mtp_rows(monkeypatch):
     assert backend._paged_gqa_workspace is not None
 
 
-def test_switch_defaults_and_validation(monkeypatch):
-    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
-        QwenSparseAttnBackend,
-    )
+@pytest.mark.parametrize(
+    "heads,kv_heads,dim,supported",
+    [
+        (12, 1, 256, True),
+        (24, 2, 128, True),
+        (32, 1, 128, True),
+        (33, 1, 128, False),
+        (3, 2, 128, False),
+        (12, 1, 64, False),
+        (0, 1, 128, False),
+        (12, 0, 128, False),
+    ],
+)
+def test_supported_head_layouts(heads, kv_heads, dim, supported):
+    q, k, v, *_ = make_inputs(heads=heads, kv_heads=kv_heads, dim=dim)
+    assert supports_sparse_paged_gqa(q, k, v) == supported
 
-    monkeypatch.delenv("SGLANG_QSA_SPARSE_IMPL", raising=False)
-    assert QwenSparseAttnBackend()._sparse_impl == "legacy"
-    monkeypatch.setenv("SGLANG_QSA_SPARSE_IMPL", "invalid")
-    with pytest.raises(ValueError, match="legacy or pr2311"):
-        QwenSparseAttnBackend()
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_unsupported_dtype(dtype):
+    q, k, v, *_ = make_inputs()
+    assert not supports_sparse_paged_gqa(q.to(dtype), k.to(dtype), v.to(dtype))
+
+
+def test_unsupported_device_arch_and_layout(monkeypatch):
+    from sglang.srt.layers.attention.qsa import sparse_attn_decode as module
+
+    q, k, v, *_ = make_inputs()
+    assert not supports_sparse_paged_gqa(q.cpu(), k, v)
+    assert not supports_sparse_paged_gqa(q, k, v.to("meta"))
+    assert not supports_sparse_paged_gqa(q, k.unsqueeze(0), v.unsqueeze(0))
+    assert not supports_sparse_paged_gqa(q, k, v[:, :, :128])
+    assert not supports_sparse_paged_gqa(q[:, :, :128], k, v)
+    monkeypatch.setattr(module, "_device_info", lambda _: ("gfx90a", 110))
+    assert not supports_sparse_paged_gqa(q, k, v)
 
 
 def test_mtp_heuristic_counts_query_rows():
@@ -231,14 +257,11 @@ def test_mtp_heuristic_counts_query_rows():
     assert _kernel_config(8, 1, 64, 20, 80) == (32, 2, 1, 0, 8)
 
 
-@pytest.mark.parametrize("impl", ["legacy", "pr2311", "fallback"])
-def test_legacy_new_and_fallback_outputs(monkeypatch, impl):
+@pytest.mark.parametrize("supported", [True, False])
+def test_automatic_dispatch_and_fallback_outputs(monkeypatch, supported):
     from sglang.srt.layers.attention import qwen_sparse_attn_backend as module
     from sglang.srt.layers.attention.qsa import sparse_attn_decode
 
-    monkeypatch.setenv(
-        "SGLANG_QSA_SPARSE_IMPL", "legacy" if impl == "legacy" else "pr2311"
-    )
     inputs = make_inputs(tokens=4)
     q, k, v, indices, table, requests, lengths = inputs
     # Legacy assumes physical slots from the allocator are valid.
@@ -248,7 +271,7 @@ def test_legacy_new_and_fallback_outputs(monkeypatch, impl):
     valid = (indices >= 0) & (indices < lengths[:, None])
     indices.copy_(torch.sort(torch.where(valid, indices, table.shape[1]), dim=1).values)
     indices.masked_fill_(indices >= table.shape[1], -1)
-    if impl == "fallback":
+    if not supported:
         monkeypatch.setattr(
             sparse_attn_decode, "supports_sparse_paged_gqa", lambda *args: False
         )
@@ -269,5 +292,5 @@ def test_legacy_new_and_fallback_outputs(monkeypatch, impl):
         q, layer, SimpleNamespace(req_pool_indices=requests), indices
     ).view_as(q)
     assert_reference(output, inputs)
-    assert bool(backend._fa2_scratch) == (impl != "pr2311")
-    assert (backend._paged_gqa_workspace is not None) == (impl == "pr2311")
+    assert bool(backend._fa2_scratch) == (not supported)
+    assert (backend._paged_gqa_workspace is not None) == supported

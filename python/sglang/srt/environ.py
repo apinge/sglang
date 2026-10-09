@@ -785,10 +785,6 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
-    # QSA decode and MTP paged attention: legacy packed path (default), or
-    # opt-in ATOM PR #2311 direct paged GQA on gfx942 BF16 token-slot caches.
-    # Ordinary prefill is unchanged; unsupported layouts use the legacy path.
-    SGLANG_QSA_SPARSE_IMPL = EnvStr("legacy")
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom

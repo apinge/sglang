@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Opt-in MI300 QSA decode with direct token-slot loads and split-K reduction.
+"""MI300 QSA decode with direct token-slot loads and split-K reduction.
 
 Adapted from ROCm/ATOM PR #2311, commit
 b97551f1d03a47027d286a5846a63a888acad237,
