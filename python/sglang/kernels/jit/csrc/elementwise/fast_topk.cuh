@@ -19,8 +19,8 @@ namespace sglang {
 namespace fast_topk_detail {
 
 constexpr uint32_t kThreadsPerBlock = 1024;
-// Each radix pass needs at most ~kTopK candidates in the threshold bin, so
-// 4K entries per round (2 rounds = 8K entries = 32KB) is sufficient.
+// Stage up to 4K threshold-bin candidates per radix round in the common path.
+// Concentrated rows that exceed this capacity use the exact full-row rescan.
 constexpr size_t kSmemBytes = 8 * 1024 * sizeof(uint32_t);  // 32KB
 
 struct FastTopKParams {
@@ -43,6 +43,24 @@ SGL_DEVICE auto convert_to_uint32(float x) -> uint32_t {
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
+#if defined(USE_ROCM) && defined(__gfx942__)
+template <int kDppCtrl, int kRowMask, int kBankMask>
+SGL_DEVICE auto dpp_add(int value) -> int {
+  const auto moved = __builtin_amdgcn_update_dpp(0, value, kDppCtrl, kRowMask, kBankMask, false);
+  return value + moved;
+}
+
+SGL_DEVICE auto wave64_inclusive_sum(int value) -> int {
+  value = dpp_add<0x111, 0xf, 0xf>(value);  // row_shr:1
+  value = dpp_add<0x112, 0xf, 0xf>(value);  // row_shr:2
+  value = dpp_add<0x114, 0xf, 0xe>(value);  // row_shr:4
+  value = dpp_add<0x118, 0xf, 0xc>(value);  // row_shr:8
+  value = dpp_add<0x142, 0xa, 0xf>(value);  // row_bcast:15
+  value = dpp_add<0x143, 0xc, 0xf>(value);  // row_bcast:31
+  return value;
+}
+#endif
+
 // When length <= kTopK, write the indices directly.
 template <int kTopK>
 SGL_DEVICE void naive_topk(const float* __restrict__ score, int32_t* __restrict__ indice, int32_t length) {
@@ -63,7 +81,14 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
   alignas(128) __shared__ int s_histogram_buf[2][RADIX + 128];
   alignas(128) __shared__ int s_counter;
   alignas(128) __shared__ int s_threshold_bin_id;
+  alignas(128) __shared__ int s_above_threshold;
+  alignas(128) __shared__ int s_last_remain;
+  alignas(128) __shared__ int s_prefix_bins[4];
   alignas(128) __shared__ int s_num_input[2];
+#if defined(USE_ROCM) && defined(__gfx942__)
+  // The radix histogram has 256 entries. One native wave64 scans four bins
+  // per lane instead of involving the whole CTA in every scan round.
+#endif
 
   auto& s_histogram = s_histogram_buf[0];
   // allocate for two rounds
@@ -71,17 +96,43 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
 
   const int tx = threadIdx.x;
 
-  // stage 1: 8bit coarse histogram
-  if (tx < RADIX + 1) s_histogram[tx] = 0;
-  __syncthreads();
-
-  for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-    const auto bin = convert_to_uint8(input[idx + row_start]);
-    ::atomicAdd(&s_histogram[bin], 1);
-  }
-  __syncthreads();
-
-  const auto run_cumsum = [&] {
+  const auto run_cumsum = [&](int total_input, int next_input, bool reset_counter, int prefix_round) {
+#if defined(USE_ROCM) && defined(__gfx942__)
+    constexpr int WAVE_SIZE = 64;
+    constexpr int BINS_PER_LANE = RADIX / WAVE_SIZE;
+    const auto lane = tx % WAVE_SIZE;
+    if (tx < WAVE_SIZE) {
+      // Reverse the lane-to-bin mapping so a low lane owns higher bins. A
+      // wave-wide inclusive prefix then becomes the required descending sum.
+      const auto base = RADIX - (tx + 1) * BINS_PER_LANE;
+      int values[BINS_PER_LANE];
+#pragma unroll
+      for (int i = 0; i < BINS_PER_LANE; ++i) {
+        values[i] = s_histogram[base + i];
+      }
+#pragma unroll
+      for (int i = BINS_PER_LANE - 2; i >= 0; --i) {
+        values[i] += values[i + 1];
+      }
+      const auto local_total = values[0];
+      const auto inclusive = wave64_inclusive_sum(local_total);
+      const auto preceding = inclusive - local_total;
+#pragma unroll
+      for (int i = 0; i < BINS_PER_LANE; ++i) {
+        const auto suffix = preceding + values[i];
+        const auto above = preceding + (i + 1 < BINS_PER_LANE ? values[i + 1] : 0);
+        if (suffix > topk && above <= topk) {
+          s_threshold_bin_id = base + i;
+          s_above_threshold = above;
+          s_num_input[next_input] = 0;
+          s_last_remain = topk - above;
+          if (prefix_round >= 0) s_prefix_bins[prefix_round] = base + i;
+          if (reset_counter) s_counter = 0;
+        }
+      }
+    }
+    __syncthreads();
+#else
 #pragma unroll 8
     for (int i = 0; i < 8; ++i) {
       static_assert(1 << 8 == RADIX);
@@ -96,18 +147,38 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
       }
       __syncthreads();
     }
+#endif
   };
 
-  run_cumsum();
-  if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
-    s_threshold_bin_id = tx;
-    s_num_input[0] = 0;
-    s_counter = 0;
+  // stage 1: 8bit coarse histogram
+  if (tx < RADIX + 1) s_histogram[tx] = 0;
+  __syncthreads();
+
+  for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+    const auto bin = convert_to_uint8(input[idx + row_start]);
+    ::atomicAdd(&s_histogram[bin], 1);
   }
   __syncthreads();
 
+  run_cumsum(length, 0, true, -1);
+#if !defined(USE_ROCM) || !defined(__gfx942__)
+  if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
+    s_threshold_bin_id = tx;
+    s_above_threshold = s_histogram[tx + 1];
+    s_num_input[0] = 0;
+    s_last_remain = topk - s_above_threshold;
+    s_counter = 0;
+  }
+  __syncthreads();
+#endif
+
   const auto threshold_bin = s_threshold_bin_id;
+  const auto coarse_threshold_bin = threshold_bin;
+#if defined(USE_ROCM) && defined(__gfx942__)
+  topk -= s_above_threshold;
+#else
   topk -= s_histogram[threshold_bin + 1];
+#endif
 
   if (topk == 0) {
     for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
@@ -117,10 +188,14 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
         index[pos] = idx;
       }
     }
+#if !defined(USE_ROCM) || !defined(__gfx942__)
     __syncthreads();
+#endif
     return;
   } else {
+#if !defined(USE_ROCM) || !defined(__gfx942__)
     __syncthreads();
+#endif
     if (tx < RADIX + 1) {
       s_histogram[tx] = 0;
     }
@@ -146,26 +221,150 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
     __syncthreads();
   }
 
-  // stage 2: refine with 8bit radix passes
-#pragma unroll 4
-  for (int round = 0; round < 4; ++round) {
-    __shared__ int s_last_remain;
-    const auto r_idx = round % 2;
-
-    // clip here to prevent overflow
-    const auto _raw_num_input = s_num_input[r_idx];
-    const auto num_input = (_raw_num_input < int(SMEM_INPUT_SIZE)) ? _raw_num_input : int(SMEM_INPUT_SIZE);
-
-    run_cumsum();
-    if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
-      s_threshold_bin_id = tx;
-      s_num_input[r_idx ^ 1] = 0;
-      s_last_remain = topk - s_histogram[tx + 1];
+  // A concentrated row can put more candidates in the coarse threshold bin
+  // than fit in the fixed shared-memory staging buffer. The old path silently
+  // dropped the overflow and refined an incomplete subset. Rebuild the first
+  // exact histogram from the full row; later rounds continue rescanning only
+  // when this overflow flag is set.
+  const bool overflow = s_num_input[0] > int(SMEM_INPUT_SIZE);
+  if (overflow) {
+    if (tx < RADIX + 1) s_histogram[tx] = 0;
+    __syncthreads();
+    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+      const auto raw_input = input[idx + row_start];
+      if (static_cast<int>(convert_to_uint8(raw_input)) == coarse_threshold_bin) {
+        const auto sub_bin = (convert_to_uint32(raw_input) >> 24) & 0xFF;
+        ::atomicAdd(&s_histogram[sub_bin], 1);
+      }
     }
     __syncthreads();
+    // Exact slow path: every refinement round rescans the full row under the
+    // coarse bin and exact-byte prefix selected by earlier rounds. Keeping it
+    // separate prevents the overflow machinery from bloating the common path.
+#pragma unroll 4
+    for (int round = 0; round < 4; ++round) {
+      const auto r_idx = round % 2;
+      const auto num_input = s_num_input[r_idx];
+      run_cumsum(num_input, r_idx ^ 1, false, round);
+#if !defined(USE_ROCM) || !defined(__gfx942__)
+      if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
+        s_threshold_bin_id = tx;
+        s_above_threshold = s_histogram[tx + 1];
+        s_num_input[r_idx ^ 1] = 0;
+        s_last_remain = topk - s_above_threshold;
+        s_prefix_bins[round] = tx;
+      }
+      __syncthreads();
+#endif
+
+      const auto threshold_bin = s_threshold_bin_id;
+#if defined(USE_ROCM) && defined(__gfx942__)
+      topk -= s_above_threshold;
+#else
+      topk -= s_histogram[threshold_bin + 1];
+#endif
+
+      if (topk == 0) {
+        for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+          const auto raw_input = input[idx + row_start];
+          if (static_cast<int>(convert_to_uint8(raw_input)) != coarse_threshold_bin) continue;
+          const auto key = convert_to_uint32(raw_input);
+          bool prefix_matches = true;
+#pragma unroll
+          for (int prefix_round = 0; prefix_round < 4; ++prefix_round) {
+            if (prefix_round >= round) break;
+            const auto prefix = (key >> (24 - 8 * prefix_round)) & 0xFF;
+            if (prefix != static_cast<uint32_t>(s_prefix_bins[prefix_round])) {
+              prefix_matches = false;
+              break;
+            }
+          }
+          if (!prefix_matches) continue;
+          const auto offset = 24 - round * 8;
+          const auto bin = (key >> offset) & 0xFF;
+          if (bin > threshold_bin) {
+            const auto pos = ::atomicAdd(&s_counter, 1);
+            index[pos] = idx;
+          }
+        }
+#if !defined(USE_ROCM) || !defined(__gfx942__)
+        __syncthreads();
+#endif
+        return;
+      }
+#if !defined(USE_ROCM) || !defined(__gfx942__)
+      __syncthreads();
+#endif
+      if (tx < RADIX + 1) {
+        s_histogram[tx] = 0;
+      }
+      __syncthreads();
+      for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+        const auto raw_input = input[idx + row_start];
+        if (static_cast<int>(convert_to_uint8(raw_input)) != coarse_threshold_bin) continue;
+        const auto key = convert_to_uint32(raw_input);
+        bool prefix_matches = true;
+#pragma unroll
+        for (int prefix_round = 0; prefix_round < 4; ++prefix_round) {
+          if (prefix_round >= round) break;
+          const auto prefix = (key >> (24 - 8 * prefix_round)) & 0xFF;
+          if (prefix != static_cast<uint32_t>(s_prefix_bins[prefix_round])) {
+            prefix_matches = false;
+            break;
+          }
+        }
+        if (!prefix_matches) continue;
+        const auto offset = 24 - round * 8;
+        const auto bin = (key >> offset) & 0xFF;
+        if (bin > threshold_bin) {
+          const auto pos = ::atomicAdd(&s_counter, 1);
+          index[pos] = idx;
+        } else if (bin == threshold_bin) {
+          if (round == 3) {
+            const auto pos = ::atomicAdd(&s_last_remain, -1);
+            if (pos > 0) {
+              index[kTopK - pos] = idx;
+            }
+          } else {
+            ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
+            const auto sub_bin = (key >> (offset - 8)) & 0xFF;
+            ::atomicAdd(&s_histogram[sub_bin], 1);
+          }
+        }
+      }
+#if defined(USE_ROCM) && defined(__gfx942__)
+      if (round < 3) __syncthreads();
+#else
+      __syncthreads();
+#endif
+    }
+    return;
+  }
+
+  // Common stage-2 path: all threshold candidates fit in shared memory.
+#pragma unroll 4
+  for (int round = 0; round < 4; ++round) {
+    const auto r_idx = round % 2;
+    const auto num_input = s_num_input[r_idx];
+
+    run_cumsum(num_input, r_idx ^ 1, false, round);
+#if !defined(USE_ROCM) || !defined(__gfx942__)
+    if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
+      s_threshold_bin_id = tx;
+      s_above_threshold = s_histogram[tx + 1];
+      s_num_input[r_idx ^ 1] = 0;
+      s_last_remain = topk - s_above_threshold;
+      s_prefix_bins[round] = tx;
+    }
+    __syncthreads();
+#endif
 
     const auto threshold_bin = s_threshold_bin_id;
+#if defined(USE_ROCM) && defined(__gfx942__)
+    topk -= s_above_threshold;
+#else
     topk -= s_histogram[threshold_bin + 1];
+#endif
 
     if (topk == 0) {
       for (int i = tx; i < num_input; i += BLOCK_SIZE) {
@@ -177,42 +376,47 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
           index[pos] = idx;
         }
       }
+#if !defined(USE_ROCM) || !defined(__gfx942__)
       __syncthreads();
+#endif
       break;
-    } else {
-      __syncthreads();
-      if (tx < RADIX + 1) {
-        s_histogram[tx] = 0;
-      }
-      __syncthreads();
-      for (int i = tx; i < num_input; i += BLOCK_SIZE) {
-        const auto idx = s_input_idx[r_idx][i];
-        const auto raw_input = input[idx + row_start];
-        const auto offset = 24 - round * 8;
-        const auto bin = (convert_to_uint32(raw_input) >> offset) & 0xFF;
-        if (bin > threshold_bin) {
-          const auto pos = ::atomicAdd(&s_counter, 1);
-          index[pos] = idx;
-        } else if (bin == threshold_bin) {
-          if (round == 3) {
-            const auto pos = ::atomicAdd(&s_last_remain, -1);
-            if (pos > 0) {
-              index[kTopK - pos] = idx;
-            }
-          } else {
-            const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
-            if (pos < int(SMEM_INPUT_SIZE)) {
-              // fuse the histogram computation here
-              s_input_idx[r_idx ^ 1][pos] = idx;
-              const auto bin = convert_to_uint32(raw_input);
-              const auto sub_bin = (bin >> (offset - 8)) & 0xFF;
-              ::atomicAdd(&s_histogram[sub_bin], 1);
-            }
+    }
+#if !defined(USE_ROCM) || !defined(__gfx942__)
+    __syncthreads();
+#endif
+    if (tx < RADIX + 1) {
+      s_histogram[tx] = 0;
+    }
+    __syncthreads();
+    for (int i = tx; i < num_input; i += BLOCK_SIZE) {
+      const auto idx = s_input_idx[r_idx][i];
+      const auto raw_input = input[idx + row_start];
+      const auto offset = 24 - round * 8;
+      const auto bin = (convert_to_uint32(raw_input) >> offset) & 0xFF;
+      if (bin > threshold_bin) {
+        const auto pos = ::atomicAdd(&s_counter, 1);
+        index[pos] = idx;
+      } else if (bin == threshold_bin) {
+        if (round == 3) {
+          const auto pos = ::atomicAdd(&s_last_remain, -1);
+          if (pos > 0) {
+            index[kTopK - pos] = idx;
+          }
+        } else {
+          const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
+          if (pos < int(SMEM_INPUT_SIZE)) {
+            s_input_idx[r_idx ^ 1][pos] = idx;
+            const auto sub_bin = (convert_to_uint32(raw_input) >> (offset - 8)) & 0xFF;
+            ::atomicAdd(&s_histogram[sub_bin], 1);
           }
         }
       }
-      __syncthreads();
     }
+#if defined(USE_ROCM) && defined(__gfx942__)
+    if (round < 3) __syncthreads();
+#else
+    __syncthreads();
+#endif
   }
 }
 
@@ -252,7 +456,7 @@ struct FastTopKKernel {
 
   static void
   run(const tvm::ffi::TensorView score,
-      const tvm::ffi::TensorView row_starts,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> row_starts,
       const tvm::ffi::TensorView indices,
       const tvm::ffi::TensorView lengths) {
     using namespace host;
@@ -260,29 +464,32 @@ struct FastTopKKernel {
     auto L = SymbolicSize{"length"};
     auto S = SymbolicSize{"input_stride"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
 
     TensorMatcher({B, L})  // score
         .with_strides({S, 1})
         .with_dtype<fp32_t>()
-        .with_device(device)
+        .with_device<kDLGPU>(device)
         .verify(score);
-    TensorMatcher({B})  // row_starts
-        .with_dtype<int32_t>()
-        .with_device(device)
-        .verify(row_starts);
+    const int32_t* row_starts_ptr = nullptr;
+    if (row_starts.has_value()) {
+      TensorMatcher({B})  // row_starts
+          .with_dtype<int32_t>()
+          .with_device<kDLGPU>(device)
+          .verify(row_starts.value());
+      row_starts_ptr = static_cast<const int32_t*>(row_starts.value().data_ptr());
+    }
     TensorMatcher({B, kTopK})  // indices
         .with_dtype<int32_t>()
-        .with_device(device)
+        .with_device<kDLGPU>(device)
         .verify(indices);
     TensorMatcher({B})  // lengths
         .with_dtype<int32_t>()
-        .with_device(device)
+        .with_device<kDLGPU>(device)
         .verify(lengths);
 
     const auto params = fast_topk_detail::FastTopKParams{
         .input = static_cast<const float*>(score.data_ptr()),
-        .row_starts = static_cast<const int32_t*>(row_starts.data_ptr()),
+        .row_starts = row_starts_ptr,
         .indices = static_cast<int32_t*>(indices.data_ptr()),
         .lengths = static_cast<const int32_t*>(lengths.data_ptr()),
         .input_stride = S.unwrap(),

@@ -12,7 +12,7 @@ never need the host.
   plus static dummy-tail rows.
 * ``_qsa_graph_row_metadata_kernel`` (one program per row) — compressed
   lengths, the boundary write slot (last raw slot // ratio; non-boundary
-  rows keep the inert reserved slot 0), the row's page table of full-KV
+  rows keep the reserved slot-0 no-op sentinel), the row's page table of full-KV
   page ids, and the layer-independent indexer inputs (logical position,
   pending-ring state slot, trailing-group member ring slots).
 
@@ -141,8 +141,8 @@ def _qsa_graph_row_metadata_kernel(
     # DSV4-style compressed addressing: the page-aligned full-KV allocator
     # keeps every compression group contiguous inside one page, so the
     # group's compressed slot is any of its raw slots floor-divided by the
-    # ratio. Non-boundary rows keep the inert reserved slot 0 (full slot 0
-    # is the pools' padding slot).
+    # ratio. Non-boundary rows keep the reserved slot-0 no-op sentinel (full
+    # slot 0 is the pools' padding slot); every active destination is >= 1.
     boundary = (seq_len > 0) & (seq_len % RATIO == 0)
     write_loc = tl.where(boundary, last_loc // RATIO, 0)
     tl.store(write_locs_ptr + row, write_loc)

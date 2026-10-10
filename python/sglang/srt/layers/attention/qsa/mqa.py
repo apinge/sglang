@@ -9,8 +9,10 @@ import math
 from typing import Optional
 
 import torch
+import triton
+import triton.language as tl
 
-from sglang.srt.utils.common import is_hip
+from sglang.srt.utils.common import is_gfx942_supported, is_hip
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -110,6 +112,187 @@ def torch_qsa_mqa_decode(
     if copy_len:
         logits[:, :copy_len] = scores[:, :copy_len]
     return logits
+
+
+@triton.jit
+def _triton_qsa_mqa_decode_kernel(
+    q_ptr,
+    k_cache_ptr,
+    page_table_ptr,
+    context_lens_ptr,
+    logits_ptr,
+    max_model_len,
+    max_pages,
+    num_cache_pages,
+    scale,
+    stride_q_batch: tl.int64,
+    stride_q_head: tl.constexpr,
+    stride_q_dim: tl.constexpr,
+    stride_k_page: tl.int64,
+    stride_k_token: tl.constexpr,
+    stride_k_dim: tl.constexpr,
+    stride_page_table_batch: tl.constexpr,
+    stride_page_table_page: tl.constexpr,
+    stride_logits_batch: tl.int64,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK_HEADS: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    BLOCK_KEYS: tl.constexpr,
+    CLEAN_TAIL: tl.constexpr,
+    SKIP_FULL_TAIL: tl.constexpr,
+):
+    """Compute decode logits directly from the paged compressed-K cache."""
+
+    batch = tl.program_id(0)
+    block_start = tl.program_id(1) * BLOCK_KEYS
+    positions = block_start + tl.arange(0, BLOCK_KEYS)
+    context_len = tl.load(context_lens_ptr + batch).to(tl.int64)
+    skip_full_tail = (block_start >= context_len) & SKIP_FULL_TAIL
+    if skip_full_tail:
+        if CLEAN_TAIL:
+            tl.store(
+                logits_ptr + batch * stride_logits_batch + positions,
+                -float("inf"),
+                mask=positions < max_model_len,
+            )
+    else:
+        head_offsets = tl.arange(0, BLOCK_HEADS)[:, None]
+        dim_offsets = tl.arange(0, BLOCK_DIM)[None, :]
+        q = tl.load(
+            q_ptr
+            + batch * stride_q_batch
+            + head_offsets * stride_q_head
+            + dim_offsets * stride_q_dim,
+            mask=(head_offsets < NUM_HEADS) & (dim_offsets < HEAD_DIM),
+            other=0.0,
+        )
+        q = q.to(tl.bfloat16)
+
+        logical_page = positions // PAGE_SIZE
+        table_valid = (positions < max_model_len) & (logical_page < max_pages)
+        page = tl.load(
+            page_table_ptr
+            + batch * stride_page_table_batch
+            + logical_page * stride_page_table_page,
+            mask=table_valid,
+            other=-1,
+        ).to(tl.int64)
+        page_valid = (page >= 0) & (page < num_cache_pages)
+        valid = table_valid & (positions < context_len) & page_valid
+        safe_page = tl.where(page_valid, page, 0)
+        page_offset = positions % PAGE_SIZE
+        k_dim_offsets = tl.arange(0, BLOCK_DIM)[:, None]
+        k = tl.load(
+            k_cache_ptr
+            + safe_page[None, :] * stride_k_page
+            + page_offset[None, :] * stride_k_token
+            + k_dim_offsets * stride_k_dim,
+            mask=valid[None, :] & (k_dim_offsets < HEAD_DIM),
+            other=0.0,
+        )
+        k = k.to(tl.bfloat16)
+        scores = tl.dot(q, k)
+        logits = tl.sum(tl.maximum(scores, 0.0), axis=0) / scale
+        tl.store(
+            logits_ptr + batch * stride_logits_batch + positions,
+            tl.where(valid, logits, -float("inf")),
+            mask=positions < max_model_len,
+        )
+
+
+def _launch_triton_qsa_mqa_decode(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    max_model_len: int,
+    score_scale: Optional[float] = None,
+    *,
+    clean_tail: bool,
+    skip_full_tail: bool = True,
+) -> torch.Tensor:
+    """Launch direct-paged QSA decode with in-kernel Q/K dtype alignment."""
+
+    _validate_decode_inputs(q, k_cache, page_table, context_lens)
+    if (
+        q.dtype not in (torch.bfloat16, torch.float16)
+        or k_cache.dtype != torch.bfloat16
+    ):
+        raise ValueError(
+            "Triton QSA decode requires BF16/FP16 Q and a BF16 compressed-K cache; "
+            f"got q={q.dtype}, k_cache={k_cache.dtype}"
+        )
+    if not q.is_cuda or not k_cache.is_cuda or q.device != k_cache.device:
+        raise ValueError("Triton QSA decode requires Q and K cache on the same GPU")
+    if page_table.dtype not in (torch.int32, torch.int64):
+        raise ValueError("Triton QSA decode page table must be int32 or int64")
+    if context_lens.dtype not in (torch.int32, torch.int64):
+        raise ValueError("Triton QSA decode context lengths must be int32 or int64")
+    batch, heads, head_dim = q.shape
+    logits = torch.empty((batch, max_model_len), dtype=torch.float32, device=q.device)
+    if not batch or not max_model_len:
+        return logits
+    q = q.contiguous()
+    page_table = page_table.to(device=q.device).contiguous()
+    context_lens = context_lens.to(device=q.device).contiguous()
+    block_keys = 32
+    _triton_qsa_mqa_decode_kernel[(batch, triton.cdiv(max_model_len, block_keys))](
+        q,
+        k_cache,
+        page_table,
+        context_lens,
+        logits,
+        max_model_len,
+        page_table.shape[1],
+        k_cache.shape[0],
+        float(score_scale or math.sqrt(head_dim)),
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(3),
+        page_table.stride(0),
+        page_table.stride(1),
+        logits.stride(0),
+        NUM_HEADS=heads,
+        HEAD_DIM=head_dim,
+        PAGE_SIZE=k_cache.shape[1],
+        BLOCK_HEADS=triton.next_power_of_2(heads),
+        BLOCK_DIM=triton.next_power_of_2(head_dim),
+        BLOCK_KEYS=block_keys,
+        CLEAN_TAIL=clean_tail,
+        SKIP_FULL_TAIL=skip_full_tail,
+        num_warps=1,
+        num_stages=1,
+        waves_per_eu=4,
+        matrix_instr_nonkdim=16,
+    )
+    return logits
+
+
+def triton_qsa_mqa_decode(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    max_model_len: int,
+    score_scale: Optional[float] = None,
+) -> torch.Tensor:
+    """ROCm direct-paged QSA decode without materializing gathered K."""
+
+    return _launch_triton_qsa_mqa_decode(
+        q,
+        k_cache,
+        page_table,
+        context_lens,
+        max_model_len,
+        score_scale,
+        clean_tail=True,
+        skip_full_tail=True,
+    )
 
 
 if HAS_TILELANG:
@@ -407,7 +590,26 @@ def qsa_mqa_decode(
     context_lens: torch.Tensor,
     max_model_len: int,
     score_scale: Optional[float] = None,
+    *,
+    _clean_tail: bool = True,
 ) -> torch.Tensor:
+    if (
+        q.is_cuda
+        and is_hip()
+        and is_gfx942_supported()
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and k_cache.dtype == torch.bfloat16
+    ):
+        return _launch_triton_qsa_mqa_decode(
+            q,
+            k_cache,
+            page_table,
+            context_lens,
+            max_model_len,
+            score_scale,
+            clean_tail=_clean_tail,
+            skip_full_tail=True,
+        )
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
             q, k_cache, page_table, context_lens, max_model_len, score_scale
@@ -425,4 +627,5 @@ __all__ = [
     "tilelang_qsa_mqa_prefill",
     "torch_qsa_mqa_decode",
     "torch_qsa_mqa_prefill",
+    "triton_qsa_mqa_decode",
 ]

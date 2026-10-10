@@ -10,16 +10,20 @@
 // qsa_index_k_compress_kernel replaces, per completed compress group,
 //   gather group -> fp32 mean -> round to storage dtype -> GemmaRMSNorm
 //   -> MRoPE(group-start position) -> set_qsa_compressed_k_buffer
-// with one warp per group.
+// with one warp per group. Compressed-cache slot 0 is reserved: on ROCm a
+// write_locs entry of 0 is a no-op sentinel, and active writes use slots >= 1.
 //
-// Numerics follow the eager chain step by step so results are bit-identical:
+// Numerics preserve the eager chain's operation boundaries:
 //   - norm: fp32 sum of squares, rsqrt(mean + eps), x * nf * (1 + w) rounded
-//     once to the storage dtype (matches sgl_kernel gemma_rmsnorm);
+//     once to the storage dtype;
 //   - rope: cos/sin are rounded to the storage dtype first, every elementary
 //     multiply/add is rounded to the storage dtype, matching PyTorch's
 //     opmath (fp32) + per-op rounding on 2-byte tensors;
 //   - mean: fp32 sequential accumulation over the group, scaled by 1/ratio,
 //     rounded to the storage dtype before the norm reads it.
+// CUDA and HIP reductions can still use different addition orders, so compare
+// low-precision outputs and downstream selections with tolerances rather than
+// requiring cross-backend bit identity.
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
@@ -75,20 +79,21 @@ SGL_DEVICE float eager_round<fp16_t>(float x) {
  * host). The cos/sin cache row is [cos(half), sin(half)] of width rotary_dim.
  *
  * \tparam T          Storage element type: bf16_t | fp16_t.
+ * \tparam CacheT     RoPE-cache element type: bf16_t | fp16_t | fp32_t.
  * \tparam kHeadDim   Compile-time head dimension (multiple of 32).
  * \tparam kIsNeox    true -> NeoX pairing (d, d+half); false -> GPT-J (2i, 2i+1).
  * \param smem_row    Normed row [kHeadDim], one warp cooperates.
  * \param out_row     Destination row [kHeadDim].
- * \param cos_sin_cache [num_positions, rotary_dim] fp32 cache.
+ * \param cos_sin_cache [num_positions, rotary_dim] CacheT cache.
  * \param axis_map    [rotary_dim/2] int32 position-axis selector per pair.
  * \param pos         Resolved per-axis positions for this token (>= 3 entries).
  * \param rotary_dim  Rotated prefix length; tail dims pass through.
  */
-template <typename T, int kHeadDim, bool kIsNeox>
+template <typename T, typename CacheT, int kHeadDim, bool kIsNeox>
 SGL_DEVICE void qsa_mrope_apply(
     const T* __restrict__ smem_row,
     T* __restrict__ out_row,
-    const float* __restrict__ cos_sin_cache,
+    const CacheT* __restrict__ cos_sin_cache,
     const int32_t* __restrict__ axis_map,
     const int64_t* pos,
     const int32_t rotary_dim) {
@@ -106,17 +111,17 @@ SGL_DEVICE void qsa_mrope_apply(
     if constexpr (kIsNeox) {
       if (d < half) {
         const int32_t p = d + half;
-        const float* row = cos_sin_cache + pos[axis_map[d]] * rotary_dim;
-        const float c = eager_round<T>(row[d]);
-        const float s = eager_round<T>(row[half + d]);
+        const CacheT* row = cos_sin_cache + pos[axis_map[d]] * rotary_dim;
+        const float c = eager_round<T>(static_cast<float>(row[d]));
+        const float s = eager_round<T>(static_cast<float>(row[half + d]));
         const float nd = static_cast<float>(smem_row[d]);
         const float np = static_cast<float>(smem_row[p]);
         o = DTypeTrait<T>::from(eager_round<T>(nd * c) - eager_round<T>(np * s));
       } else if (d < rotary_dim) {
         const int32_t p = d - half;
-        const float* row = cos_sin_cache + pos[axis_map[p]] * rotary_dim;
-        const float c = eager_round<T>(row[p]);
-        const float s = eager_round<T>(row[half + p]);
+        const CacheT* row = cos_sin_cache + pos[axis_map[p]] * rotary_dim;
+        const float c = eager_round<T>(static_cast<float>(row[p]));
+        const float s = eager_round<T>(static_cast<float>(row[half + p]));
         const float nd = static_cast<float>(smem_row[d]);
         const float np = static_cast<float>(smem_row[p]);
         o = DTypeTrait<T>::from(eager_round<T>(nd * c) + eager_round<T>(np * s));
@@ -126,9 +131,9 @@ SGL_DEVICE void qsa_mrope_apply(
     } else {
       if (d < rotary_dim) {
         const int32_t p = d / 2;
-        const float* row = cos_sin_cache + pos[axis_map[p]] * rotary_dim;
-        const float c = eager_round<T>(row[p]);
-        const float s = eager_round<T>(row[half + p]);
+        const CacheT* row = cos_sin_cache + pos[axis_map[p]] * rotary_dim;
+        const float c = eager_round<T>(static_cast<float>(row[p]));
+        const float s = eager_round<T>(static_cast<float>(row[half + p]));
         const int32_t q = (d % 2 == 0) ? d + 1 : d - 1;
         const float nd = static_cast<float>(smem_row[d]);
         const float nq = static_cast<float>(smem_row[q]);
@@ -204,7 +209,7 @@ struct QsaIndexQPrepParams {
   const void* qk;                 // [tokens, (num_q_heads + 1) * kHeadDim]
   void* q_out;                    // [tokens, q_heads_padded, kHeadDim]
   const void* weight;             // [kHeadDim]
-  const float* cos_sin_cache;     // [positions_capacity, rotary_dim]
+  const void* cos_sin_cache;      // [positions_capacity, rotary_dim]
   const int32_t* axis_map;        // [rotary_dim / 2]
   const int64_t* positions;       // [num_axes, tokens] (row stride may exceed tokens)
   const int64_t* cache_loc;       // [tokens]
@@ -223,7 +228,7 @@ struct QsaIndexQPrepParams {
  * head, zero-fill of padded heads, raw token-K store and RoPE-position store.
  * One CTA (4 warps) per token; one warp per query head.
  */
-template <typename T, int kHeadDim, bool kIsNeox, bool kUsePDL>
+template <typename T, typename CacheT, int kHeadDim, bool kIsNeox, bool kUsePDL>
 __global__ __launch_bounds__(128) void qsa_index_q_prep_kernel(const QsaIndexQPrepParams __grid_constant__ params) {
   using namespace device;
   constexpr int kPerLane = kHeadDim / kWarpThreads;
@@ -249,8 +254,13 @@ __global__ __launch_bounds__(128) void qsa_index_q_prep_kernel(const QsaIndexQPr
     if (h < params.num_q_heads) {
       const T* x_row = static_cast<const T*>(params.qk) + qk_row + h * kHeadDim;
       qsa_gemma_norm_row<T, kHeadDim>(x_row, static_cast<const T*>(params.weight), params.eps, smem_rows[warp]);
-      qsa_mrope_apply<T, kHeadDim, kIsNeox>(
-          smem_rows[warp], out_row, params.cos_sin_cache, params.axis_map, pos, params.rotary_dim);
+      qsa_mrope_apply<T, CacheT, kHeadDim, kIsNeox>(
+          smem_rows[warp],
+          out_row,
+          static_cast<const CacheT*>(params.cos_sin_cache),
+          params.axis_map,
+          pos,
+          params.rotary_dim);
     } else {
       vec_t zv;
       zv.fill(DTypeTrait<T>::from(0.0f));
@@ -278,23 +288,28 @@ struct QsaIndexKCompressParams {
   const void* key_state_buffer;         // [slots, kHeadDim]
   const int32_t* group_locs;            // [groups, compress_ratio]
   const int64_t* rope_position_buffer;  // [slots, 3]
-  const float* cos_sin_cache;           // [positions_capacity, rotary_dim]
+  const void* cos_sin_cache;            // [positions_capacity, rotary_dim]
   const int32_t* axis_map;              // [rotary_dim / 2]
   const void* weight;                   // [kHeadDim]
-  const int32_t* write_locs;            // [groups]
+  const int32_t* write_locs;            // [groups], ROCm: 0 = no-op; active slots >= 1
   void* compressed_k_buffer;            // [compressed_slots, kHeadDim]
   int32_t compress_ratio;
   int32_t rotary_dim;
   int32_t num_groups;
+  int64_t key_state_stride;
   float eps;
 };
 
 /**
  * \brief Per-group compressed-K prep: fp32 mean over the group, gemma norm,
  * MRoPE at the group-start position, store into the compressed cache.
+ * On ROCm, a write location of 0 is a no-op sentinel and performs no source
+ * reads or destination write; compressed-cache slot 0 is reserved for this
+ * contract. CUDA keeps the established inert-slot write behavior so an early
+ * warp cannot signal PDL completion while another warp in its CTA is active.
  * One warp per group.
  */
-template <typename T, int kHeadDim, bool kIsNeox, bool kUsePDL>
+template <typename T, typename CacheT, int kHeadDim, bool kIsNeox, bool kUsePDL>
 __global__
 __launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressParams __grid_constant__ params) {
   using namespace device;
@@ -308,7 +323,17 @@ __launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressP
   }
   __shared__ T smem_rows[4][kHeadDim];
 
+  // The graph metadata kernel may produce write_locs immediately before this
+  // launch, so the sentinel must be read only after the PDL dependency wait.
+  // A no-op warp still triggers its secondary dependency before returning.
   device::PDLWaitPrimary<kUsePDL>();
+  const int32_t write_loc = params.write_locs[group];
+#ifdef USE_ROCM
+  if (write_loc == 0) {
+    device::PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
+#endif
 
   const int32_t* locs = params.group_locs + group * params.compress_ratio;
   const int32_t loc0 = locs[0];
@@ -318,10 +343,15 @@ __launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressP
   float mf[kPerLane];
   {
     float acc[kPerLane];
+#ifdef USE_ROCM
+    const int64_t row_stride = params.key_state_stride;
+#else
+    constexpr int64_t row_stride = kHeadDim;
+#endif
     for (int32_t r = 0; r < params.compress_ratio; ++r) {
       vec_t v;
       v.load(
-          static_cast<const T*>(params.key_state_buffer) + static_cast<int64_t>(locs[r]) * kHeadDim,
+          static_cast<const T*>(params.key_state_buffer) + static_cast<int64_t>(locs[r]) * row_stride,
           lane);  // offset is in vector units
 #pragma unroll
       for (int i = 0; i < kPerLane; ++i) {
@@ -365,9 +395,14 @@ __launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressP
     pos[a] = params.rope_position_buffer[static_cast<int64_t>(loc0) * 3 + a];
   }
 
-  T* out_row = static_cast<T*>(params.compressed_k_buffer) + static_cast<int64_t>(params.write_locs[group]) * kHeadDim;
-  qsa_mrope_apply<T, kHeadDim, kIsNeox>(
-      smem_rows[warp], out_row, params.cos_sin_cache, params.axis_map, pos, params.rotary_dim);
+  T* out_row = static_cast<T*>(params.compressed_k_buffer) + static_cast<int64_t>(write_loc) * kHeadDim;
+  qsa_mrope_apply<T, CacheT, kHeadDim, kIsNeox>(
+      smem_rows[warp],
+      out_row,
+      static_cast<const CacheT*>(params.cos_sin_cache),
+      params.axis_map,
+      pos,
+      params.rotary_dim);
 
   device::PDLTriggerSecondary<kUsePDL>();
 }
@@ -380,7 +415,7 @@ __launch_bounds__(128) void qsa_index_k_compress_kernel(const QsaIndexKCompressP
  * \tparam kIsNeox   RoPE pairing style.
  * \tparam kUsePDL   Whether to launch with PDL enabled.
  */
-template <typename T, int kHeadDim, bool kIsNeox, bool kUsePDL>
+template <typename T, typename CacheT, int kHeadDim, bool kIsNeox, bool kUsePDL>
 void qsa_index_q_prep(
     tvm::ffi::TensorView qk,
     tvm::ffi::TensorView q_out,
@@ -398,21 +433,27 @@ void qsa_index_q_prep(
   using namespace host;
   auto tokens = SymbolicSize{"tokens"};
   auto device = SymbolicDevice{};
-  device.set_options<kDLCUDA>();
   constexpr int64_t D = kHeadDim;
 
-  TensorMatcher({tokens, (num_q_heads + 1) * D}).with_dtype<T>().with_device(device).verify(qk);
+  TensorMatcher({tokens, (num_q_heads + 1) * D}).with_dtype<T>().template with_device<kDLGPU>(device).verify(qk);
   auto heads_padded = SymbolicSize{"heads_padded"};
-  TensorMatcher({tokens, heads_padded, D}).with_dtype<T>().with_device(device).verify(q_out);
-  TensorMatcher({D}).with_dtype<T>().with_device(device).verify(weight);
+  TensorMatcher({tokens, heads_padded, D}).with_dtype<T>().template with_device<kDLGPU>(device).verify(q_out);
+  TensorMatcher({D}).with_dtype<T>().template with_device<kDLGPU>(device).verify(weight);
   auto cache_rows = SymbolicSize{"cos_sin_cache_rows"};
-  TensorMatcher({cache_rows, rotary_dim}).with_dtype<fp32_t>().with_device(device).verify(cos_sin_cache);
-  TensorMatcher({rotary_dim / 2}).with_dtype<int32_t>().with_device(device).verify(axis_map);
-  TensorMatcher({num_axes, tokens}).with_dtype<int64_t>().with_device(device).with_strides({-1, 1}).verify(positions);
-  TensorMatcher({tokens}).with_dtype<int64_t>().with_device(device).verify(cache_loc);
+  TensorMatcher({cache_rows, rotary_dim})
+      .with_dtype<CacheT>()
+      .template with_device<kDLGPU>(device)
+      .verify(cos_sin_cache);
+  TensorMatcher({rotary_dim / 2}).with_dtype<int32_t>().with_device<kDLGPU>(device).verify(axis_map);
+  TensorMatcher({num_axes, tokens})
+      .with_dtype<int64_t>()
+      .with_device<kDLGPU>(device)
+      .with_strides({-1, 1})
+      .verify(positions);
+  TensorMatcher({tokens}).with_dtype<int64_t>().with_device<kDLGPU>(device).verify(cache_loc);
   auto slots = SymbolicSize{"state_slots"};
-  TensorMatcher({slots, D}).with_dtype<T>().with_device(device).verify(key_state_buffer);
-  TensorMatcher({slots, 3}).with_dtype<int64_t>().with_device(device).verify(rope_position_buffer);
+  TensorMatcher({slots, D}).with_dtype<T>().template with_device<kDLGPU>(device).verify(key_state_buffer);
+  TensorMatcher({slots, 3}).with_dtype<int64_t>().with_device<kDLGPU>(device).verify(rope_position_buffer);
 
   const int64_t num_tokens = tokens.unwrap();
   const int64_t q_heads_padded = heads_padded.unwrap();
@@ -427,7 +468,7 @@ void qsa_index_q_prep(
       .qk = qk.data_ptr(),
       .q_out = q_out.data_ptr(),
       .weight = weight.data_ptr(),
-      .cos_sin_cache = static_cast<const float*>(cos_sin_cache.data_ptr()),
+      .cos_sin_cache = cos_sin_cache.data_ptr(),
       .axis_map = static_cast<const int32_t*>(axis_map.data_ptr()),
       .positions = static_cast<const int64_t*>(positions.data_ptr()),
       .cache_loc = static_cast<const int64_t*>(cache_loc.data_ptr()),
@@ -441,13 +482,13 @@ void qsa_index_q_prep(
       .eps = eps,
   };
   LaunchKernel(static_cast<uint32_t>(num_tokens), 128, device.unwrap())
-      .enable_pdl(kUsePDL)(qsa_index_q_prep_kernel<T, kHeadDim, kIsNeox, kUsePDL>, params);
+      .enable_pdl(kUsePDL)(qsa_index_q_prep_kernel<T, CacheT, kHeadDim, kIsNeox, kUsePDL>, params);
 }
 
 /**
  * \brief Validate inputs and launch `qsa_index_k_compress_kernel` (one warp per group).
  */
-template <typename T, int kHeadDim, bool kIsNeox, bool kUsePDL>
+template <typename T, typename CacheT, int kHeadDim, bool kIsNeox, bool kUsePDL>
 void qsa_index_k_compress(
     tvm::ffi::TensorView key_state_buffer,
     tvm::ffi::TensorView group_locs,
@@ -462,21 +503,32 @@ void qsa_index_k_compress(
     float eps) {
   using namespace host;
   auto device = SymbolicDevice{};
-  device.set_options<kDLCUDA>();
   constexpr int64_t D = kHeadDim;
 
   auto slots = SymbolicSize{"state_slots"};
-  TensorMatcher({slots, D}).with_dtype<T>().with_device(device).verify(key_state_buffer);
+#ifdef USE_ROCM
+  auto key_state_stride_sym = SymbolicSize{"key_state_stride"};
+  TensorMatcher({slots, D})
+      .with_strides({key_state_stride_sym, 1})
+      .with_dtype<T>()
+      .template with_device<kDLGPU>(device)
+      .verify(key_state_buffer);
+#else
+  TensorMatcher({slots, D}).with_dtype<T>().template with_device<kDLGPU>(device).verify(key_state_buffer);
+#endif
   auto groups = SymbolicSize{"groups"};
-  TensorMatcher({groups, compress_ratio}).with_dtype<int32_t>().with_device(device).verify(group_locs);
-  TensorMatcher({slots, 3}).with_dtype<int64_t>().with_device(device).verify(rope_position_buffer);
+  TensorMatcher({groups, compress_ratio}).with_dtype<int32_t>().with_device<kDLGPU>(device).verify(group_locs);
+  TensorMatcher({slots, 3}).with_dtype<int64_t>().with_device<kDLGPU>(device).verify(rope_position_buffer);
   auto cache_rows = SymbolicSize{"cos_sin_cache_rows"};
-  TensorMatcher({cache_rows, rotary_dim}).with_dtype<fp32_t>().with_device(device).verify(cos_sin_cache);
-  TensorMatcher({rotary_dim / 2}).with_dtype<int32_t>().with_device(device).verify(axis_map);
-  TensorMatcher({D}).with_dtype<T>().with_device(device).verify(weight);
-  TensorMatcher({groups}).with_dtype<int32_t>().with_device(device).verify(write_locs);
+  TensorMatcher({cache_rows, rotary_dim})
+      .with_dtype<CacheT>()
+      .template with_device<kDLGPU>(device)
+      .verify(cos_sin_cache);
+  TensorMatcher({rotary_dim / 2}).with_dtype<int32_t>().with_device<kDLGPU>(device).verify(axis_map);
+  TensorMatcher({D}).with_dtype<T>().template with_device<kDLGPU>(device).verify(weight);
+  TensorMatcher({groups}).with_dtype<int32_t>().with_device<kDLGPU>(device).verify(write_locs);
   auto compressed_slots = SymbolicSize{"compressed_slots"};
-  TensorMatcher({compressed_slots, D}).with_dtype<T>().with_device(device).verify(compressed_k_buffer);
+  TensorMatcher({compressed_slots, D}).with_dtype<T>().template with_device<kDLGPU>(device).verify(compressed_k_buffer);
 
   const int64_t num_groups = groups.unwrap();
   CHECK_HOST(num_groups > 0) << "qsa_index_k_compress: no groups";
@@ -484,12 +536,19 @@ void qsa_index_k_compress(
       << "qsa_index_k_compress: invalid compress_ratio " << compress_ratio;
   CHECK_HOST(rotary_dim > 0 && rotary_dim % 2 == 0 && rotary_dim <= D)
       << "qsa_index_k_compress: invalid rotary_dim " << rotary_dim;
+  constexpr int64_t kVectorElements = D / device::kWarpThreads;
+  using vec_t = device::AlignedVector<T, kVectorElements>;
+  CHECK_HOST(reinterpret_cast<uintptr_t>(key_state_buffer.data_ptr()) % alignof(vec_t) == 0)
+      << "qsa_index_k_compress: key-state base pointer is not vector aligned";
+  const int64_t key_state_stride = key_state_buffer.stride(0);
+  CHECK_HOST(key_state_stride % kVectorElements == 0)
+      << "qsa_index_k_compress: key-state row stride " << key_state_stride << " does not preserve vector alignment";
 
   const auto params = QsaIndexKCompressParams{
       .key_state_buffer = key_state_buffer.data_ptr(),
       .group_locs = static_cast<const int32_t*>(group_locs.data_ptr()),
       .rope_position_buffer = static_cast<const int64_t*>(rope_position_buffer.data_ptr()),
-      .cos_sin_cache = static_cast<const float*>(cos_sin_cache.data_ptr()),
+      .cos_sin_cache = cos_sin_cache.data_ptr(),
       .axis_map = static_cast<const int32_t*>(axis_map.data_ptr()),
       .weight = weight.data_ptr(),
       .write_locs = static_cast<const int32_t*>(write_locs.data_ptr()),
@@ -497,10 +556,11 @@ void qsa_index_k_compress(
       .compress_ratio = static_cast<int32_t>(compress_ratio),
       .rotary_dim = static_cast<int32_t>(rotary_dim),
       .num_groups = static_cast<int32_t>(num_groups),
+      .key_state_stride = key_state_stride,
       .eps = eps,
   };
   LaunchKernel(static_cast<uint32_t>(div_ceil(num_groups, 4)), 128, device.unwrap())
-      .enable_pdl(kUsePDL)(qsa_index_k_compress_kernel<T, kHeadDim, kIsNeox, kUsePDL>, params);
+      .enable_pdl(kUsePDL)(qsa_index_k_compress_kernel<T, CacheT, kHeadDim, kIsNeox, kUsePDL>, params);
 }
 
 }  // namespace sglang
