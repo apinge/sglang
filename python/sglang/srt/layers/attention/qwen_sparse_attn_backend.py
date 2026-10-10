@@ -108,6 +108,10 @@ class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     fa2_valid_counts: Optional[torch.Tensor] = None
     fa2_cu_seqlens_k: Optional[torch.Tensor] = None
     fa2_cu_seqlens_q: Optional[torch.Tensor] = None
+    # Eager chunk-prefill only: one request-major physical-slot vector shared
+    # by every QSA layer in this forward. None for decode, graph, and a
+    # prefix-free extend, where no packed full-context K/V gather is needed.
+    packed_kv_slots: Optional[torch.Tensor] = None
 
 
 class QSAMTPSharedSparseIndices:
@@ -718,6 +722,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         pending_ring_slots = None
         compress_group_ring_locs = None
         extend_rope_matrix = None
+        packed_kv_slots = None
         if (
             self.qsa_profile is None
             or self.qsa_profile.variant == QSA_VARIANT_COMPRESSED
@@ -779,6 +784,36 @@ class QwenSparseAttnBackend(AttentionBackend):
                             sequence_ids=group_sequence_ids.long(),
                             compress_ratio=self.compress_ratio,
                         )
+        # Prefix chunk-prefill repacks each request's full logical context
+        # into K/V rows for every QSA layer. Request ids, final sequence
+        # lengths, and req_to_token stay fixed for the complete forward, so
+        # build its physical-slot vector once in per-forward metadata rather
+        # than once per layer. CPU mirrors are already required by the
+        # packed-attention path; using them only decides whether a prefix is
+        # present and supplies the host-known output length.
+        if (
+            forward_batch.forward_mode == ForwardMode.EXTEND
+            and forward_batch.seq_lens_cpu is not None
+            and forward_batch.extend_seq_lens_cpu is not None
+        ):
+            batch_size = sequence_lengths.numel()
+            cpu_seq_lens = [
+                int(length) for length in forward_batch.seq_lens_cpu[:batch_size]
+            ]
+            cpu_extend_lens = [
+                int(length)
+                for length in forward_batch.extend_seq_lens_cpu[:batch_size]
+            ]
+            if any(
+                seq_len > extend_len
+                for seq_len, extend_len in zip(cpu_seq_lens, cpu_extend_lens)
+            ):
+                packed_kv_slots = self._packed_kv_slots(
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=row_req_pool_indices,
+                    seq_lens=sequence_lengths,
+                    total=sum(cpu_seq_lens),
+                )
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
@@ -805,6 +840,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             token_slot_table=token_slot_table,
             indexer_metadata=indexer_metadata,
             row_req_pool_indices=row_req_pool_indices,
+            packed_kv_slots=packed_kv_slots,
         )
 
     def init_forward_metadata(self, forward_batch):
@@ -1488,13 +1524,18 @@ class QwenSparseAttnBackend(AttentionBackend):
         # The validated chunk-prefill kernel consumes tightly packed full-context
         # K/V. Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
-        batch_size = len(sequence_lens)
-        slots = self._packed_kv_slots(
-            req_to_token=self.req_to_token_pool.req_to_token,
-            req_pool_indices=forward_batch.req_pool_indices[:batch_size],
-            seq_lens=forward_batch.seq_lens[:batch_size],
-            total=sum(sequence_lens),
-        )
+        metadata = self._resolve_metadata(forward_batch)
+        slots = metadata.packed_kv_slots
+        if slots is None:
+            # Direct/manual callers can bypass init_forward_metadata. Retain a
+            # local GPU-only fallback for that non-serving path.
+            batch_size = len(sequence_lens)
+            slots = self._packed_kv_slots(
+                req_to_token=self.req_to_token_pool.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices[:batch_size],
+                seq_lens=forward_batch.seq_lens[:batch_size],
+                total=sum(sequence_lens),
+            )
         packed_k = pool.get_key_buffer(layer.layer_id).index_select(0, slots)
         packed_v = pool.get_value_buffer(layer.layer_id).index_select(0, slots)
         if use_pyhip:
