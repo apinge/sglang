@@ -84,7 +84,7 @@ command=(
   --mem-fraction-static "${MEM_FRACTION_STATIC}"
   --max-running-requests "${MAX_RUNNING_REQUESTS}"
   --cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE}"
-  # --speculative-algorithm EAGLE
+  # --speculative-algorithm NEXTN
   # --speculative-num-steps 3
   # --speculative-eagle-topk 1
   # --speculative-num-draft-tokens 4
