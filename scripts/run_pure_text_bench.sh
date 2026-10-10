@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -o pipefail
 
-model="${BENCH_MODEL:-/models/Qwen3.8-Flash-Next-PTPC-FP8}"
+model="${BENCH_MODEL:-/models/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16}"
 input_tokens="${INPUT_TOKENS:-12000}"
 output_tokens="${OUTPUT_TOKENS:-350}"
 num_prompts="${NUM_PROMPTS:-32}"
