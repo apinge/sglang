@@ -12,8 +12,8 @@ mkdir -p "$(dirname -- "${LOG_FILE}")"
 exec > >(tee "${LOG_FILE}") 2>&1
 printf 'Logging to: %s\n' "${LOG_FILE}"
 
-MODEL_PATH="${MODEL_PATH:-/models/Qwen3.8-Flash-Next-PTPC-FP8}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3.8-Flash-Next-PTPC-FP8}"
+MODEL_PATH="${MODEL_PATH:-/models/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-7080}"
 TP_SIZE="${TP_SIZE:-2}"
@@ -76,6 +76,7 @@ PY
 #unset SGLANG_USE_AITER
 export SGLANG_USE_AITER=1
 export SGLANG_GR_READ_FLYDSL="${SGLANG_GR_READ_FLYDSL:-1}"
+export SGLANG_USE_PYHIP_QSA="${SGLANG_USE_PYHIP_QSA:-1}"
 export AITER_MOE_PADDING_SIZE
 printf 'GR read: installed PyHIP enabled=%s; TP=%s; AITER_MOE_PADDING_SIZE=%s\n' \
   "${SGLANG_GR_READ_FLYDSL}" "${TP_SIZE}" "${AITER_MOE_PADDING_SIZE}"
@@ -97,7 +98,7 @@ command=(
   --mem-fraction-static "${MEM_FRACTION_STATIC}"
   --max-running-requests "${MAX_RUNNING_REQUESTS}"
   --cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE}"
-  # --speculative-algorithm EAGLE
+  # --speculative-algorithm NEXTN
   # --speculative-num-steps 3
   # --speculative-eagle-topk 1
   # --speculative-num-draft-tokens 4

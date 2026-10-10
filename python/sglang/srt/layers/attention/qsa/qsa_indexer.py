@@ -6,6 +6,7 @@ from typing import Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
@@ -82,6 +83,11 @@ class QSAIndexer(MultiPlatformOp):
             self.index_head_dim, eps=getattr(config, "rms_norm_eps", 1e-6)
         )
         self._rope_axis_map_cache = None
+        self._pyhip_indexer = None
+        if is_hip() and envs.SGLANG_USE_PYHIP_QSA.get():
+            from sglang.srt.layers.attention.qsa.pyhip_backend import PyHIPIndexer
+
+            self._pyhip_indexer = PyHIPIndexer.create(indexer=self)
 
     @staticmethod
     def _validate_config(config) -> None:
@@ -607,6 +613,18 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.compress_member_rows is not None,
             )
+        if hidden_states.is_cuda and self._pyhip_indexer is not None:
+            output = self._pyhip_indexer.forward(
+                indexer=self,
+                hidden=hidden_states,
+                positions=positions,
+                logical=logical_positions,
+                batch=forward_batch,
+                metadata=indexer_metadata,
+                state_slots=state_slots,
+            )
+            if output is not None:
+                return output
         q, token_k, state_stored = self.project_qk(
             hidden_states,
             positions,

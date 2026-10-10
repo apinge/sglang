@@ -2,10 +2,12 @@ import pytest
 import torch
 
 from sglang.kernels.ops.elementwise.fast_topk import fast_topk
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 
 
 def _check_topk_values(score, lengths, indices, topk, row_starts):
@@ -137,6 +139,19 @@ def test_fast_topk_unsupported_k():
     lengths = torch.full((2,), 4096, dtype=torch.int32, device="cuda")
     with pytest.raises(RuntimeError, match="topk"):
         fast_topk(score, lengths, 1024)
+
+
+class TestFastTopKOverflow(CustomTestCase):
+    def test_concentrated_scores(self):
+        """A threshold bucket larger than scratch capacity must not discard candidates."""
+        values = 6.5 + torch.arange(8192, dtype=torch.float32, device="cuda") / 2**18
+        score = torch.stack((values, values.flip(0)))
+        starts = torch.tensor([0, 16], dtype=torch.int32, device="cuda")
+        lengths = torch.tensor([8192, 8000], dtype=torch.int32, device="cuda")
+        for topk in (512, 2048):
+            with self.subTest(topk=topk):
+                indices = fast_topk(score, lengths, topk, row_starts=starts)
+                _check_topk_values(score, lengths, indices, topk, starts)
 
 
 if __name__ == "__main__":

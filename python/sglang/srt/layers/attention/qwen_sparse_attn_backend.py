@@ -16,6 +16,7 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
     QSA_VARIANT_COMPRESSED,
@@ -107,6 +108,10 @@ class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     fa2_valid_counts: Optional[torch.Tensor] = None
     fa2_cu_seqlens_k: Optional[torch.Tensor] = None
     fa2_cu_seqlens_q: Optional[torch.Tensor] = None
+    # Eager chunk-prefill only: one request-major physical-slot vector shared
+    # by every QSA layer in this forward. None for decode, graph, and a
+    # prefix-free extend, where no packed full-context K/V gather is needed.
+    packed_kv_slots: Optional[torch.Tensor] = None
 
 
 class QSAMTPSharedSparseIndices:
@@ -244,6 +249,27 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
+        self._pyhip_attention = None
+        profile = self.qsa_profile
+        if (
+            is_hip()
+            and envs.SGLANG_USE_PYHIP_QSA.get()
+            and runner is not None
+            and not runner.is_draft_worker
+            and runner.ps.attn_cp_size == runner.ps.attn_dcp_size == 1
+            and runner.kv_cache_dtype == torch.bfloat16
+            and profile is not None
+            and profile.variant == QSA_VARIANT_COMPRESSED
+            and (profile.compress_ratio, profile.block_topk, profile.budget)
+            == (4, 512, 2048)
+            and torch.cuda.get_device_properties(self.device).gcnArchName.startswith(
+                "gfx942"
+            )
+        ):
+            from sglang.srt.layers.attention.qsa.pyhip_backend import PyHIPAttention
+
+            self._pyhip_attention = PyHIPAttention()
+            logger.info("Using installed PyHIP for gfx942 QSA prefill attention")
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -260,12 +286,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         draft_tokens = int(getattr(spec_info, "draft_token_num", 0) or 0)
         if draft_tokens > self.compress_ratio:
-            # The pending-group ring keys state by position % ratio; a verify
-            # window wider than the ratio would collide within one forward.
+            # The pending ring (qsa_ring_slots_per_request) holds a verify
+            # window plus the members of its first group that precede it.
             raise NotImplementedError(
                 "Qwen QSA requires speculative_num_draft_tokens <= the QSA "
-                f"compress ratio ({self.compress_ratio}): the pending "
-                f"index-key ring holds one group; got {draft_tokens}"
+                f"compress ratio ({self.compress_ratio}); got {draft_tokens}"
             )
 
     @staticmethod
@@ -697,6 +722,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         pending_ring_slots = None
         compress_group_ring_locs = None
         extend_rope_matrix = None
+        packed_kv_slots = None
         if (
             self.qsa_profile is None
             or self.qsa_profile.variant == QSA_VARIANT_COMPRESSED
@@ -758,6 +784,36 @@ class QwenSparseAttnBackend(AttentionBackend):
                             sequence_ids=group_sequence_ids.long(),
                             compress_ratio=self.compress_ratio,
                         )
+        # Prefix chunk-prefill repacks each request's full logical context
+        # into K/V rows for every QSA layer. Request ids, final sequence
+        # lengths, and req_to_token stay fixed for the complete forward, so
+        # build its physical-slot vector once in per-forward metadata rather
+        # than once per layer. CPU mirrors are already required by the
+        # packed-attention path; using them only decides whether a prefix is
+        # present and supplies the host-known output length.
+        if (
+            forward_batch.forward_mode == ForwardMode.EXTEND
+            and forward_batch.seq_lens_cpu is not None
+            and forward_batch.extend_seq_lens_cpu is not None
+        ):
+            batch_size = sequence_lengths.numel()
+            cpu_seq_lens = [
+                int(length) for length in forward_batch.seq_lens_cpu[:batch_size]
+            ]
+            cpu_extend_lens = [
+                int(length)
+                for length in forward_batch.extend_seq_lens_cpu[:batch_size]
+            ]
+            if any(
+                seq_len > extend_len
+                for seq_len, extend_len in zip(cpu_seq_lens, cpu_extend_lens)
+            ):
+                packed_kv_slots = self._packed_kv_slots(
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=row_req_pool_indices,
+                    seq_lens=sequence_lengths,
+                    total=sum(cpu_seq_lens),
+                )
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
@@ -784,6 +840,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             token_slot_table=token_slot_table,
             indexer_metadata=indexer_metadata,
             row_req_pool_indices=row_req_pool_indices,
+            packed_kv_slots=packed_kv_slots,
         )
 
     def init_forward_metadata(self, forward_batch):
@@ -1420,11 +1477,39 @@ class QwenSparseAttnBackend(AttentionBackend):
         prefix_lens = [
             sequence_lens[i] - extend_lens[i] for i in range(len(extend_lens))
         ]
-        cu_seqlens_q = F.pad(
-            forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
-            (1, 0),
-        ).contiguous()
+        use_pyhip = (
+            self._pyhip_attention is not None
+            and self._pyhip_attention.supports(
+                q=q,
+                k=k,
+                v=v,
+                indices=topk_indices,
+                layer=layer,
+                forward_mode=forward_batch.forward_mode,
+                kwargs=kwargs,
+            )
+        )
+        cu_seqlens_q = (
+            None
+            if use_pyhip
+            else F.pad(
+                forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
+                (1, 0),
+            ).contiguous()
+        )
         if not any(prefix_lens):
+            if use_pyhip:
+                output = self._pyhip_attention.forward(
+                    q=q.contiguous(),
+                    k=k[:num_valid_rows].contiguous(),
+                    v=v[:num_valid_rows].contiguous(),
+                    indices=topk_indices,
+                    query_lens=extend_lens,
+                    prefix_lens=prefix_lens,
+                    scale=layer.scaling,
+                    layer_id=layer.layer_id,
+                )
+                return self._pad_extend_output(output, num_output_rows)
             output = sparse_gqa_fwd_interface_triton(
                 q.contiguous(),
                 k[:num_valid_rows].contiguous(),
@@ -1439,30 +1524,40 @@ class QwenSparseAttnBackend(AttentionBackend):
         # The validated chunk-prefill kernel consumes tightly packed full-context
         # K/V. Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
-        k_buffer = pool.get_key_buffer(layer.layer_id)
-        v_buffer = pool.get_value_buffer(layer.layer_id)
-        req_to_token = self.req_to_token_pool.req_to_token
-        req_indices = forward_batch.req_pool_indices.tolist()
-        k_parts = [
-            k_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+        metadata = self._resolve_metadata(forward_batch)
+        slots = metadata.packed_kv_slots
+        if slots is None:
+            # Direct/manual callers can bypass init_forward_metadata. Retain a
+            # local GPU-only fallback for that non-serving path.
+            batch_size = len(sequence_lens)
+            slots = self._packed_kv_slots(
+                req_to_token=self.req_to_token_pool.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices[:batch_size],
+                seq_lens=forward_batch.seq_lens[:batch_size],
+                total=sum(sequence_lens),
             )
-            for i in range(len(sequence_lens))
-        ]
-        v_parts = [
-            v_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
+        packed_k = pool.get_key_buffer(layer.layer_id).index_select(0, slots)
+        packed_v = pool.get_value_buffer(layer.layer_id).index_select(0, slots)
+        if use_pyhip:
+            output = self._pyhip_attention.forward(
+                q=q.contiguous(),
+                k=packed_k,
+                v=packed_v,
+                indices=topk_indices,
+                query_lens=extend_lens,
+                prefix_lens=prefix_lens,
+                scale=layer.scaling,
+                layer_id=layer.layer_id,
             )
-            for i in range(len(sequence_lens))
-        ]
+            return self._pad_extend_output(output, num_output_rows)
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
-            torch.cat(k_parts),
-            torch.cat(v_parts),
+            packed_k,
+            packed_v,
             topk_indices,
             cu_seqlens_q,
             cu_seqlens_k,
@@ -1484,6 +1579,22 @@ class QwenSparseAttnBackend(AttentionBackend):
         padded = output.new_zeros((num_rows, output.shape[1]))
         padded[: output.shape[0]].copy_(output)
         return padded
+
+    @staticmethod
+    def _packed_kv_slots(
+        *,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        total: int,
+    ) -> torch.Tensor:
+        # searchsorted is parallel over tokens; repeat_interleave serializes one
+        # long request. total is host-known, so nothing reads back from the device.
+        ends = torch.cumsum(seq_lens, 0)
+        tokens = torch.arange(total, device=seq_lens.device)
+        requests = torch.searchsorted(ends, tokens, right=True)
+        columns = tokens - (ends - seq_lens)[requests]
+        return req_to_token[req_pool_indices[requests].long(), columns]
 
     def _get_fa2_scratch(
         self,
