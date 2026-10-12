@@ -2193,3 +2193,37 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_non_hip_paged_dispatch_does_not_import_amd_kernel(monkeypatch):
+    import builtins
+
+    module = qsa_backend_module
+    backend = QwenSparseAttnBackend(
+        SimpleNamespace(
+            token_to_kv_pool=SimpleNamespace(
+                get_key_buffer=lambda _: None, get_value_buffer=lambda _: None
+            ),
+            req_to_token_pool=None,
+        )
+    )
+    monkeypatch.setattr(module, "is_hip", lambda: False)
+    monkeypatch.setattr(backend, "_resolve_metadata", lambda _: None)
+    sentinel = object()
+    monkeypatch.setattr(module, "_resolve_trtllm_sparse_decode", lambda: sentinel)
+    monkeypatch.setattr(backend, "_forward_trtllm_sparse", lambda *args: sentinel)
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        assert name != "sglang.srt.layers.attention.qsa.sparse_attn_decode"
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    output = backend._forward_paged_attention(
+        SimpleNamespace(is_cuda=True),
+        SimpleNamespace(layer_id=0),
+        None,
+        torch.zeros((1, 1), dtype=torch.int32),
+    )
+    assert output is sentinel
+    assert backend._paged_gqa_workspace is None
