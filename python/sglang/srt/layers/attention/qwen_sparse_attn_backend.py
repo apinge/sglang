@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 
 # This only decides whether a target QSA backend may construct the PyHIP
-# attention wrapper. `PyHIPAttention.supports()` remains the per-forward
+# attention wrapper. `PyHIPAttention.can_use_for_forward()` remains the per-forward
 # contract for mode, graph state, and real Q/K/V layout.
 _USE_PYHIP_QSA_ATTENTION = (
     envs.SGLANG_USE_PYHIP_QSA.get()
@@ -1482,9 +1482,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         prefix_lens = [
             sequence_lens[i] - extend_lens[i] for i in range(len(extend_lens))
         ]
-        use_pyhip = (
+        can_use_pyhip_attention = (
             self._pyhip_attention is not None
-            and self._pyhip_attention.supports(
+            and self._pyhip_attention.can_use_for_forward(
                 q=q,
                 k=k,
                 v=v,
@@ -1496,14 +1496,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         cu_seqlens_q = (
             None
-            if use_pyhip
+            if can_use_pyhip_attention
             else F.pad(
                 forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
                 (1, 0),
             ).contiguous()
         )
         if not any(prefix_lens):
-            if use_pyhip:
+            if can_use_pyhip_attention:
                 output = self._pyhip_attention.forward(
                     q=q.contiguous(),
                     k=k[:num_valid_rows].contiguous(),
@@ -1543,7 +1543,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         packed_k = pool.get_key_buffer(layer.layer_id).index_select(0, slots)
         packed_v = pool.get_value_buffer(layer.layer_id).index_select(0, slots)
-        if use_pyhip:
+        if can_use_pyhip_attention:
             output = self._pyhip_attention.forward(
                 q=q.contiguous(),
                 k=packed_k,

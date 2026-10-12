@@ -29,7 +29,7 @@ class PyHIPAttention:
         self.checked_layouts = set()
 
     @staticmethod
-    def supports(*, q, k, v, indices, layer, forward_mode, kwargs):
+    def can_use_for_forward(*, q, k, v, indices, layer, forward_mode, kwargs):
         return (
             forward_mode == ForwardMode.EXTEND
             and not get_is_capture_mode()
