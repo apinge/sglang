@@ -40,9 +40,18 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_packed_decode_triton,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx942_supported, is_hip
 
 logger = logging.getLogger(__name__)
+
+
+# This only decides whether a target QSA backend may construct the PyHIP
+# attention wrapper. `PyHIPAttention.supports()` remains the per-forward
+# contract for mode, graph state, and real Q/K/V layout.
+_USE_PYHIP_QSA_ATTENTION = (
+    envs.SGLANG_USE_PYHIP_QSA.get()
+    and is_gfx942_supported()
+)
 
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
@@ -252,8 +261,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._pyhip_attention = None
         profile = self.qsa_profile
         if (
-            is_hip()
-            and envs.SGLANG_USE_PYHIP_QSA.get()
+            _USE_PYHIP_QSA_ATTENTION
             and runner is not None
             and not runner.is_draft_worker
             and runner.ps.attn_cp_size == runner.ps.attn_dcp_size == 1
@@ -262,9 +270,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             and profile.variant == QSA_VARIANT_COMPRESSED
             and (profile.compress_ratio, profile.block_topk, profile.budget)
             == (4, 512, 2048)
-            and torch.cuda.get_device_properties(self.device).gcnArchName.startswith(
-                "gfx942"
-            )
         ):
             from sglang.srt.layers.attention.qsa.pyhip_backend import PyHIPAttention
 
