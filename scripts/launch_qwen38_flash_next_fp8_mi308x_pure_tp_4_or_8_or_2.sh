@@ -31,6 +31,9 @@ CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-32}"
 CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-32}"
 AITER_MOE_PADDING_SIZE="${AITER_MOE_PADDING_SIZE:-64}"
+DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-1}"
+# Report cache hits by default when radix caching is enabled.
+ENABLE_CACHE_REPORT="${ENABLE_CACHE_REPORT:-1}"
 
 if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
   echo "Model config not found: ${MODEL_PATH}/config.json" >&2
@@ -47,6 +50,9 @@ if [[ "${PLE_OFFLOAD_EMBEDDING}" != "0" && "${PLE_OFFLOAD_EMBEDDING}" != "1" ]];
   exit 1
 fi
 
+if (( DISABLE_RADIX_CACHE )); then
+  ENABLE_CACHE_REPORT=0
+fi
 
 python - "${TP_SIZE}" <<'PY'
 import sys
@@ -94,7 +100,6 @@ command=(
   --kv-cache-dtype auto
   --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}"
   --watchdog-timeout 1200
-  --disable-radix-cache
   --mem-fraction-static "${MEM_FRACTION_STATIC}"
   --max-running-requests "${MAX_RUNNING_REQUESTS}"
   --cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE}"
@@ -103,6 +108,14 @@ command=(
   # --speculative-eagle-topk 1
   # --speculative-num-draft-tokens 4
 )
+
+if (( DISABLE_RADIX_CACHE )); then
+  command+=(--disable-radix-cache)
+fi
+
+if (( ENABLE_CACHE_REPORT )); then
+  command+=(--enable-cache-report)
+fi
 
 # Use an explicit negative flag for the control run so the A/B result cannot be
 # affected by an upstream model-specific default.
