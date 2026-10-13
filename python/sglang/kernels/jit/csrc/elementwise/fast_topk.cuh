@@ -169,6 +169,7 @@ SGL_DEVICE void radix_select_topk(const float* __restrict__ input, int* __restri
       prefix |= static_cast<uint32_t>(s_threshold_bin_id) << shift;
       prefix_mask |= 0xFFu << shift;
     }
+    __syncthreads();
     if (tx == 0) {
       s_counter = 0;
       s_num_input[0] = 0;
