@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -438,7 +439,7 @@ def test_qsa_same_named_chunk_prefill_kernels_do_not_collide_in_one_process():
 
 
 @pytest.mark.skipif(not _is_mi308x(), reason="requires MI308X ROCm")
-def test_qsa_fast_topk_expand_dispatches_direct_paged_one_cta(monkeypatch):
+def test_qsa_fast_topk_expand_dispatches_prepared_pr40_attention(monkeypatch):
     """Exercise the decode selection output directly through sparse attention."""
 
     lengths = [CACHE_TOKENS, 2051, 1025, 17]
@@ -456,7 +457,7 @@ def test_qsa_fast_topk_expand_dispatches_direct_paged_one_cta(monkeypatch):
     logits.masked_fill_(columns[None, :] >= compressed_lengths[:, None], 1.0e9)
 
     def fallback_must_not_run(*args, **kwargs):
-        pytest.fail("direct-paged backend dispatch reached a compact/fallback path")
+        pytest.fail("prepared-packed backend dispatch reached a legacy fallback path")
 
     monkeypatch.setattr(
         backend_module, "_resolve_trtllm_sparse_decode", fallback_must_not_run
@@ -471,6 +472,11 @@ def test_qsa_fast_topk_expand_dispatches_direct_paged_one_cta(monkeypatch):
     )
     monkeypatch.setattr(
         backend_module, "sparse_gqa_packed_decode_triton", fallback_must_not_run
+    )
+    monkeypatch.setattr(
+        direct_module,
+        "sparse_gqa_direct_paged_decode_one_cta_triton",
+        fallback_must_not_run,
     )
 
     def select_and_attend():
@@ -492,7 +498,7 @@ def test_qsa_fast_topk_expand_dispatches_direct_paged_one_cta(monkeypatch):
         )
         return block_indices, token_indices, output
 
-    # Compile all three kernels before profiling the steady-state decode chain.
+    # Compile selection, expansion, preparation, and attention before profiling.
     select_and_attend()
     torch.cuda.synchronize()
     with torch.profiler.profile(
@@ -519,15 +525,22 @@ def test_qsa_fast_topk_expand_dispatches_direct_paged_one_cta(monkeypatch):
         sum("_expand_qsa_block_indices_kernel" in name for name in gpu_kernel_names)
         == 1
     )
-    assert gpu_kernel_names.count("_sparse_gqa_chunk_prefill.kd") == 1
+    assert (
+        sum("_qsa_sparse_packed_gqa_kernel" in name for name in gpu_kernel_names) == 1
+    )
+    assert (
+        sum("_mla_decode_fwd_reduce_kernel" in name for name in gpu_kernel_names) == 1
+    )
+    assert sum("_prepare_qsa_packed_kv" in name for name in gpu_kernel_names) == 1
+    assert not any("_sparse_gqa_chunk_prefill" in name for name in gpu_kernel_names)
     assert not any(
         forbidden in name.lower()
         for name in gpu_kernel_names
-        for forbidden in ("compact", "split", "merge")
+        for forbidden in ("compact", "merge")
     )
 
 
-def test_qsa_backend_direct_paged_helper_falls_back_without_inputs(monkeypatch):
+def test_qsa_backend_packed_prepare_helper_falls_back_without_inputs(monkeypatch):
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
     monkeypatch.setattr(backend_module, "is_hip", lambda: True)
     indexer = SimpleNamespace(
@@ -547,7 +560,7 @@ def test_qsa_backend_direct_paged_helper_falls_back_without_inputs(monkeypatch):
     k = torch.zeros(PAGE_SIZE, KV_HEADS, HEAD_DIM, dtype=torch.bfloat16)
     indices = torch.full((1, TOPK), -1, dtype=torch.int32)
     assert (
-        backend._forward_direct_paged_one_cta(
+        backend._forward_packed_decode(
             q,
             k,
             k,
@@ -582,7 +595,7 @@ def test_qsa_backend_direct_page_table_selects_graph_and_eager_inputs():
 
 
 @pytest.mark.skipif(not _is_mi308x(), reason="requires MI308X ROCm")
-def test_qsa_backend_direct_gate_miss_keeps_packed_one_cta_fallback(monkeypatch):
+def test_qsa_backend_prepare_gate_miss_keeps_packed_one_cta_fallback(monkeypatch):
     state = _make_backend_state(1, [2051], 805000)
     indexer = SimpleNamespace(
         graph_compressed_page_table=None,
@@ -641,7 +654,7 @@ def test_qsa_backend_direct_gate_miss_keeps_packed_one_cta_fallback(monkeypatch)
         ),
     ],
 )
-def test_qsa_backend_direct_paged_one_cta_graph_replay(
+def test_qsa_backend_prepared_pr40_attention_graph_replay(
     monkeypatch, primary_lengths, alternate_lengths
 ):
     state = _make_backend_state(
@@ -650,7 +663,7 @@ def test_qsa_backend_direct_paged_one_cta_graph_replay(
     layer = SimpleNamespace(layer_id=0, scaling=SCALE)
 
     def compact_must_not_run(*args, **kwargs):
-        pytest.fail("direct-paged backend dispatch reached compact metadata")
+        pytest.fail("prepared-packed backend dispatch reached legacy compact metadata")
 
     monkeypatch.setattr(
         backend_module, "qwen_sparse_fa2_cu_seqlens_triton", compact_must_not_run
@@ -708,7 +721,7 @@ def test_qsa_backend_direct_paged_one_cta_graph_replay(
 
 
 @pytest.mark.skipif(not _is_mi308x(), reason="requires MI308X ROCm")
-def test_qsa_backend_direct_paged_one_cta_two_layers_do_not_alias():
+def test_qsa_backend_prepared_pr40_attention_two_layers_do_not_alias():
     state = _make_backend_state(4, [2051, 1, 1, 1], 840000, layers=2)
     layer0 = SimpleNamespace(layer_id=0, scaling=SCALE)
     layer1 = SimpleNamespace(layer_id=1, scaling=SCALE)
@@ -746,3 +759,7 @@ def test_qsa_backend_direct_paged_one_cta_two_layers_do_not_alias():
         rtol=2e-2,
         atol=2e-2,
     )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -20,12 +20,31 @@ index projection GEMM
 -> fast_topk_kernel<512, false>
 -> _expand_qsa_block_indices_kernel.kd
 -> store_kvcache<512, 512, 1, false, long>
--> _sparse_gqa_chunk_prefill.kd
+-> _prepare_qsa_packed_kv.kd
+-> _qsa_sparse_packed_gqa_kernel.kd
+-> _mla_decode_fwd_reduce_kernel.kd
 ```
 
-The final sparse-attention kernel is a direct-paged, one-CTA-per-row decode
-kernel. It is launched before the generic compact-KV fallback and reads the
-full K/V cache through the indexer's existing page table.
+The preparation kernel resolves the existing page table, gathers selected
+full K/V into continuous per-row scratch, and writes all packed-attention
+metadata in one launch. Attention uses the split-K computation and token-count
+scheduling adapted from apinge/sglang PR #40 (`4b5faf7343`), followed by the
+installed AITER reduction. It reads the prepared packed K/V directly through
+row offsets and relative indices, without accessing the original cache's page
+table. Unsupported shapes keep the generic compact-KV and original attention
+fallback; ordinary prefill is unchanged.
+
+Each preparation row owns `TOPK + 1` scratch slots. Valid selections retain
+their original order, with relative indices listing only valid scratch slots.
+The additional zero K/V slot represents an empty row. The split-K attention
+returns zero for this sentinel and for empty selection rows.
+Mutable lengths, selections, and page tables are read on device on every
+graph replay. Preparation is separate from both split-K attention and its
+reduction. Attention retains PR #40's occupancy tiers, BF16 probability
+rounding, FP32 partials, and `.cg` loads. Every split initializes its partial
+state, including empty partitions, so reused graph workspaces cannot leak
+old values. Workspaces are retained per device, query shape, split count and
+stream; returned outputs have independent storage.
 
 ## Operator replacements
 
@@ -36,8 +55,8 @@ full K/V cache through the indexer's existing page table.
 | Torch paged-cache gather, FP32 einsum/GEMM, ReLU, head reduction, scaling, and tail masking | `_triton_qsa_mqa_decode_kernel.kd` | Reads compressed K pages directly and produces the MQA logits in one Triton kernel. |
 | Allocating/filling a zero `row_starts` tensor and the barrier-heavy gfx942 radix histogram scan | `fast_topk(..., row_starts=None)` plus the wave64 DPP scan | Decode rows start at zero. The optimized scan is length-generic, supports top-k 512/2048, and retains an exact overflow fallback. |
 | Work on complete logits-tail CTAs | Device-side early return in `_triton_qsa_mqa_decode_kernel.kd` | Internal FastTopK receives the valid compressed lengths, so untouched tail CTAs are not consumed. |
-| Valid-count, prefix-sum, compact-KV, and relative-index preparation before sparse attention | Direct logical-index to physical-page mapping inside `_sparse_gqa_chunk_prefill.kd` | The supported path does not materialize a compact K/V buffer. |
-| Experimental split-K stage plus merge | One `_sparse_gqa_chunk_prefill.kd` launch | No partial-output, LSE, merge, or effective-length scratch is present in the selected product path. |
+| Valid-count, prefix-sum, compact-KV, and relative-index preparation before sparse attention | `_prepare_qsa_packed_kv.kd` | Parallel gather and all row metadata are produced in one launch, outside attention. |
+| One-CTA `_sparse_gqa_chunk_prefill.kd` over packed K/V | PR #40 adapted `_qsa_sparse_packed_gqa_kernel.kd` plus AITER reduction | Splits selected tokens across CTAs while keeping the packed-input contract. No page-table lookup is moved back into attention. |
 
 The following kernels are retained rather than replaced:
 
@@ -50,7 +69,7 @@ The following kernels are retained rather than replaced:
   to four raw-token indices and appends up to three tokens from the incomplete
   compression group. Its output width is therefore `2048 + 3 = 2051`.
 - `store_kvcache<512, 512, 1, false, long>`: writes the current raw K/V row
-  before sparse attention consumes the selected paged-cache entries.
+  before preparation gathers the selected paged-cache entries.
 
 ## MQA equivalence
 
@@ -112,15 +131,27 @@ The relevant tests are:
 - `test_qsa_triton_decode_mqa_supports_rocm_graph_replay`
 - `test_qsa_triton_decode_mqa_matches_tilelang_when_available`
 - `test_qsa_same_named_chunk_prefill_kernels_do_not_collide_in_one_process`
-- `test_qsa_fast_topk_expand_dispatches_direct_paged_one_cta`
-- `test_qsa_backend_direct_paged_one_cta_graph_replay`
-- `test_qsa_backend_direct_paged_one_cta_two_layers_do_not_alias`
+- `test_qsa_fast_topk_expand_dispatches_prepared_pr40_attention`
+- `test_qsa_backend_prepared_pr40_attention_graph_replay`
+- `test_qsa_backend_prepared_pr40_attention_two_layers_do_not_alias`
+- `test_qsa_packed_prepare.py`: selected K/V and FP32 attention reference,
+  invalid pages and rows, holes, dirty tails, empty rows, dynamic B1/B4/B8
+  graph replay, and separate preparation, split-K attention and reduction.
+- `test_qsa_packed_pr40.py`: split counts, ragged and strided packed inputs,
+  FP32/legacy reference, invalid offsets, empty partitions, poisoned workspaces,
+  dynamic graph replay, and output non-aliasing.
 
-The direct-paged backend tests make the compact-KV helpers fail if they are
-reached, compare outputs with an FP32 reference, and inspect profiler events to
-require `_sparse_gqa_chunk_prefill.kd` while rejecting split-K or merge names.
+The backend tests make the old multi-launch compact-KV helpers fail if they
+are reached, compare outputs with an FP32 reference, and require the separate
+preparation and PR #40 packed-attention calls. Standalone tests of the
+former direct-paged kernel remain as regression and comparison coverage.
 
-## 12K input / 350 output validation
+## Historical 12K input / 350 output validation
+
+The following measurements describe the original PR commits through
+`d619d57b18`, which used direct-paged sparse attention. They predate the
+separate packed-preparation path described above and are not measurements
+of that revision.
 
 Every adjacent commit was measured as a same-node A/B on MI308X with ROCm
 7.2.4, TP2, concurrency 1, four fixed-seed requests, fresh compiler caches,

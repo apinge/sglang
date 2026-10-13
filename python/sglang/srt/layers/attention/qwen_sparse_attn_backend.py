@@ -24,7 +24,6 @@ from sglang.srt.layers.attention.qsa.config import (
 )
 from sglang.srt.layers.attention.qsa.direct_paged_one_cta import (
     is_sparse_gqa_direct_paged_one_cta_supported,
-    sparse_gqa_direct_paged_decode_one_cta_triton,
 )
 from sglang.srt.layers.attention.qsa.kernel import qsa_sparse_attention
 from sglang.srt.layers.attention.qsa.metadata import (
@@ -34,6 +33,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_rope_position_matrix,
     compressed_decode_view,
 )
+from sglang.srt.layers.attention.qsa.packed_prepare import prepare_qsa_packed_kv
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
@@ -41,6 +41,10 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
     sparse_gqa_packed_decode_triton,
+)
+from sglang.srt.layers.attention.qsa.sparse_attn_decode import (
+    SparsePackedGQAWorkspace,
+    qsa_sparse_packed_gqa,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_hip
@@ -1525,7 +1529,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             return indexer.graph_compressed_page_table
         return indexer.decode_page_table
 
-    def _forward_direct_paged_one_cta(
+    def _forward_packed_decode(
         self,
         q: torch.Tensor,
         k_buffer: torch.Tensor,
@@ -1534,7 +1538,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         metadata: QwenSparseAttnMetadata,
         topk_indices: torch.Tensor,
     ) -> Optional[torch.Tensor]:
-        """Try the narrow MI308X direct-paged path before compacting K/V."""
+        """Gather paged KV separately, then run PR40 split-K on packed input."""
 
         if not is_hip():
             return None
@@ -1563,19 +1567,21 @@ class QwenSparseAttnBackend(AttentionBackend):
             block_topk=indexer.block_topk,
         ):
             return None
-        return sparse_gqa_direct_paged_decode_one_cta_triton(
-            q,
+        packed = prepare_qsa_packed_kv(
             k_buffer,
             v_buffer,
             topk_indices,
             page_table,
             row_to_page_table,
             sequence_lens,
-            layer.scaling,
             full_kv_page_size=full_kv_page_size,
             compress_ratio=indexer.compress_ratio,
             block_topk=indexer.block_topk,
         )
+        workspace = getattr(self, "_packed_gqa_workspace", None)
+        if workspace is None:
+            workspace = self._packed_gqa_workspace = SparsePackedGQAWorkspace()
+        return qsa_sparse_packed_gqa(q, *packed, layer.scaling, workspace=workspace)
 
     def _get_trtllm_sparse_tables(self, batch, pages_per_row, page, device):
         key = (batch, pages_per_row, device)
@@ -1716,7 +1722,7 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = topk_indices.to(torch.int32).contiguous()
-        direct_output = self._forward_direct_paged_one_cta(
+        packed_output = self._forward_packed_decode(
             q,
             k_buffer,
             v_buffer,
@@ -1724,8 +1730,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             metadata,
             topk_indices,
         )
-        if direct_output is not None:
-            return direct_output.reshape(q.shape[0], -1)
+        if packed_output is not None:
+            return packed_output.reshape(q.shape[0], -1)
         trtllm_decode = _resolve_trtllm_sparse_decode()
         if trtllm_decode is not None:
             return self._forward_trtllm_sparse(
