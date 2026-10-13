@@ -39,8 +39,15 @@ class QSATokenToKVPool(HybridLinearKVPool):
     def qsa_bytes_per_token(
         cls, *, kv_heads: int, head_dim: int, compress_ratio: int, num_layers: int
     ) -> int:
-        """Per-token QSA index-cache cost: compressed keys only;
-        the per-request pending ring is budgeted with the other per-request buffers."""
+        """Per-token cost of the QSA index caches: the compressed keys only.
+
+        Pre-compression state is a per-request ring of ``2 * compress_ratio``
+        slots (pending group members plus a verify window), not a per-token
+        cache, so it
+        does not price per token; its total is bounded by the request-slot
+        count and stays outside this budget like the other per-request
+        buffers.
+        """
         index_k_bytes = _index_k_bytes(
             kv_heads=kv_heads, head_dim=head_dim, dtype=cls.index_state_dtype
         )
@@ -122,16 +129,29 @@ class QSATokenToKVPool(HybridLinearKVPool):
         # seen by the scoring kernels is one full-KV page's worth of groups.
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
         self.qsa_compressed_capacity = -(state_size // -self.qsa_compress_ratio)
-        # Pre-compression index-K state is a per-request ring, not a per-token cache:
-        # only the pending group's ``ratio`` members must survive a forward,
-        # addressed as ``req_pool_idx * ratio + position % ratio``.
-        # Request slot 0 is never allocated, so rows [0, ratio) are the inert dump.
+        # Pre-compression index-K state is a per-request RING, not a
+        # per-token cache: once a group's compressed key is written, its raw
+        # members are never read again, and page-granular prefix sharing
+        # keeps every extend chunk group-aligned, so the only state that
+        # must survive a forward is the pending group's members -- at most
+        # ``ratio - 1`` tokens per request before a forward that may add a
+        # verify window of ``ratio`` rows, addressed as
+        # ``req_pool_idx * ring + position % ring`` with ``ring = 2 * ratio``
+        # (``qsa_ring_slots_per_request``). Request slot 0 is never
+        # allocated, so ring rows [0, ring) double as the inert dump for
+        # tokens whose group already compressed in the same forward.
         if num_request_slots <= 0:
             raise ValueError(
                 f"QSA pending ring needs request slots, got {num_request_slots}"
             )
+        from sglang.srt.layers.attention.qsa.metadata import (
+            qsa_ring_slots_per_request,
+        )
+
         self.qsa_num_request_slots = int(num_request_slots)
-        ring_slots = self.qsa_num_request_slots * self.qsa_compress_ratio
+        ring_slots = self.qsa_num_request_slots * qsa_ring_slots_per_request(
+            self.qsa_compress_ratio
+        )
         # These buffers participate in Mooncake PD transfer just like the base
         # KV and Mamba pools.  Keep their allocation in the same memory-saver
         # and Mooncake custom-pool regions; otherwise MNNVL cannot resolve the
