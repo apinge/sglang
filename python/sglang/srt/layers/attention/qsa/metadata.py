@@ -271,7 +271,7 @@ def build_pending_ring_slots(
     if is_extend:
         lengths = sequence_lengths.long()[rows]
         pending = positions >= (lengths // compress_ratio) * compress_ratio
-        slots = torch.where(pending, slots, positions % ring)
+        slots = torch.where(pending, slots, positions % ring_slots)
     return slots
 
 
