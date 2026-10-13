@@ -255,22 +255,23 @@ def build_pending_ring_slots(
 ) -> torch.Tensor:
     """Per-token slots in the per-request pending ring.
 
-    ``req_pool_idx * ring + position % ring`` with
-    ``ring = qsa_ring_slots_per_request(ratio)``: ``ring`` consecutive
-    positions occupy distinct slots. On extend forwards only the pending tail
-    must survive the forward (compression sources members from the chunk
-    itself), so older tokens dump into ring rows [0, ring) -- request slot 0
-    is never allocated. Pure tensor arithmetic, CUDA-graph safe.
+    ``req_pool_idx * ring_slots + position % ring_slots`` with
+    ``ring_slots = qsa_ring_slots_per_request(ratio)``. Each request owns
+    ``ring_slots`` consecutive pending-state slots. On extend forwards only
+    the pending tail must survive the forward (compression sources members
+    from the chunk itself), so older tokens dump into rows
+    ``[0, ring_slots)`` -- request slot 0 is never allocated. Pure tensor
+    arithmetic, CUDA-graph safe.
     """
     rows = token_to_batch_idx.long()[: logical_positions.numel()]
     requests = req_pool_indices.long()[rows]
     positions = logical_positions.long()
-    ring = qsa_ring_slots_per_request(compress_ratio)
-    slots = requests * ring + positions % ring
+    ring_slots = qsa_ring_slots_per_request(compress_ratio)
+    slots = requests * ring_slots + positions % ring_slots
     if is_extend:
         lengths = sequence_lengths.long()[rows]
         pending = positions >= (lengths // compress_ratio) * compress_ratio
-        slots = torch.where(pending, slots, positions % ring)
+        slots = torch.where(pending, slots, positions % ring_slots)
     return slots
 
 
@@ -281,7 +282,7 @@ def build_group_ring_slots(
     sequence_ids: torch.Tensor,
     compress_ratio: int,
 ) -> torch.Tensor:
-    """Ring slots of a planned group's members, oldest first."""
+    """Pending-state slots of a planned group's members, oldest first."""
     requests = req_pool_indices.long()[sequence_ids]
     offsets = torch.arange(
         compress_ratio - 1,
@@ -291,8 +292,8 @@ def build_group_ring_slots(
         dtype=torch.long,
     )
     positions = (group_end_positions[:, None] - offsets[None, :]).clamp_min(0)
-    ring = qsa_ring_slots_per_request(compress_ratio)
-    return requests[:, None] * ring + positions % ring
+    ring_slots = qsa_ring_slots_per_request(compress_ratio)
+    return requests[:, None] * ring_slots + positions % ring_slots
 
 
 def build_rope_position_matrix(
