@@ -196,9 +196,9 @@ class PyHIPIndexer:
                 metadata=metadata,
                 state_slots=state_slots,
             )
-        if metadata.is_cuda_graph and batch.forward_mode in (
-            ForwardMode.DECODE,
-            ForwardMode.TARGET_VERIFY,
+        if batch.forward_mode == ForwardMode.DECODE or (
+            metadata.is_cuda_graph
+            and batch.forward_mode == ForwardMode.TARGET_VERIFY
         ):
             return self._decode(
                 indexer=indexer,
@@ -322,23 +322,41 @@ class PyHIPIndexer:
     def _decode(
         self, *, indexer, hidden, positions, logical, metadata, state_slots, verify
     ):
-        if any(
-            t is None
-            for t in (
-                metadata.graph_write_locs,
-                metadata.graph_ring_group_locs,
-                metadata.decode_logical_positions,
-                metadata.graph_compressed_page_table,
-                metadata.graph_compressed_lengths,
-            )
-        ):
-            return None
+        if metadata.is_cuda_graph:
+            if any(
+                t is None
+                for t in (
+                    metadata.graph_write_locs,
+                    metadata.graph_ring_group_locs,
+                    metadata.decode_logical_positions,
+                    metadata.graph_compressed_page_table,
+                    metadata.graph_compressed_lengths,
+                )
+            ):
+                return None
+            groups = metadata.graph_ring_group_locs
+            writes = metadata.graph_write_locs
+        else:
+            if any(
+                t is None
+                for t in (
+                    metadata.write_locs,
+                    metadata.compress_group_ring_locs,
+                    metadata.decode_logical_positions,
+                    metadata.decode_page_table,
+                    metadata.decode_lengths,
+                )
+            ):
+                return None
+            groups = metadata.compress_group_ring_locs
+            writes = metadata.write_locs
         cache, table, lengths, _ = metadata.get_decode_mqa_inputs(indexer.layer_id)
         rows = len(hidden)
-        groups, writes = (
-            metadata.graph_ring_group_locs[:rows],
-            metadata.graph_write_locs[:rows],
-        )
+        groups, writes = groups[:rows], writes[:rows]
+        if not metadata.is_cuda_graph:
+            # Eager metadata keeps ring slots as int64 for native tensor
+            # indexing; the PyHIP decode ABI uses int32, like graph metadata.
+            groups = groups.to(dtype=torch.int32).contiguous()
         if (
             not self._supports_decode(
                 rows=rows,
