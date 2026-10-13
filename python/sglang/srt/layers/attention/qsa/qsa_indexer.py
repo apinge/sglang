@@ -6,6 +6,7 @@ from typing import Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
@@ -22,12 +23,20 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx942_supported, is_hip
 
 # Bound the dominant FP32 [query_rows, compressed_keys] prefill workspace.
 # Top-k is row-independent, so large scheduler chunks can be scored in smaller
 # row tiles without changing the selected blocks.
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
+
+
+# Qwen3.8 Flash Next's direct PyHIP indexer is implemented for gfx942 only.
+# Per-forward input and metadata checks remain in PyHIPIndexer.
+_USE_PYHIP_QSA_INDEXER = (
+    envs.SGLANG_USE_PYHIP_QSA.get()
+    and is_gfx942_supported()
+)
 
 
 def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
@@ -82,6 +91,11 @@ class QSAIndexer(MultiPlatformOp):
             self.index_head_dim, eps=getattr(config, "rms_norm_eps", 1e-6)
         )
         self._rope_axis_map_cache = None
+        self._pyhip_indexer = None
+        if _USE_PYHIP_QSA_INDEXER:
+            from sglang.srt.layers.attention.qsa.pyhip_backend import PyHIPIndexer
+
+            self._pyhip_indexer = PyHIPIndexer.create(indexer=self)
 
     @staticmethod
     def _validate_config(config) -> None:
@@ -607,6 +621,18 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.compress_member_rows is not None,
             )
+        if hidden_states.is_cuda and self._pyhip_indexer is not None:
+            output = self._pyhip_indexer.forward(
+                indexer=self,
+                hidden=hidden_states,
+                positions=positions,
+                logical=logical_positions,
+                batch=forward_batch,
+                metadata=indexer_metadata,
+                state_slots=state_slots,
+            )
+            if output is not None:
+                return output
         q, token_k, state_stored = self.project_qk(
             hidden_states,
             positions,

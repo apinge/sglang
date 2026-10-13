@@ -41,8 +41,9 @@ class QSATokenToKVPool(HybridLinearKVPool):
     ) -> int:
         """Per-token cost of the QSA index caches: the compressed keys only.
 
-        Pre-compression state is a per-request ring of ``compress_ratio``
-        slots (the pending group's members), not a per-token cache, so it
+        Pre-compression state is a per-request ring of ``2 * compress_ratio``
+        slots (pending group members plus a verify window), not a per-token
+        cache, so it
         does not price per token; its total is bounded by the request-slot
         count and stays outside this budget like the other per-request
         buffers.
@@ -134,16 +135,24 @@ class QSATokenToKVPool(HybridLinearKVPool):
         # members are never read again, and page-granular prefix sharing
         # keeps every extend chunk group-aligned, so the only state that
         # must survive a forward is the pending group's members -- at most
-        # ``ratio`` tokens per request, addressed as
-        # ``req_pool_idx * ratio + position % ratio``. Request slot 0 is
-        # never allocated, so ring rows [0, ratio) double as the inert dump
-        # for tokens whose group already compressed in the same forward.
+        # ``ratio - 1`` tokens per request before a forward that may add a
+        # verify window of ``ratio`` rows, addressed as
+        # ``req_pool_idx * ring + position % ring`` with ``ring = 2 * ratio``
+        # (``qsa_ring_slots_per_request``). Request slot 0 is never
+        # allocated, so ring rows [0, ring) double as the inert dump for
+        # tokens whose group already compressed in the same forward.
         if num_request_slots <= 0:
             raise ValueError(
                 f"QSA pending ring needs request slots, got {num_request_slots}"
             )
+        from sglang.srt.layers.attention.qsa.metadata import (
+            qsa_ring_slots_per_request,
+        )
+
         self.qsa_num_request_slots = int(num_request_slots)
-        ring_slots = self.qsa_num_request_slots * self.qsa_compress_ratio
+        ring_slots = self.qsa_num_request_slots * qsa_ring_slots_per_request(
+            self.qsa_compress_ratio
+        )
         self.qsa_key_state_buffer_pool = [
             torch.zeros(
                 (ring_slots, self.qsa_index_kv_heads, self.qsa_index_head_dim),
