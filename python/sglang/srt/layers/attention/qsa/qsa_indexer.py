@@ -23,12 +23,20 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx942_supported, is_hip
 
 # Bound the dominant FP32 [query_rows, compressed_keys] prefill workspace.
 # Top-k is row-independent, so large scheduler chunks can be scored in smaller
 # row tiles without changing the selected blocks.
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
+
+
+# Qwen3.8 Flash Next's direct PyHIP indexer is implemented for gfx942 only.
+# Per-forward input and metadata checks remain in PyHIPIndexer.
+_USE_PYHIP_QSA_INDEXER = (
+    envs.SGLANG_USE_PYHIP_QSA.get()
+    and is_gfx942_supported()
+)
 
 
 def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
@@ -84,7 +92,7 @@ class QSAIndexer(MultiPlatformOp):
         )
         self._rope_axis_map_cache = None
         self._pyhip_indexer = None
-        if is_hip() and envs.SGLANG_USE_PYHIP_QSA.get():
+        if _USE_PYHIP_QSA_INDEXER:
             from sglang.srt.layers.attention.qsa.pyhip_backend import PyHIPIndexer
 
             self._pyhip_indexer = PyHIPIndexer.create(indexer=self)

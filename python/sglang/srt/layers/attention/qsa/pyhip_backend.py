@@ -132,16 +132,13 @@ class PyHIPIndexer:
         return cls()
 
     @staticmethod
-    def _supports_frame(*, indexer, hidden, positions):
+    def can_use_for_forward(*, indexer, hidden, positions):
         cache = indexer.rotary_emb.cos_sin_cache
         return (
             hidden.is_cuda
             and hidden.dtype == torch.bfloat16
             and len(hidden) > 0
             and not torch.compiler.is_compiling()
-            and torch.cuda.get_device_properties(hidden.device).gcnArchName.startswith(
-                "gfx942"
-            )
             and positions.dtype == torch.int64
             and positions.ndim in (1, 2)
             and positions.shape[-1] == len(hidden)
@@ -185,7 +182,7 @@ class PyHIPIndexer:
     def forward(
         self, *, indexer, hidden, positions, logical, batch, metadata, state_slots
     ):
-        if not self._supports_frame(
+        if not self.can_use_for_forward(
             indexer=indexer, hidden=hidden, positions=positions
         ):
             return None
