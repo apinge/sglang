@@ -34,15 +34,16 @@ def _assert_close_to_reference(out, x, w):
     assert err <= max(blas_err * 2.0, 1e-2), (err, blas_err)
 
 
-# M covers both edges of each kernel bucket (1 | 2..16 | 17..32); N=31041 and
-# 4097 leave a partial last N tile for every BLOCK_N; K=512 is one K step.
+# Kernel mechanics with a shipped config (TP8 shard entry): M covers both edges of
+# each kernel family (1 | 2..16 | 17..32); N=31041, 4097 and 64 leave a partial
+# last N tile for every BLOCK_N; K=512 is a single BLOCK_K=512 step.
 @pytest.mark.parametrize("m", [1, 2, 3, 16, 17, 31, 32])
-@pytest.mark.parametrize("n,k", [(31040, 2560), (31041, 2560), (4097, 4096), (64, 512)])
-def test_matches_reference(m, n, k):
-    from sglang.kernels.ops.gemm.rocm_bf16_gemv import rocm_bf16_gemv
+@pytest.mark.parametrize("n,k", [(31041, 2560), (4097, 4096), (64, 512)])
+def test_kernel_matches_reference(m, n, k):
+    from sglang.kernels.ops.gemm.rocm_bf16_gemv import _get_config, _launch
 
     x, w = _make(m, n, k)
-    _assert_close_to_reference(rocm_bf16_gemv(x, w), x, w)
+    _assert_close_to_reference(_launch(x, w, _get_config(m, 31040, 2560)), x, w)
 
 
 @pytest.mark.parametrize("m", [1, 8, 24])
@@ -53,7 +54,7 @@ def test_strided_rows(m):
         use_rocm_bf16_gemv,
     )
 
-    n, k = 4097, 2560
+    n, k = 31040, 2560
     x_buf, w_buf = _make(m, n, k + 512)
     x, w = x_buf[:, :k], w_buf[:, :k]
     assert use_rocm_bf16_gemv(x, w)
@@ -61,14 +62,17 @@ def test_strided_rows(m):
 
 
 def test_predicate_rejects_unsupported():
+    """Only tuned (N, K) shapes are routed; untuned ones measured slower than hipBLASLt."""
     from sglang.kernels.ops.gemm.rocm_bf16_gemv import use_rocm_bf16_gemv
 
-    x, w = _make(32, 1024, 2560)
+    x, w = _make(32, 31040, 2560)
     assert use_rocm_bf16_gemv(x, w)
-    assert not use_rocm_bf16_gemv(_make(33, 1024, 2560)[0], w)  # M > 32
+    assert not use_rocm_bf16_gemv(x, _make(1, 31041, 2560)[1])  # untuned N
+    assert not use_rocm_bf16_gemv(x, _make(1, 4096, 2560)[1])  # small N
+    x_k, w_k = _make(4, 31040, 3072)  # untuned K
+    assert not use_rocm_bf16_gemv(x_k, w_k)
+    assert not use_rocm_bf16_gemv(_make(33, 31040, 2560)[0], w)  # M > 32
     assert not use_rocm_bf16_gemv(x[:0], w)  # M == 0
-    x_odd_k, w_odd_k = _make(4, 1024, 2560 + 64)  # K not a multiple of 512
-    assert not use_rocm_bf16_gemv(x_odd_k, w_odd_k)
     assert not use_rocm_bf16_gemv(x.half(), w.half())
     assert not use_rocm_bf16_gemv(x.float(), w)
     assert not use_rocm_bf16_gemv(x, w.t().contiguous().t())  # K not unit-stride
@@ -90,6 +94,37 @@ def test_cuda_graph_replay(m):
     graph.replay()
     torch.cuda.synchronize()
     _assert_close_to_reference(out, x, w)
+
+
+def _shipped_buckets():
+    from sglang.kernels.ops.gemm.rocm_bf16_gemv import _GFX942_CONFIGS
+
+    cases = []
+    for shape, buckets in _GFX942_CONFIGS.items():
+        bounds = sorted(buckets)
+        lower = [1] + [b + 1 for b in bounds[:-1]]
+        for lo, hi in zip(lower, bounds):
+            for m in sorted({lo, hi}):
+                cases.append(pytest.param(shape, m, id=f"{shape}-M{m}"))
+    return cases
+
+
+@pytest.mark.parametrize("shape,m", _shipped_buckets())
+def test_shipped_configs_match_reference(shape, m):
+    """Every tuned entry, at both edges of its M bucket and at its own N."""
+    from sglang.kernels.ops.gemm.rocm_bf16_gemv import rocm_bf16_gemv
+
+    n, k = shape
+    x, w = _make(m, n, k)
+    _assert_close_to_reference(rocm_bf16_gemv(x, w), x, w)
+
+
+def test_configs_cover_all_supported_m():
+    """An entry whose largest bucket is below the predicate's M limit fails at runtime."""
+    from sglang.kernels.ops.gemm.rocm_bf16_gemv import _GFX942_CONFIGS, _MAX_M
+
+    for shape, buckets in _GFX942_CONFIGS.items():
+        assert min(buckets) == 1 and max(buckets) >= _MAX_M, (shape, sorted(buckets))
 
 
 class _LMHeadStub(torch.nn.Module):
@@ -117,7 +152,7 @@ def test_lm_head_routing(enabled):
     import sglang.srt.layers.logits_processor as lp
     from sglang.srt.environ import envs
 
-    n, k = 4097, 2560
+    n, k = 31040, 2560
     x, w = _make(4, n, k)
     with envs.SGLANG_ENABLE_ROCM_LM_HEAD_GEMV.override(enabled):
         processor = _make_logits_processor(n)
