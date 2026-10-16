@@ -508,6 +508,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 isinstance(self.draft_attn_backend, AiterMultiStepDraftBackend)
                 or isinstance(self.draft_extend_attn_backend, DeepseekV4HipRadixBackend)
                 or isinstance(self.draft_extend_attn_backend, DeepseekSparseAttnBackend)
+                # Same graph-stable QSA draft-extend metadata as on CUDA (below).
+                or (
+                    self.draft_extend_attn_backend is not None
+                    and is_qwen_qsa(self.draft_runner.model_config.hf_config)
+                )
             )
 
         graph_supported_backend_types = [

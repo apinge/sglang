@@ -3,6 +3,7 @@
 import importlib.util
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -14,7 +15,11 @@ from sglang.srt.layers.attention.qsa.metadata import (
     qsa_ring_slots_per_request,
 )
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
-from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
+from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+    QSAMTPSharedSparseIndices,
+    QwenSparseAttnBackend,
+    QwenSparseAttnMetadata,
+)
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -152,9 +157,16 @@ class TestPyHIPQSA(CustomTestCase):
 
     @torch.no_grad()
     def test_attention_cache_and_padding(self):
+        self._check_attention_cache_and_padding(is_draft_worker=False)
+
+    @torch.no_grad()
+    def test_draft_prefill_attention_cache_and_padding(self):
+        self._check_attention_cache_and_padding(is_draft_worker=True)
+
+    def _check_attention_cache_and_padding(self, *, is_draft_worker):
         from pyhip.testing.qsa_reference import reference
 
-        for heads in (12, 6):
+        for heads in (12, 6, 3):
             for queries, prefixes in (((33,), (0,)), ((7, 0, 9), (2048, 0, 12))):
                 with self.subTest(heads=heads, queries=queries, prefixes=prefixes):
                     rows = sum(queries)
@@ -181,7 +193,7 @@ class TestPyHIPQSA(CustomTestCase):
                         model_config=SimpleNamespace(
                             hf_text_config=_config(), context_len=8192
                         ),
-                        is_draft_worker=False,
+                        is_draft_worker=is_draft_worker,
                         kv_cache_dtype=torch.bfloat16,
                         ps=SimpleNamespace(attn_cp_size=1, attn_dcp_size=1),
                     )
@@ -248,6 +260,16 @@ class TestPyHIPQSA(CustomTestCase):
                         is_cross_attention=False,
                         pos_encoding_mode="NONE",
                     )
+                    # Supply the full-context slot plan that serving metadata
+                    # prepares before attention; the fixture has no indexer pool.
+                    backend.forward_metadata = SimpleNamespace(
+                        packed_kv_slots=torch.cat(
+                            [
+                                table[request, :length]
+                                for request, length in enumerate(lengths)
+                            ]
+                        )
+                    )
                     output = backend.forward_extend(
                         query, keys, values, layer, batch, topk_indices=indices
                     )
@@ -284,13 +306,24 @@ class TestPyHIPQSA(CustomTestCase):
                     self.assertTrue(bool((output[rows:] == 0).all()))
                     self.assertEqual(len(backend._pyhip_attention.checked_layouts), 1)
                     self.assertFalse(
-                        backend._pyhip_attention.supports(
+                        backend._pyhip_attention.can_use_for_forward(
                             q=query[:rows],
                             k=keys[:rows],
                             v=values[:rows],
                             indices=indices,
                             layer=layer,
                             forward_mode=ForwardMode.TARGET_VERIFY,
+                            kwargs={},
+                        )
+                    )
+                    self.assertFalse(
+                        backend._pyhip_attention.can_use_for_forward(
+                            q=query[:rows],
+                            k=keys[:rows],
+                            v=values[:rows],
+                            indices=indices,
+                            layer=layer,
+                            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
                             kwargs={},
                         )
                     )
@@ -525,6 +558,344 @@ class TestPyHIPQSA(CustomTestCase):
         self.assertEqual(
             int(module._pyhip_indexer.validation.decode_checks.item()), checks + 2
         )
+
+    @torch.no_grad()
+    def test_draft_extend_indexer_eager_and_graph(self):
+        from sglang.srt.layers.attention.qsa.graph_metadata import launch_graph_metadata
+
+        with envs.SGLANG_USE_PYHIP_QSA.override(
+            True
+        ), envs.SGLANG_TEST_PYHIP_QSA.override(False):
+            module = _indexer(self.device)
+        wrapper = module._pyhip_indexer
+        self.assertIsNotNone(wrapper)
+        for bases in ((4,), (5,), (6,), (7,), (2046, 14)):
+            with self.subTest(bases=bases):
+                wrapper.validation = None
+                pool = _pool(self.device)
+                table = torch.stack(
+                    [
+                        torch.zeros(4096, dtype=torch.int32, device=self.device),
+                        64 + torch.arange(4096, dtype=torch.int32, device=self.device),
+                        4224
+                        + torch.arange(4096, dtype=torch.int32, device=self.device),
+                    ]
+                )
+                bs, window = len(bases), 4
+                reqs = torch.arange(1, bs + 1, device=self.device)
+                extends = torch.full(
+                    (bs,), window, dtype=torch.int32, device=self.device
+                )
+                logical = torch.cat(
+                    [
+                        torch.arange(base, base + window, device=self.device)
+                        for base in bases
+                    ]
+                )
+                rows = len(logical)
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+                    positions=logical,
+                    seq_lens=torch.tensor(
+                        [b + window for b in bases], device=self.device
+                    ),
+                    seq_lens_cpu=torch.tensor([b + window for b in bases]),
+                    extend_seq_lens=extends,
+                    req_pool_indices=reqs,
+                    batch_size=bs,
+                    out_cache_loc=torch.zeros(
+                        rows, dtype=torch.int64, device=self.device
+                    ),
+                    spec_info=SimpleNamespace(
+                        draft_token_num=window,
+                        num_front_tokens=0,
+                        num_accept_tokens=torch.tensor(
+                            [min(i + 2, window) for i in range(bs)], device=self.device
+                        ),
+                    ),
+                    _original_forward_mode=None,
+                )
+                backend = QwenSparseAttnBackend(
+                    SimpleNamespace(
+                        device=self.device,
+                        token_to_kv_pool=pool,
+                        req_to_token_pool=SimpleNamespace(req_to_token=table),
+                        model_config=SimpleNamespace(
+                            hf_text_config=_config(), context_len=4096
+                        ),
+                        ps=SimpleNamespace(attn_cp_size=1, attn_dcp_size=1),
+                        kv_cache_dtype=torch.bfloat16,
+                        is_draft_worker=True,
+                    )
+                )
+                eager = backend._metadata_from_forward_batch(batch).indexer_metadata
+                positions = torch.stack([logical, logical + 3, logical + 7])
+                hidden = torch.randn(
+                    (rows, 2560), dtype=torch.bfloat16, device=self.device
+                )
+
+                def snapshot():
+                    return tuple(
+                        t.clone()
+                        for t in (
+                            pool.get_qsa_key_state_buffer(3),
+                            pool.qsa_rope_position_buffer,
+                            pool.get_qsa_compressed_k_buffer(3),
+                        )
+                    )
+
+                def restore(saved):
+                    for buffer, value in zip(
+                        (
+                            pool.get_qsa_key_state_buffer(3),
+                            pool.qsa_rope_position_buffer,
+                            pool.get_qsa_compressed_k_buffer(3),
+                        ),
+                        saved,
+                    ):
+                        buffer.copy_(value)
+
+                def native(metadata):
+                    module._pyhip_indexer = None
+                    try:
+                        with patch.object(
+                            module,
+                            "select_decode_tokens",
+                            wraps=module.select_decode_tokens,
+                        ) as select:
+                            output = module.forward_cuda(
+                                hidden, positions, batch, metadata
+                            )
+                            query = select.call_args.args[0][:, :4].double()
+                        cache, pages, counts, _ = metadata.get_decode_mqa_inputs(3)
+                        slots = pages.long()[:, :, None] * 16 + torch.arange(
+                            16, device=self.device
+                        )
+                        keys = (
+                            cache.reshape(-1, 128)[slots.flatten()]
+                            .reshape(len(query), -1, 128)
+                            .double()
+                        )
+                        logits = (
+                            torch.einsum("rhd,rnd->rhn", query, keys).relu().sum(1)
+                            / 128**0.5
+                        )
+                        return output, logits, counts
+                    finally:
+                        module._pyhip_indexer = wrapper
+
+                def check(output, expected, state):
+                    from sglang.test.qsa_validation import _selection_valid
+
+                    tokens, logits, counts = expected
+                    # Judge near-tied top-k boundaries against independent
+                    # FP64 logits instead of requiring native token identity.
+                    real = torch.ones(len(output), dtype=torch.bool, device=self.device)
+                    self.assertTrue(
+                        bool(
+                            _selection_valid(
+                                logits=logits,
+                                lengths=counts,
+                                actual=output,
+                                expected=tokens,
+                                real=real,
+                            )
+                        )
+                    )
+                    for index, (actual, wanted) in enumerate(zip(snapshot(), state)):
+                        # Reserved ring/request 0 and compressed slot 0 are
+                        # inert sinks, so their concurrent writes are ignored.
+                        first = 1 if index == 2 else qsa_ring_slots_per_request(4)
+                        torch.testing.assert_close(
+                            actual[first:], wanted[first:], atol=0, rtol=0
+                        )
+
+                initial = snapshot()
+                expected = native(eager)
+                expected_state = snapshot()
+                restore(initial)
+                with patch.object(
+                    wrapper.runtime,
+                    "decode_indexer",
+                    wraps=wrapper.runtime.decode_indexer,
+                ) as decode:
+                    output = module.forward_cuda(hidden, positions, batch, eager)
+                    self.assertEqual(decode.call_count, 1)
+                    self.assertTrue(decode.call_args.kwargs["verify"])
+                torch.cuda.synchronize()
+                check(output, expected, expected_state)
+
+                # Unsupported widened windows must decline before mutating
+                # the pending ring or compressed cache.
+                before = snapshot()
+                batch.spec_info.num_front_tokens = 1
+                self.assertIsNone(
+                    wrapper.forward(
+                        indexer=module,
+                        hidden=hidden,
+                        positions=positions,
+                        logical=eager.decode_logical_positions,
+                        batch=batch,
+                        metadata=eager,
+                        state_slots=eager.pending_ring_slots,
+                    )
+                )
+                for actual, wanted in zip(snapshot(), before):
+                    torch.testing.assert_close(actual, wanted, atol=0, rtol=0)
+                batch.spec_info.num_front_tokens = 0
+
+                from sglang.test.qsa_validation import IndexerValidation
+
+                wrapper.validation = IndexerValidation()
+                module.forward_cuda(hidden, positions, batch, eager)
+                torch.cuda.synchronize()
+                self.assertEqual(int(wrapper.validation.decode_checks), 1)
+                wrapper.validation = None
+
+                # Graph buckets include one padding request (slot 0). Build
+                # row metadata from stable GPU request lengths inside the
+                # graph, just as the serving prologue does.
+                graph_bs, graph_rows = bs + 1, (bs + 1) * window
+                hidden = torch.randn(
+                    (graph_rows, 2560), dtype=torch.bfloat16, device=self.device
+                )
+                positions = torch.empty(
+                    (3, graph_rows), dtype=torch.int64, device=self.device
+                )
+                end_lengths = torch.tensor(
+                    [b + window for b in bases] + [1],
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                graph_reqs = torch.cat([reqs, reqs.new_zeros(1)])
+                graph_extends = torch.full(
+                    (graph_bs,), window, dtype=torch.int32, device=self.device
+                )
+                row_lengths = torch.empty(
+                    graph_rows, dtype=torch.int32, device=self.device
+                )
+                row_reqs = torch.empty_like(row_lengths)
+                graph_metadata = QSAIndexerMetadata(
+                    sequence_lengths=row_lengths,
+                    token_to_batch_idx=torch.arange(
+                        graph_rows, dtype=torch.int32, device=self.device
+                    ),
+                    token_slot_table=torch.zeros(
+                        (graph_rows, 1), dtype=torch.int32, device=self.device
+                    ),
+                    out_cache_loc=torch.zeros(
+                        graph_rows, dtype=torch.int64, device=self.device
+                    ),
+                    token_to_kv_pool=pool,
+                    compress_ratio=4,
+                    block_topk=512,
+                    req_pool_indices=row_reqs,
+                    is_cuda_graph=True,
+                    graph_write_locs=torch.empty_like(row_lengths),
+                    graph_compressed_lengths=torch.empty_like(row_lengths),
+                    graph_compressed_page_table=torch.empty(
+                        (graph_rows, 64), dtype=torch.int32, device=self.device
+                    ),
+                    graph_prefix_lengths=torch.empty_like(row_lengths),
+                    decode_logical_positions=torch.empty_like(row_lengths),
+                    pending_ring_slots=torch.empty(
+                        graph_rows, dtype=torch.int64, device=self.device
+                    ),
+                    graph_ring_group_locs=torch.empty(
+                        (graph_rows, 4), dtype=torch.int32, device=self.device
+                    ),
+                )
+                metadata = QwenSparseAttnMetadata(
+                    sequence_lengths=row_lengths,
+                    token_to_batch_idx=graph_metadata.token_to_batch_idx,
+                    token_slot_table=graph_metadata.token_slot_table,
+                    indexer_metadata=graph_metadata,
+                    row_req_pool_indices=row_reqs,
+                    is_cuda_graph=True,
+                )
+                state = QSAMTPSharedSparseIndices(
+                    layer_ids=[3],
+                    num_requests=3,
+                    token_topk=2051,
+                    tail_width=4,
+                    device=self.device,
+                )
+                backend.set_mtp_shared_sparse_indices(state)
+                batch.batch_size = graph_bs
+                batch.req_pool_indices = graph_reqs
+                batch.extend_seq_lens = graph_extends
+                batch.spec_info.num_accept_tokens = torch.tensor(
+                    [2] * bs + [4], device=self.device
+                )
+
+                def prepare():
+                    launch_graph_metadata(
+                        mode=2,
+                        bs=graph_bs,
+                        num_rows=graph_rows,
+                        seq_lens=end_lengths,
+                        req_pool_indices=graph_reqs,
+                        extend_lens=graph_extends,
+                        extend_len=0,
+                        num_padding=1,
+                        metadata=metadata,
+                        req_to_token=table,
+                        pool=pool,
+                    )
+                    logical = graph_metadata.decode_logical_positions.long()
+                    positions.copy_(torch.stack([logical, logical + 3, logical + 7]))
+
+                def run():
+                    prepare()
+                    output = module.forward_cuda(
+                        hidden, positions, batch, graph_metadata
+                    )
+                    backend.capture_mtp_sparse_indices(output, batch, 3, graph_metadata)
+                    return output
+
+                run()
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with model_capture_mode(), torch.cuda.graph(graph):
+                    output = run()
+                for accepted in (1, 3, 4):
+                    end_lengths[:bs].add_(accepted)
+                    batch.spec_info.num_accept_tokens[:bs].fill_(accepted)
+                    hidden.normal_()
+                    prepare()
+                    initial = snapshot()
+                    expected = native(graph_metadata)
+                    expected_state = snapshot()
+                    restore(initial)
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    check(output, expected, expected_state)
+                    for request in range(bs):
+                        anchor = request * window + accepted - 1
+                        torch.testing.assert_close(
+                            state.indices[0, request + 1, :2051],
+                            output[anchor],
+                            atol=0,
+                            rtol=0,
+                        )
+                        self.assertEqual(
+                            int(state.captured_len[0, request + 1]),
+                            int(row_lengths[anchor]),
+                        )
+
+                # The opt-in native comparison must itself record and replay.
+                wrapper.validation = IndexerValidation()
+                run()
+                torch.cuda.synchronize()
+                validation_graph = torch.cuda.CUDAGraph()
+                with model_capture_mode(), torch.cuda.graph(validation_graph):
+                    run()
+                end_lengths[:bs].add_(1)
+                hidden.neg_()
+                validation_graph.replay()
+                torch.cuda.synchronize()
+                self.assertEqual(int(wrapper.validation.decode_checks), 2)
+                wrapper.validation = None
 
 
 if __name__ == "__main__":

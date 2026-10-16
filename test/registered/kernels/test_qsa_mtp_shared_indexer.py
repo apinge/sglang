@@ -65,7 +65,11 @@ def test_prefill_extend_capture_anchors_last_row_per_request():
     )
     topk = torch.arange(5 * TOPK, dtype=torch.int32).reshape(5, TOPK)
     forward_batch = _forward_batch(
-        ForwardMode.EXTEND, req_pool_indices=req_pool_indices
+        ForwardMode.EXTEND,
+        batch_size=2,
+        spec_info=SimpleNamespace(extend_seq_lens_tensor=None, num_accept_tokens=None),
+        extend_seq_lens=torch.tensor([3, 2], dtype=torch.int32),
+        req_pool_indices=req_pool_indices,
     )
     assert backend.should_capture_mtp_sparse_indices(forward_batch)
     backend.capture_mtp_sparse_indices(topk, forward_batch, layer_id=48)

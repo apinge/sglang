@@ -701,6 +701,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 if extend_seq_lens is None:
                     raise ValueError("QSA extend metadata requires extend_seq_lens")
+                extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
                 token_to_batch_idx = torch.repeat_interleave(
                     torch.arange(
                         batch_size,
@@ -708,6 +709,13 @@ class QwenSparseAttnBackend(AttentionBackend):
                         dtype=torch.int32,
                     ),
                     extend_seq_lens.to(torch.long),
+                    # A host total avoids a readback that waits for all queued GPU
+                    # work (the whole target prefill, for the MTP draft extend).
+                    output_size=(
+                        None
+                        if extend_seq_lens_cpu is None
+                        else sum(extend_seq_lens_cpu)
+                    ),
                 )
                 # DP MAX_LEN pseudo-extend pads token rows after the real
                 # extend rows; the extra rows are trimmed downstream, but the
@@ -1305,25 +1313,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             return
         if metadata is None:
             metadata = self.get_indexer_metadata(layer_id, forward_batch)
-        if metadata.is_cuda_graph or forward_batch.forward_mode.is_draft_extend_v2():
-            self._capture_mtp_sparse_indices_from_extend_lens(
-                topk_indices, forward_batch, metadata, layer_id
-            )
-            return
-        if metadata.req_pool_indices is None or metadata.req_pool_indices.numel() == 0:
-            return
-        state = self._mtp_shared_sparse_indices
-        row_to_req = metadata.get_token_to_batch_idx().long()
-        row_req_pool_indices = metadata.req_pool_indices[
-            row_to_req[: topk_indices.shape[0]]
-        ]
-        is_last = torch.ones_like(row_req_pool_indices, dtype=torch.bool)
-        if row_req_pool_indices.numel() > 1:
-            is_last[:-1] = row_req_pool_indices[:-1] != row_req_pool_indices[1:]
-        anchor_rows = is_last.nonzero().flatten()
-        req_rows = row_req_pool_indices[anchor_rows]
-        captured_lens = metadata.get_seqlens_expanded()[anchor_rows]
-        state.capture(topk_indices[anchor_rows], req_rows, captured_lens, layer_id)
+        # The post-prefill EXTEND anchors at block ends too; deriving them from
+        # extend lengths (not a nonzero() over rows) keeps this sync-free.
+        self._capture_mtp_sparse_indices_from_extend_lens(
+            topk_indices, forward_batch, metadata, layer_id
+        )
 
     @staticmethod
     def _capture_extend_seq_lens(forward_batch) -> torch.Tensor:
