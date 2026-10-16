@@ -45,13 +45,10 @@ from sglang.srt.utils import is_gfx942_supported, is_hip
 logger = logging.getLogger(__name__)
 
 
-# This only decides whether a target QSA backend may construct the PyHIP
+# This only decides whether a target or draft QSA backend may construct the PyHIP
 # attention wrapper. `PyHIPAttention.can_use_for_forward()` remains the per-forward
 # contract for mode, graph state, and real Q/K/V layout.
-_USE_PYHIP_QSA_ATTENTION = (
-    envs.SGLANG_USE_PYHIP_QSA.get()
-    and is_gfx942_supported()
-)
+_USE_PYHIP_QSA_ATTENTION = envs.SGLANG_USE_PYHIP_QSA.get() and is_gfx942_supported()
 
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
@@ -265,7 +262,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         if (
             _USE_PYHIP_QSA_ATTENTION
             and runner is not None
-            and not runner.is_draft_worker
             and runner.ps.attn_cp_size == runner.ps.attn_dcp_size == 1
             and runner.kv_cache_dtype == torch.bfloat16
             and profile is not None
@@ -276,7 +272,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             from sglang.srt.layers.attention.qsa.pyhip_backend import PyHIPAttention
 
             self._pyhip_attention = PyHIPAttention()
-            logger.info("Using installed PyHIP for gfx942 QSA prefill attention")
+            logger.info(
+                "Using installed PyHIP for gfx942 QSA prefill attention (draft=%s)",
+                runner.is_draft_worker,
+            )
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -808,8 +807,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 int(length) for length in forward_batch.seq_lens_cpu[:batch_size]
             ]
             cpu_extend_lens = [
-                int(length)
-                for length in forward_batch.extend_seq_lens_cpu[:batch_size]
+                int(length) for length in forward_batch.extend_seq_lens_cpu[:batch_size]
             ]
             if any(
                 seq_len > extend_len
