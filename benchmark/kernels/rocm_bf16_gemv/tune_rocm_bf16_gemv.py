@@ -8,6 +8,7 @@ rocm_bf16_gemv.py, plus per-bucket timings. Run one process per N on an idle GPU
 
 Search is coarse-to-fine: tile shape first (BLOCK_N, BLOCK_K, num_warps) with neutral
 knobs, then waves_per_eu / num_stages / cache_modifier on the best tiles.
+All timings (candidates, hipBLASLt, shipped config) use triton.testing.do_bench.
 Every candidate is checked against an fp32 reference before it is timed. Only add an
 entry when the tuned config beats hipBLASLt in every bucket: listed shapes are the
 only ones routed to these kernels.
@@ -19,25 +20,16 @@ import json
 import statistics
 
 import torch
+import triton
 
 from sglang.kernels.ops.gemm.rocm_bf16_gemv import _GFX942_CONFIGS, _launch
 
 M_BOUNDS = (1, 2, 4, 8, 16, 24, 32)
 
 
-def _time_us(fn, iters):
-    for _ in range(5):
-        fn()
-    torch.cuda.synchronize()
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-        enable_timing=True
-    )
-    start.record()
-    for _ in range(iters):
-        fn()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters * 1000
+def _time_us(fn):
+    # Same settings as aiter's op_benchmarks (do_bench also flushes L2 between reps).
+    return triton.testing.do_bench(fn, warmup=25, rep=100) * 1000
 
 
 def _tile_candidates(m, k):
@@ -78,7 +70,7 @@ def _knob_candidates(tile):
         yield dict(tile, waves_per_eu=wpe, num_stages=stages, cache_modifier=cache)
 
 
-def _screen(x, w, ref, tol, candidates, iters):
+def _screen(x, w, ref, tol, candidates):
     timed = []
     for cfg in candidates:
         try:
@@ -88,13 +80,13 @@ def _screen(x, w, ref, tol, candidates, iters):
             continue
         if (out.float() - ref).abs().max().item() > tol:
             continue
-        timed.append((_time_us(lambda: _launch(x, w, cfg), iters), cfg))
+        timed.append((_time_us(lambda: _launch(x, w, cfg)), cfg))
     timed.sort(key=lambda item: item[0])
     return timed
 
 
-def _final_time(fn, repeats=3, iters=200):
-    return statistics.median(_time_us(fn, iters) for _ in range(repeats))
+def _final_time(fn, repeats=3):
+    return statistics.median(_time_us(fn) for _ in range(repeats))
 
 
 def tune_bucket(w, m):
@@ -104,9 +96,9 @@ def tune_bucket(w, m):
     blas_err = ((x @ w.t()).float() - ref).abs().max().item()
     tol = max(blas_err * 2.0, 1e-2)
 
-    tiles = _screen(x, w, ref, tol, _tile_candidates(m, k), iters=20)[:8]
+    tiles = _screen(x, w, ref, tol, _tile_candidates(m, k))[:8]
     knobs = [c for _, tile in tiles for c in _knob_candidates(tile)]
-    finalists = [cfg for _, cfg in _screen(x, w, ref, tol, knobs, iters=20)[:5]]
+    finalists = [cfg for _, cfg in _screen(x, w, ref, tol, knobs)[:5]]
 
     t_blas = _final_time(lambda: torch.matmul(x, w.t()))
     best = min(
