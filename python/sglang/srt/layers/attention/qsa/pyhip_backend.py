@@ -328,6 +328,7 @@ class PyHIPIndexer:
             and table.shape[0] == rows
             and table.is_contiguous()
             and table.shape[1] > 0
+            and table.shape[1] * 16 <= 65536
             and lengths.dtype == torch.int32
             and lengths.shape == (rows,)
             and lengths.is_contiguous()
