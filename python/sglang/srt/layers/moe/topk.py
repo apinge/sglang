@@ -865,7 +865,21 @@ def fused_topk(
     topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
 
     if scoring_func == "softmax":
-        if will_use_aiter_moe():
+        if (
+            will_use_aiter_moe()
+            and renormalize
+            and gating_output.dtype == torch.bfloat16
+            and gating_output.shape[1] == 512
+            and gating_output.stride(1) == 1
+        ):
+            # AITER has no asm kernel for 512 experts; its generic
+            # topkGatingSoftmax takes ~11 us at any batch size. Same result.
+            from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+                softmax_topk_renorm_bf16,
+            )
+
+            softmax_topk_renorm_bf16(gating_output, topk_weights, topk_ids)
+        elif will_use_aiter_moe():
             _, aiter_fused_topk = _get_aiter_topk_ops()
 
             # Use fused_topk instead of topk_softmax to auto dispatch to the correct kernel

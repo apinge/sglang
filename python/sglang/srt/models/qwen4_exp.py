@@ -1256,6 +1256,9 @@ class Qwen4ExpLayerExtensionMixin:
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
         self.ple = None
+        # hc_norm of the block after this layer; set by Qwen4ExpModel so the
+        # last combine also emits that block's normalised input.
+        self._next_hc_norm = None
 
         for attr_name in (
             "input_layernorm",
@@ -1315,6 +1318,9 @@ class Qwen4ExpLayerExtensionMixin:
                 [hidden_states for _ in range(self.hc_count)], dim=-1
             )
 
+        # From the previous layer, `residual` is this block's hc_norm input
+        # (or None); it is never set for PLE layers, which edit the input first.
+        hyper_input_normed = residual
         if self.ple is not None:
             if ple_batch is None:
                 if not _get_ple_forward_mode(forward_batch).is_idle():
@@ -1330,7 +1336,9 @@ class Qwen4ExpLayerExtensionMixin:
                     ple_query, forward_batch, ple_batch
                 )
 
-        hidden_states, residual = self.attn_hyper_connection.mix(hidden_states)
+        hidden_states, residual = self.attn_hyper_connection.mix(
+            hidden_states, hyper_input_normed
+        )
         return hidden_states, residual
 
     def _prepare_qwen4_exp_mlp(
@@ -1341,8 +1349,12 @@ class Qwen4ExpLayerExtensionMixin:
     ):
         if not forward_batch.forward_mode.is_idle():
             hidden_states = attn_tp_all_reduce(hidden_states)
-        hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
-        hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
+        hidden_states, hyper_input_normed = self.attn_hyper_connection.combine_norm(
+            hidden_states, residual, self.mlp_hyper_connection.hc_norm
+        )
+        hidden_states, residual = self.mlp_hyper_connection.mix(
+            hidden_states, hyper_input_normed
+        )
         return hidden_states, residual
 
     def _qwen4_exp_use_dp_moe_gather(self) -> bool:
@@ -1408,8 +1420,10 @@ class Qwen4ExpLayerExtensionMixin:
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ):
-        hidden_states = self.mlp_hyper_connection.combine(hidden_states, residual)
-        return hidden_states, None
+        # Returns (hidden_states, next block's hc_norm input or None).
+        return self.mlp_hyper_connection.combine_norm(
+            hidden_states, residual, self._next_hc_norm
+        )
 
 
 class Qwen4ExpLinearDecoderLayer(
@@ -1644,6 +1658,18 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_per_branch_norm=True,
         )
         self.hyper_connection_mixer = GatedResidual(hc_config, use_combine=False)
+        # Chain each layer's last combine to the next block's hc_norm (a
+        # PLE-free layer, or the final mixer) for the fused combine+norm.
+        # Plain attributes: the norms stay registered only under their owners.
+        if self.start_layer == 0 and self.end_layer == config.num_hidden_layers:
+            for layer_id in range(self.start_layer, self.end_layer):
+                if layer_id + 1 == self.end_layer:
+                    next_norm = self.hyper_connection_mixer.hc_norm
+                elif self.layers[layer_id + 1].ple is None:
+                    next_norm = self.layers[layer_id + 1].attn_hyper_connection.hc_norm
+                else:
+                    next_norm = None
+                object.__setattr__(self.layers[layer_id], "_next_hc_norm", next_norm)
 
     def forward(
         self,
@@ -1692,7 +1718,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         _commit_ple_batch(ple_batch, forward_batch)
 
         hc_hidden_states = hidden_states
-        hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
+        hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states, residual)
         if not forward_batch.forward_mode.is_idle():
             return hidden_states, hc_hidden_states
 
@@ -1728,6 +1754,18 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
         # mm routine passes input_ids=None; PLE needs the real ids.
         if input_ids is None:
             input_ids = forward_batch.input_ids
+        spec_algorithm = forward_batch.spec_algorithm
+        if (
+            input_embeds is not None
+            and forward_batch.mm_input_embeds is None
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and spec_algorithm is not None
+            and spec_algorithm.is_eagle()
+            and not spec_algorithm.is_eagle3()
+        ):
+            # Text-only prefill: the MTP draft extend shifts these prompt
+            # embeddings instead of re-embedding (and all-reducing) every token.
+            forward_batch.mm_input_embeds = input_embeds
         model_output = super().forward(
             input_ids=input_ids,
             positions=positions,

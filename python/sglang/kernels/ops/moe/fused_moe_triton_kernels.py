@@ -1626,3 +1626,77 @@ def fused_append_shared_experts_with_weights(
         num_warps=num_warps,
     )
     return out_ids, out_weights
+
+
+@triton.jit
+def _softmax_topk_renorm_bf16_kernel(
+    logits_ptr,
+    weights_ptr,
+    ids_ptr,
+    stride_row,
+    E: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    IDX_BITS: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_E)
+    bits = tl.load(logits_ptr + row * stride_row + offs, mask=offs < E, other=0.0)
+    bits = bits.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+    # One int32 max per pick: order-preserving BF16 bits above the inverted
+    # expert id, so equal logits resolve to the lower expert id.
+    order = tl.where((bits & 0x8000) != 0, (~bits) & 0xFFFF, bits | 0x8000)
+    id_mask = (1 << IDX_BITS) - 1
+    keys = tl.where(offs < E, (order << IDX_BITS) | (id_mask - offs), -1)
+    offs_k = tl.arange(0, BLOCK_K)
+    numers = tl.zeros([BLOCK_K], dtype=tl.float32)
+    ids = tl.zeros([BLOCK_K], dtype=tl.int32)
+    row_max = 0.0
+    total = 0.0
+    for k in tl.static_range(K):
+        best = tl.max(keys, axis=0)
+        top = best >> IDX_BITS
+        raw = tl.where((top & 0x8000) != 0, top & 0x7FFF, (~top) & 0xFFFF)
+        val = (raw << 16).to(tl.float32, bitcast=True)
+        if k == 0:
+            row_max = val
+        numer = tl.extra.hip.libdevice.exp(val - row_max)
+        # The HIP build flushes f32 denormals to zero.
+        numer = tl.where(numer < 1.1754943508222875e-38, 0.0, numer)
+        total += numer
+        numers = tl.where(offs_k == k, numer, numers)
+        ids = tl.where(offs_k == k, id_mask - (best & id_mask), ids)
+        keys = tl.where(keys == best, -1, keys)
+    numers = numers * (1.0 / total)
+    tl.store(weights_ptr + row * K + offs_k, numers, mask=offs_k < K)
+    tl.store(ids_ptr + row * K + offs_k, ids, mask=offs_k < K)
+
+
+def softmax_topk_renorm_bf16(
+    gating_output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> None:
+    """ROCm softmax top-k with renormalization for BF16 router logits.
+
+    Bit-identical to AITER topkGatingSoftmax (renormalize=True): picks by
+    logit with ties to the lower expert id, weights expf(l - l_max) times the
+    reciprocal of their in-order sum. fp fusion stays off so the expf sequence
+    rounds like the HIP build.
+    """
+    rows, experts = gating_output.shape
+    k = topk_ids.shape[1]
+    _softmax_topk_renorm_bf16_kernel[(rows,)](
+        gating_output,
+        topk_weights,
+        topk_ids,
+        gating_output.stride(0),
+        E=experts,
+        BLOCK_E=triton.next_power_of_2(experts),
+        IDX_BITS=(experts - 1).bit_length(),
+        K=k,
+        BLOCK_K=triton.next_power_of_2(k),
+        num_warps=1,
+        enable_fp_fusion=False,
+    )
