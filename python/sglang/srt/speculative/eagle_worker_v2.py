@@ -791,6 +791,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         )
                         topk_p = torch.ones_like(topk_index, dtype=torch.float32)
                         forward_batch.positions.add_(1)
+                elif self.topk == 1:
+                    # ROCm keeps max()'s tie-break (#26358) without the vocab softmax.
+                    topk_index = torch.max(
+                        logits_output.next_token_logits, dim=-1, keepdim=True
+                    ).indices
+                    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+                    forward_batch.positions.add_(1)
                 else:
                     probs = renorm_draft_probs(
                         logits_output.next_token_logits,
@@ -925,7 +932,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
-            forward_batch.mm_input_embeds = mm_input_embeds
+            if forward_batch.contains_mm_inputs():
+                forward_batch.mm_input_embeds = mm_input_embeds
+            elif mm_input_embeds.shape[0] == forward_batch.input_ids.shape[0]:
+                # Text-only target prompt embeddings (Qwen4Exp): move them onto
+                # the shifted draft ids; the draft model re-embeds the last row
+                # of every request (its tail token).
+                shifted = torch.empty_like(mm_input_embeds)
+                shifted[:-1].copy_(mm_input_embeds[1:])
+                forward_batch.mm_input_embeds = shifted
 
         # Seed the first draft-decode loop from each request's last prefill
         # position. Gather last-per-req before the copy (prefill can be long).
@@ -964,15 +979,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
-            logits_output.next_token_logits,
-            batch.sampling_info,
-            use_rejection_sampling,
-        )
-        if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
+        if self.topk == 1 and _is_hip and not use_rejection_sampling:
+            # ROCm keeps max()'s tie-break (#26358) without the vocab softmax.
+            probs = None
+            topk_index = torch.max(
+                logits_output.next_token_logits, dim=-1, keepdim=True
+            ).indices
+            topk_p = torch.ones_like(topk_index, dtype=torch.float32)
         else:
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            probs = renorm_draft_probs(
+                logits_output.next_token_logits,
+                batch.sampling_info,
+                use_rejection_sampling,
+            )
+            if use_rejection_sampling:
+                topk_p, topk_index = fast_sample(probs, num_samples=1)
+            else:
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
@@ -1120,6 +1143,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_topk_index = torch.argmax(
                 draft_logits_output.next_token_logits, dim=-1, keepdim=True
             )
+            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            ret_draft_probs = None
+        elif self.topk == 1:
+            # ROCm keeps max()'s tie-break (#26358) without the vocab softmax.
+            ret_topk_index = torch.max(
+                draft_logits_output.next_token_logits, dim=-1, keepdim=True
+            ).indices
             ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
         else:
