@@ -1021,6 +1021,11 @@ class Envs:
     SGLANG_BF16_GEMM_LOG_SHAPES = EnvBool(False)
     # Split the HC combine gate dot across CTAs instead of one CTA per row.
     SGLANG_HC_COMBINE_SPLIT = EnvBool(True)
+    SGLANG_GFX942_GDN_PREFILL_TILES = EnvBool(False)
+    SGLANG_GFX942_GDN_VERIFY_TILES = EnvBool(False)
+    SGLANG_GFX942_GDN_CUMSUM = EnvBool(False)
+    SGLANG_GFX942_GDN_QKV_SPLIT = EnvBool(False)
+    SGLANG_GFX942_GDN_GATING = EnvBool(False)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
