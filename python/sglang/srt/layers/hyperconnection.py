@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import msgspec
 import torch
@@ -260,7 +260,11 @@ class GatedResidual(HyperConnectionBase):
             raise ValueError("GR checkpoint weight shape mismatch")
         param.copy_(loaded_weight)
 
-    def mix(self, hyper_input: torch.Tensor):
+    def mix(
+        self,
+        hyper_input: torch.Tensor,
+        hyper_input_normed: Optional[torch.Tensor] = None,
+    ):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
             mixed_input = hyper_input.new_empty(
@@ -268,9 +272,10 @@ class GatedResidual(HyperConnectionBase):
             )
             return mixed_input, (hyper_input, hyper_input)
 
-        if self.config.hc_per_branch_norm:
+        # The previous combine_norm() may already have normalised hyper_input.
+        if hyper_input_normed is None and self.config.hc_per_branch_norm:
             hyper_input_normed = self.hc_norm(hyper_input)
-        else:
+        elif hyper_input_normed is None:
             hyper_input_normed = self.hc_norm(
                 hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
             ).flatten(-2)
@@ -370,6 +375,48 @@ class GatedResidual(HyperConnectionBase):
             self.hidden_size,
         ).to(self.params_dtype)
         return updated_residuals
+
+    def combine_norm(
+        self,
+        block_output: torch.Tensor,
+        residuals,
+        norm: Optional[GroupedGemmaRMSNorm],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """combine() plus ``norm`` of its output, fused on the split path.
+
+        Returns ``(combined, normed)``; ``normed`` is None when the fused
+        kernel does not apply and the next mix() normalises as usual.
+        """
+        hyper_input, hyper_input_normed = residuals
+        if (
+            norm is not None
+            and self._split_combine_ok
+            and 0 < block_output.shape[0] <= 32
+            and block_output.is_cuda
+            and block_output.dtype in (torch.bfloat16, torch.float16)
+            and hyper_input.dtype == block_output.dtype
+            and hyper_input_normed.dtype == block_output.dtype
+            and self.block_inject_weight.weight.dtype == block_output.dtype
+            and norm.weight.dtype == block_output.dtype
+            # One weight row per branch; a shared-weight norm falls back.
+            and norm.group_size == self.hidden_size
+            and norm._jit_group_size == self.hidden_size
+        ):
+            from sglang.kernels.ops.elementwise.hc_combine import (
+                hc_combine_split_norm,
+            )
+
+            return hc_combine_split_norm(
+                block_output,
+                hyper_input,
+                hyper_input_normed,
+                self.block_inject_weight.weight.data,
+                norm.weight.data,
+                norm.variance_epsilon,
+                self.hc_count,
+                self.hidden_size,
+            )
+        return self.combine(block_output, residuals), None
 
 
 HYPERCONNECTION_CLASS_DICT = {

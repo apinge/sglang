@@ -380,4 +380,182 @@ struct HcCombineSplitKernel {
   }
 };
 
+struct HcCombineSplitNormParams {
+  const void* block_output;
+  const void* residual;
+  const void* __restrict__ norm_weight;
+  void* output;
+  void* normed_output;
+  const float* partials;
+  float eps;
+};
+
+/**
+ * \brief Stage 2 of the split combine fused with the next block's
+ * GroupedGemmaRMSNorm (one group per branch).
+ *
+ * One CTA per (row, branch) in grouped_gemma_rmsnorm's 160-thread layout: the
+ * combined values are computed exactly as in hc_combine_apply_kernel and then
+ * normalised in grouped_gemma_rmsnorm_kernel's reduction order, so both
+ * outputs are bit-identical to apply followed by the norm kernel.
+ */
+template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename Float>
+__global__ __launch_bounds__(kHiddenSize / 16) void hc_combine_apply_norm_kernel(
+    const HcCombineSplitNormParams __grid_constant__ params) {
+  using namespace device;
+  using namespace hc_combine_split_detail;
+  using Float2 = packed_t<Float>;
+  using Storage = AlignedVector<Float2, 4>;
+  constexpr uint32_t kNumLoads = 2;
+  constexpr uint32_t kPairs = 4;
+  constexpr int64_t kRowSize = kHcCount * kHiddenSize;
+  constexpr auto kNumThreads = kHiddenSize / 16;
+  constexpr auto kNumWarps = kNumThreads / kWarpThreads;
+  static_assert(kHiddenSize % 512 == 0);
+
+  const uint32_t m = blockIdx.x;
+  const uint32_t branch = blockIdx.y;
+  const auto gmem = tile::Memory<Storage>::cta(kNumThreads);
+  __shared__ float smem[kWarpThreads];
+
+  const int64_t branch_offset = static_cast<int64_t>(m) * kRowSize + static_cast<int64_t>(branch) * kHiddenSize;
+  const auto y_ptr = pointer::offset<Float>(params.block_output, static_cast<int64_t>(m) * kHiddenSize);
+  const auto r_ptr = pointer::offset<Float>(params.residual, branch_offset);
+  const auto out_ptr = pointer::offset<Float>(params.output, branch_offset);
+  const auto normed_ptr = pointer::offset<Float>(params.normed_output, branch_offset);
+  const auto weight_ptr = pointer::offset<Float>(params.norm_weight, static_cast<int64_t>(branch) * kHiddenSize);
+
+  PDLWaitPrimary<kUsePDL>();
+
+  float total = 0.0f;
+#pragma unroll
+  for (uint32_t s = 0; s < kSplit; ++s) {
+    total += params.partials[(static_cast<int64_t>(m) * kSplit + s) * kHcCount + branch];
+  }
+  const float a = 2.0f / (1.0f + math::exp(-total / kHcCount));
+
+  Storage input_vec[kNumLoads];
+  Storage weight_vec[kNumLoads];
+#pragma unroll
+  for (uint32_t j = 0; j < kNumLoads; ++j) {
+    const Storage r_vec = gmem.load(r_ptr, j);
+    const Storage y_vec = gmem.load(y_ptr, j);
+    weight_vec[j] = gmem.load(weight_ptr, j);
+#pragma unroll
+    for (uint32_t i = 0; i < kPairs; ++i) {
+      const auto [rx, ry] = cast<fp32x2_t>(r_vec[i]);
+      const auto [yx, yy] = cast<fp32x2_t>(y_vec[i]);
+      input_vec[j][i] = cast<Float2>(fp32x2_t{rx + a * yx, ry + a * yy});
+    }
+    gmem.store(out_ptr, input_vec[j], j);
+  }
+
+  float sum_of_squares = 0.0f;
+#pragma unroll
+  for (uint32_t j = 0; j < kNumLoads; ++j) {
+#pragma unroll
+    for (uint32_t i = 0; i < kPairs; ++i) {
+      const auto [x, y] = cast<fp32x2_t>(input_vec[j][i]);
+      sum_of_squares += x * x + y * y;
+    }
+  }
+
+  sum_of_squares = warp::reduce_sum(sum_of_squares);
+  float norm_factor;
+  if constexpr (kNumWarps == 1) {
+    norm_factor = math::rsqrt(sum_of_squares / kHiddenSize + params.eps);
+  } else {
+    const auto warp_id = threadIdx.x / kWarpThreads;
+    smem[warp_id] = sum_of_squares;
+    __syncthreads();
+    if (warp_id == 0) {
+      const auto tx = threadIdx.x;
+      const auto local_sum = tx < kNumWarps ? smem[tx] : 0.0f;
+      sum_of_squares = warp::reduce_sum(local_sum);
+      smem[tx] = math::rsqrt(sum_of_squares / kHiddenSize + params.eps);
+    }
+    __syncthreads();
+    norm_factor = smem[warp_id];
+  }
+
+#pragma unroll
+  for (uint32_t j = 0; j < kNumLoads; ++j) {
+    Storage output_vec;
+#pragma unroll
+    for (uint32_t i = 0; i < kPairs; ++i) {
+      const auto [ix, iy] = cast<fp32x2_t>(input_vec[j][i]);
+      const auto [wx, wy] = cast<fp32x2_t>(weight_vec[j][i]);
+      output_vec[i] = cast<Float2>(fp32x2_t{ix * norm_factor * (1.0f + wx), iy * norm_factor * (1.0f + wy)});
+    }
+    gmem.store(normed_ptr, output_vec, j);
+  }
+
+  PDLTriggerSecondary<kUsePDL>();
+}
+
+template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename DType>
+struct HcCombineSplitNormKernel {
+  static_assert(sizeof(DType) == 2, "HcCombine only supports 2-byte dtypes");
+  static constexpr auto gate_kernel = hc_combine_gate_kernel<kHcCount, kHiddenSize, kUsePDL, DType>;
+  static constexpr auto apply_norm_kernel = hc_combine_apply_norm_kernel<kHcCount, kHiddenSize, kUsePDL, DType>;
+
+  /**
+   * \brief Split combine whose stage 2 also writes the next block's grouped
+   * Gemma RMSNorm of the combined row (group size = hidden size).
+   */
+  static void
+  run(const tvm::ffi::TensorView block_output,
+      const tvm::ffi::TensorView residual,
+      const tvm::ffi::TensorView normed_residual,
+      const tvm::ffi::TensorView inject_weight,
+      const tvm::ffi::TensorView norm_weight,
+      const tvm::ffi::TensorView output,
+      const tvm::ffi::TensorView normed_output,
+      const tvm::ffi::TensorView partials,
+      float eps) {
+    using namespace host;
+    using namespace hc_combine_split_detail;
+    auto M = SymbolicSize{"num_tokens"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({M, kHiddenSize}).with_dtype<DType>().with_device(device).verify(block_output);
+    TensorMatcher({M, kHcCount * kHiddenSize})
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(residual)
+        .verify(normed_residual)
+        .verify(output)
+        .verify(normed_output);
+    TensorMatcher({kHcCount, kHcCount * kHiddenSize}).with_dtype<DType>().with_device(device).verify(inject_weight);
+    TensorMatcher({kHcCount * kHiddenSize}).with_dtype<DType>().with_device(device).verify(norm_weight);
+    auto part_rows = SymbolicSize{"partial_rows"};
+    TensorMatcher({part_rows, kSplit, kHcCount}).with_dtype<fp32_t>().with_device(device).verify(partials);
+
+    const auto gate_params = HcCombineSplitParams{
+        .block_output = block_output.data_ptr(),
+        .residual = residual.data_ptr(),
+        .normed_residual = normed_residual.data_ptr(),
+        .inject_weight = inject_weight.data_ptr(),
+        .output = output.data_ptr(),
+        .partials = static_cast<float*>(partials.data_ptr()),
+    };
+    const auto params = HcCombineSplitNormParams{
+        .block_output = block_output.data_ptr(),
+        .residual = residual.data_ptr(),
+        .norm_weight = norm_weight.data_ptr(),
+        .output = output.data_ptr(),
+        .normed_output = normed_output.data_ptr(),
+        .partials = static_cast<const float*>(partials.data_ptr()),
+        .eps = eps,
+    };
+
+    const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    LaunchKernel(dim3(num_tokens, kSplit * kHcCount, 1), kGateThreads, device.unwrap())
+        .enable_pdl(kUsePDL)(gate_kernel, gate_params);
+    LaunchKernel(dim3(num_tokens, kHcCount, 1), static_cast<uint32_t>(kHiddenSize / 16), device.unwrap())
+        .enable_pdl(kUsePDL)(apply_norm_kernel, params);
+  }
+};
+
 }  // namespace sglang

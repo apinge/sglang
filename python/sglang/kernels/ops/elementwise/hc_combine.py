@@ -134,3 +134,57 @@ def hc_combine_split(
     module = _jit_hc_combine_module(hc_count, hidden_size, residual.dtype)
     module.hc_combine_split(y, r, n, inject_weight, out, partials)
     return out.reshape(residual.shape)
+
+
+@cache_once
+def _jit_hc_combine_norm_module(
+    hc_count: int, hidden_size: int, dtype: torch.dtype
+) -> Module:
+    """Compile and cache the split combine fused with the next grouped norm."""
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise RuntimeError(f"Unsupported dtype {dtype}. Supported: bfloat16, float16")
+    if hidden_size % 512 != 0 or (hc_count * hidden_size) % 2048 != 0:
+        raise RuntimeError(
+            f"Unsupported hc_count {hc_count} / hidden_size {hidden_size}: "
+            "hidden_size must be a multiple of 512 and hc_count * hidden_size "
+            "a multiple of 2048."
+        )
+    args = make_cpp_args(hc_count, hidden_size, is_arch_support_pdl(), dtype)
+    return load_jit(
+        "hc_combine_norm",
+        *args,
+        cuda_files=["elementwise/hc_combine.cuh"],
+        cuda_wrappers=[
+            ("hc_combine_split_norm", f"HcCombineSplitNormKernel<{args}>::run"),
+        ],
+    )
+
+
+def hc_combine_split_norm(
+    block_output: torch.Tensor,
+    residual: torch.Tensor,
+    normed_residual: torch.Tensor,
+    inject_weight: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    hc_count: int,
+    hidden_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``hc_combine_split`` plus the next block's per-branch Gemma RMSNorm.
+
+    Returns ``(out, normed)`` where ``out`` is bit-identical to
+    ``hc_combine_split`` and ``normed`` to ``grouped_gemma_rmsnorm(out,
+    norm_weight, hidden_size, eps)``.
+    """
+    y = block_output.reshape(-1, hidden_size)
+    r = residual.reshape(-1, hc_count * hidden_size)
+    n = normed_residual.reshape(-1, hc_count * hidden_size)
+    out = torch.empty_like(r)
+    normed = torch.empty_like(r)
+    rows = r.shape[0]
+    partials = _get_partials(hc_count, r.device, rows)[:rows]
+    module = _jit_hc_combine_norm_module(hc_count, hidden_size, residual.dtype)
+    module.hc_combine_split_norm(
+        y, r, n, inject_weight, norm_weight, out, normed, partials, eps
+    )
+    return out.reshape(residual.shape), normed.reshape(residual.shape)
