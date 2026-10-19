@@ -520,7 +520,9 @@ class TestMultimodalFeatureTransport(CustomTestCase):
 
     @patch("sglang.srt.server_args.is_hip", return_value=False)
     @patch("sglang.srt.server_args.is_cuda", return_value=False)
-    def test_cuda_ipc_rejects_non_cuda_alike_platforms(self, _mock_is_cuda, _mock_is_hip):
+    def test_cuda_ipc_rejects_non_cuda_alike_platforms(
+        self, _mock_is_cuda, _mock_is_hip
+    ):
         server_args = ServerArgs(model_path="dummy", mm_feature_transport="cuda_ipc")
 
         with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA or AMD ROCm/HIP"):

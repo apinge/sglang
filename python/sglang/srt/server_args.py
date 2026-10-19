@@ -8745,8 +8745,8 @@ class ServerArgs:
             )
 
         if requested_transport == "cuda_ipc":
-            # The implementation only uses torch.cuda APIs (``_share_cuda_``,
-            # streams, events), which dispatch to HIP IPC in a ROCm build.
+            # PyTorch storage sharing dispatches to HIP IPC on ROCm. The pool's
+            # ready/ack protocol also needs the ROCm stream-control implementation.
             if not (is_cuda() or is_hip()):
                 raise ValueError(
                     "--mm-feature-transport=cuda_ipc requires NVIDIA CUDA or AMD ROCm/HIP."
