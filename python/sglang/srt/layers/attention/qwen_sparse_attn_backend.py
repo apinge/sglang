@@ -771,7 +771,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 if extend_seq_lens is None:
                     raise ValueError("QSA extend metadata requires extend_seq_lens")
-                extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+                extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
                 token_to_batch_idx = torch.repeat_interleave(
                     torch.arange(
                         batch_size,
