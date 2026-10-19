@@ -940,6 +940,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 # of every request (its tail token).
                 shifted = torch.empty_like(mm_input_embeds)
                 shifted[:-1].copy_(mm_input_embeds[1:])
+                # Initialize the final row before publishing; the draft replaces
+                # each request's tail with its actual token embedding.
+                shifted[-1:].zero_()
                 forward_batch.mm_input_embeds = shifted
 
         # Seed the first draft-decode loop from each request's last prefill

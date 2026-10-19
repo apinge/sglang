@@ -561,6 +561,7 @@ class TestPyHIPQSA(CustomTestCase):
 
     @torch.no_grad()
     def test_draft_extend_indexer_eager_and_graph(self):
+        from sglang.srt.layers.attention.qsa.config import QSA_GRAPH_MODE_DRAFT_EXTEND_V2
         from sglang.srt.layers.attention.qsa.graph_metadata import launch_graph_metadata
 
         with envs.SGLANG_USE_PYHIP_QSA.override(
@@ -830,7 +831,7 @@ class TestPyHIPQSA(CustomTestCase):
 
                 def prepare():
                     launch_graph_metadata(
-                        mode=2,
+                        mode=QSA_GRAPH_MODE_DRAFT_EXTEND_V2,
                         bs=graph_bs,
                         num_rows=graph_rows,
                         seq_lens=end_lengths,
