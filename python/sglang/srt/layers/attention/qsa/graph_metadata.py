@@ -27,6 +27,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.qsa import config as qsa_config
 from sglang.srt.layers.attention.qsa.metadata import qsa_ring_slots_per_request
 
 
@@ -44,11 +45,11 @@ def _qsa_graph_layout_kernel(
     num_tokens,
     num_padding,
     extend_len,  # uniform extend length (target verify); 0 -> extend_lens_ptr
-    MODE: tl.constexpr,  # 0 = decode, 1 = target verify, 2 = draft extend
+    MODE: tl.constexpr,  # QSA_GRAPH_MODE_* from qsa_config
 ):
     pid = tl.program_id(0)
 
-    if MODE == 0:
+    if MODE == qsa_config.QSA_GRAPH_MODE_DECODE:
         if pid < bs:
             real = pid < bs - num_padding
             seq_len = tl.load(seq_lens_ptr + pid).to(tl.int32)
@@ -69,7 +70,7 @@ def _qsa_graph_layout_kernel(
         # Tail program: dummy-fill the static-capacity rows past the real
         # layout (length 1, prefix 0, aliased to request slot 0, matching
         # the legacy padding contract).
-        if MODE == 1:
+        if MODE == qsa_config.QSA_GRAPH_MODE_TARGET_VERIFY:
             row_start = real_reqs * extend_len
         else:
             row_start = 0
@@ -83,7 +84,7 @@ def _qsa_graph_layout_kernel(
             tl.store(row_req_pool_ptr + row, 0)
         return
 
-    if MODE == 1:
+    if MODE == qsa_config.QSA_GRAPH_MODE_TARGET_VERIFY:
         eff = tl.where(pid < real_reqs, extend_len, 0)
         offset = tl.minimum(pid, real_reqs) * extend_len
     else:
@@ -95,7 +96,7 @@ def _qsa_graph_layout_kernel(
             eff = tl.where(j == pid, e_j, eff)
     base = tl.load(seq_lens_ptr + pid).to(tl.int32)
     req = tl.load(req_pool_ptr + pid).to(tl.int64)
-    if MODE == 1:
+    if MODE == qsa_config.QSA_GRAPH_MODE_TARGET_VERIFY:
         prefix = base
         limit = base + eff
     else:
@@ -237,7 +238,7 @@ def _qsa_graph_draft_extend_metadata_kernel(
     row = tl.program_id(0)
     seq_len, prefix, req = 1, 0, tl.full((), 0, tl.int64)
     start = 0
-    # Same request-major, ragged layout as mode 2 in the layout kernel.
+    # Same request-major, ragged layout as DRAFT_EXTEND_V2 in the layout kernel.
     # Rows outside the live layout use the reserved request-0 sink.
     for request in range(bs - num_padding):
         count = tl.load(extend_lens_ptr + request).to(tl.int32)
@@ -367,7 +368,7 @@ def launch_graph_metadata(
     row_req_pool = metadata.row_req_pool_indices
     row_prefix_lens = indexer.graph_prefix_lengths
 
-    if mode == 2:
+    if mode == qsa_config.QSA_GRAPH_MODE_DRAFT_EXTEND_V2:
         _qsa_graph_draft_extend_metadata_kernel[(num_rows,)](
             seq_lens,
             req_pool_indices,

@@ -19,6 +19,9 @@ import torch.nn.functional as F
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
+    QSA_GRAPH_MODE_DECODE,
+    QSA_GRAPH_MODE_DRAFT_EXTEND_V2,
+    QSA_GRAPH_MODE_TARGET_VERIFY,
     QSA_VARIANT_COMPRESSED,
     is_qwen_qsa,
     parse_qsa_profile,
@@ -1274,15 +1277,15 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         if speculative:
             if forward_mode.is_target_verify():
-                mode = 1
+                mode = QSA_GRAPH_MODE_TARGET_VERIFY
                 extend_lens = None
                 extend_len = int(spec_info.draft_token_num)
             else:
-                mode = 2
+                mode = QSA_GRAPH_MODE_DRAFT_EXTEND_V2
                 extend_len = 0
                 extend_lens = self._stage_extend_lens(spec_info, bs, num_rows)
         else:
-            mode = 0
+            mode = QSA_GRAPH_MODE_DECODE
             extend_lens = None
             extend_len = 0
         launch_graph_metadata(
@@ -1413,7 +1416,7 @@ class QwenSparseAttnBackend(AttentionBackend):
     @staticmethod
     def _capture_extend_seq_lens(forward_batch) -> torch.Tensor:
         """GPU extend lengths for speculative capture/layout, in the same
-        resolution order as the mode-2 in-graph layout kernels so both read
+        resolution order as the DRAFT_EXTEND_V2 in-graph layout kernels so both read
         the SAME replay-refreshed buffer."""
         spec_info = getattr(forward_batch, "spec_info", None)
         extend_seq_lens = getattr(spec_info, "extend_seq_lens_tensor", None)
