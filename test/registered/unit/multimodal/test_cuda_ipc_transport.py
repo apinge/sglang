@@ -7,9 +7,11 @@ CPU-only policy tests intentionally cannot exercise this cross-process handle.
 
 import gc
 import multiprocessing as mp
+import pickle
 import queue
 import time
 import unittest
+from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
 import torch
@@ -25,13 +27,18 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     MmItemMemoryPool,
     _pool_handle_cache_clear,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.multimodal.transport.memory_pool import (
+    stream_wait_value32,
+    stream_write_value32,
+)
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=37, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
 
 
-def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue):
+def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue, consumer_count=1):
     """Create a tokenizer-worker-like CUDA IPC pool in a spawned producer."""
     pool = source = proxy = None
     try:
@@ -40,7 +47,7 @@ def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue):
             memory_size=1 << 20,
             recycle_interval=0.01,
             base_gpu_id=0,
-            consumer_count=1,
+            consumer_count=consumer_count,
         )
         source = torch.arange(35, dtype=torch.float32, device="cuda").reshape(5, 7)
         expected = torch.arange(35, dtype=torch.float32).reshape(5, 7).tolist()
@@ -80,6 +87,76 @@ class TestCudaIpcTransport(CustomTestCase):
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is required")
+
+    def test_stream_memory_operations_order_nondefault_streams(self):
+        control = torch.zeros(1, dtype=torch.int32, device="cuda:0")
+        producer_stream = torch.cuda.Stream(device=0)
+        consumer_stream = torch.cuda.Stream(device=0)
+        producer_stream.wait_stream(torch.cuda.current_stream(0))
+        consumer_stream.wait_stream(torch.cuda.current_stream(0))
+        nvidia_driver_guard = (
+            patch(
+                "sglang.srt.multimodal.transport.memory_pool._driver_modules",
+                side_effect=AssertionError("ROCm must not import the CUDA driver"),
+            )
+            if torch.version.hip is not None
+            else nullcontext()
+        )
+
+        with nvidia_driver_guard:
+            with torch.cuda.stream(consumer_stream):
+                stream_wait_value32(0, control.data_ptr(), 17, "test")
+                observed = control.clone()
+            with torch.cuda.stream(producer_stream):
+                stream_write_value32(0, control.data_ptr(), 17, "test")
+
+        consumer_stream.synchronize()
+        self.assertEqual(observed.cpu().tolist(), [17])
+
+    @unittest.skipUnless(torch.cuda.device_count() >= 2, "Two GPUs are required")
+    def test_pooled_tensor_reconstructs_across_gpu_consumers(self):
+        ctx = mp.get_context("spawn")
+        proxy_queue = ctx.Queue()
+        producer_results = ctx.Queue()
+        consumer_done = ctx.Event()
+        producer = ctx.Process(
+            target=_produce_pooled_tensor,
+            args=(proxy_queue, consumer_done, producer_results, 2),
+        )
+        producer.start()
+        proxy = reconstructed = None
+        try:
+            proxy, expected = proxy_queue.get(timeout=60)
+            for device_id in range(2):
+                # Each TP rank owns its proxy copy and acknowledgement slot.
+                consumer_proxy = pickle.loads(pickle.dumps(proxy))
+                with torch.cuda.device(device_id):
+                    stream = torch.cuda.Stream(device=device_id)
+                    with torch.cuda.stream(stream):
+                        reconstructed = consumer_proxy.reconstruct_on_target_device(
+                            device_id, consumer_rank=device_id
+                        )
+                    stream.synchronize()
+                    self.assertEqual(reconstructed.cpu().tolist(), expected)
+                del consumer_proxy, reconstructed
+                reconstructed = None
+        finally:
+            del proxy, reconstructed
+            _pool_handle_cache_clear()
+            gc.collect()
+            for device_id in range(2):
+                with torch.cuda.device(device_id):
+                    torch.cuda.ipc_collect()
+            consumer_done.set()
+            producer.join(timeout=60)
+            try:
+                status, payload = producer_results.get(timeout=5)
+                self.assertEqual(status, "ok", payload)
+            finally:
+                if producer.is_alive():
+                    producer.terminate()
+                    producer.join(timeout=10)
+            self.assertEqual(producer.exitcode, 0)
 
     def test_pooled_tensor_reconstructs_in_spawned_process(self):
         """Consumer releases the pool mapping before the producer tears down."""
