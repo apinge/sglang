@@ -18,6 +18,8 @@ register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 HC_COUNT = 4
 HIDDEN_SIZE = 2560
 LOWRANK = 320
+# Mirrors the decode CUDA-graph batch sizes the Qwen3.8 server captures.
+DECODE_GRAPH_BUCKETS = (1, 2, 4, 8, 12, 16, 24, 32)
 
 
 def _reference_mix(
@@ -53,8 +55,13 @@ _TOLERANCES = {
 }
 
 
+# The decode CUDA-graph buckets, plus the row counts that sit just off a
+# power-of-two boundary (the kernels pad the row tile to one).
+_ROW_CASES = [1, 2, 3, 4, 7, 8, 9, 12, 15, 16, 17, 24, 31, _FUSED_MIX_MAX_ROWS]
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("num_tokens", range(1, _FUSED_MIX_MAX_ROWS + 1))
+@pytest.mark.parametrize("num_tokens", _ROW_CASES)
 def test_fused_hc_mix_matches_reference(dtype, num_tokens):
     x, w_down, w_up = _make_inputs(num_tokens, dtype)
     assert fused_hc_mix_supported(x, w_down, w_up)
@@ -82,9 +89,36 @@ def test_fused_hc_mix_gate_rejects_prefill_rows():
     assert not fused_hc_mix_supported(x, w_down, w_up)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 4, 7, 8, _FUSED_MIX_MAX_ROWS])
+def test_fused_hc_mix_gate_accepts_every_decode_bucket():
+    """Every decode CUDA-graph bucket must take the fused path; a row cap below
+    the largest bucket silently routes that bucket to the torch.compile chain."""
+    for num_tokens in DECODE_GRAPH_BUCKETS:
+        x, w_down, w_up = _make_inputs(num_tokens, torch.bfloat16)
+        assert fused_hc_mix_supported(x, w_down, w_up), num_tokens
+
+
+@pytest.mark.parametrize("num_tokens", [1, 5, 16])
+def test_fused_hc_mix_untuned_shape(num_tokens):
+    """The tuned launch config only covers Qwen3.8's shape on gfx942; an
+    unlisted shape falls back to the default config, which nothing else
+    exercises."""
+    hc, hs, lowrank = 4, 1024, 72
+    torch.manual_seed(0)
+    x = torch.randn(num_tokens, hc * hs, dtype=torch.bfloat16, device="cuda")
+    w_down = torch.randn(lowrank, hc * hs, dtype=torch.bfloat16, device="cuda") * 0.02
+    w_up = torch.randn(hc * hs, lowrank, dtype=torch.bfloat16, device="cuda") * 0.02
+    assert fused_hc_mix_supported(x, w_down, w_up)
+    out = fused_hc_mix(x, w_down, w_up, hc, hs)
+    ref = _reference_mix(x, w_down, w_up, hc, hs)
+    torch.testing.assert_close(
+        out.to(torch.float64), ref, **_TOLERANCES[torch.bfloat16]
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 4, 7, 8, 16, 24, _FUSED_MIX_MAX_ROWS])
 def test_fused_hc_mix_graph_replay(num_tokens):
-    """Reusing the persistent barrier must observe each replay's new input."""
+    """A replay must observe the new input: no state may survive a call, and
+    the scratch buffers must come from the graph's own pool."""
     x, w_down, w_up = _make_inputs(num_tokens, torch.bfloat16)
     for _ in range(3):
         fused_hc_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
