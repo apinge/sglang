@@ -8,6 +8,11 @@ from sglang.kernels.ops.attention import qwen38_qsa_sm121_varlen
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
 from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
 from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
+from sglang.srt.layers.attention.qsa.config import (
+    QSA_GRAPH_MODE_DECODE,
+    QSA_GRAPH_MODE_DRAFT_EXTEND_V2,
+    QSA_GRAPH_MODE_TARGET_VERIFY,
+)
 from sglang.srt.layers.attention.qsa.kernel import (
     expand_qsa_block_indices,
     qsa_fast_topk,
@@ -1443,17 +1448,73 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path():
             assert torch.equal(kernel_buf, host_buf), (mode, field)
 
     # Decode: lengths straddling boundaries (256 is a boundary, others not).
-    run_case(mode=0, bs=4, num_rows=4, seq_lens_list=[255, 256, 257, 512], extend_len=0)
+    run_case(
+        mode=QSA_GRAPH_MODE_DECODE,
+        bs=4,
+        num_rows=4,
+        seq_lens_list=[255, 256, 257, 512],
+        extend_len=0,
+    )
     # Target verify: 2 requests x 3 draft rows, one request crossing a boundary.
-    run_case(mode=1, bs=2, num_rows=6, seq_lens_list=[254, 300], extend_len=3)
+    run_case(
+        mode=QSA_GRAPH_MODE_TARGET_VERIFY,
+        bs=2,
+        num_rows=6,
+        seq_lens_list=[254, 300],
+        extend_len=3,
+    )
     # Draft extend: ragged per-request rows plus a dummy-tail row.
     run_case(
-        mode=2,
+        mode=QSA_GRAPH_MODE_DRAFT_EXTEND_V2,
         bs=2,
         num_rows=6,
         seq_lens_list=[256, 303],
         extend_len=0,
         extend_lens=[3, 2],
+    )
+
+
+def test_qsa_eager_speculative_mapping_uses_cpu_lengths_without_item(monkeypatch):
+    """Known packed lengths, including zero-row requests and token padding,
+    must not synchronize to discover repeat_interleave's output shape."""
+    batch = SimpleNamespace(
+        req_pool_indices=torch.tensor([2, 4, 7]),
+        extend_seq_lens=torch.tensor([3, 0, 2]),
+        extend_seq_lens_cpu=[3, 0, 2],
+    )
+
+    def reject_item(*args, **kwargs):
+        raise AssertionError("CPU mirror path read a tensor scalar")
+
+    monkeypatch.setattr(torch.Tensor, "item", reject_item)
+    actual = QwenSparseAttnBackend._speculative_row_to_request(batch, 7)
+    assert torch.equal(actual, torch.tensor([0, 0, 0, 2, 2, 0, 0]))
+    batch.extend_seq_lens_cpu = None
+    actual = QwenSparseAttnBackend._speculative_row_to_request(batch, 7)
+    assert torch.equal(actual, torch.tensor([0, 0, 0, 2, 2, 0, 0]))
+
+
+def test_qsa_eager_gpu_lengths_do_not_read_back_table_bound(monkeypatch):
+    backend, batch, _ = _make_mtp_draft_batch(steps=3)
+    child = backend.attn_backends[0]
+    batch.seq_lens_cpu = None
+
+    def reject_scalar(*args, **kwargs):
+        raise AssertionError("metadata bound read a tensor scalar")
+
+    monkeypatch.setattr(torch.Tensor, "item", reject_scalar)
+    monkeypatch.setattr(torch.Tensor, "__int__", reject_scalar)
+    child.init_forward_metadata(batch)
+    assert (
+        child.forward_metadata.token_slot_table.shape[1] == child.req_to_token.shape[1]
+    )
+    batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+    batch.extend_seq_lens = torch.tensor([1, 1])
+    batch.extend_seq_lens_cpu = None
+    batch.spec_info = SimpleNamespace(draft_token_num=4)
+    child.init_forward_metadata(batch)
+    assert (
+        child.forward_metadata.token_slot_table.shape[1] == child.req_to_token.shape[1]
     )
 
 
@@ -1465,17 +1526,21 @@ def _qsa_expected_graph_layout(
     row_lens, row_prefix, row_reqs = [], [], []
     for pid in range(bs):
         base = seq_lens[pid]
-        if mode == 0:
+        if mode == QSA_GRAPH_MODE_DECODE:
             row_lens.append(base)
             row_prefix.append(max(base - 1, 0))
             row_reqs.append(req_pool[pid])
             continue
         eff = (
             (extend_len if pid < real_reqs else 0)
-            if mode == 1
+            if mode == QSA_GRAPH_MODE_TARGET_VERIFY
             else (extend_lens[pid] if pid < real_reqs else 0)
         )
-        prefix, limit = (base, base + eff) if mode == 1 else (max(base - eff, 0), base)
+        prefix, limit = (
+            (base, base + eff)
+            if mode == QSA_GRAPH_MODE_TARGET_VERIFY
+            else (max(base - eff, 0), base)
+        )
         for j in range(eff):
             row_lens.append(min(prefix + 1 + j, limit))
             row_prefix.append(prefix)
@@ -1596,7 +1661,7 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
 
     # Target verify: uniform 4-token window, 2 padded request slots.
     run_case(
-        mode=1,
+        mode=QSA_GRAPH_MODE_TARGET_VERIFY,
         bs=6,
         num_rows=32,
         seq_lens=[254, 255, 256, 300, 7, 7],
@@ -1606,7 +1671,7 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
     )
     # Draft extend: per-request extend lengths (accept-count dependent), padded.
     run_case(
-        mode=2,
+        mode=QSA_GRAPH_MODE_DRAFT_EXTEND_V2,
         bs=5,
         num_rows=24,
         seq_lens=[260, 512, 257, 9, 9],
@@ -1616,7 +1681,7 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
     )
     # Decode with a padded tail (dummy rows alias request slot 0).
     run_case(
-        mode=0,
+        mode=QSA_GRAPH_MODE_DECODE,
         bs=4,
         num_rows=4,
         seq_lens=[256, 1024, 1025, 4096],

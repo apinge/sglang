@@ -5,9 +5,8 @@ a group's compressed slot is any of its raw slots floor-divided by the compress 
 so per-row graph buffers are rebuilt from request lengths and ``req_to_token`` alone;
 accept-dependent speculative lengths never need the host.
 
-Both kernels run once eagerly at capture warmup,
-then are recorded into the main CUDA graph through ``init_forward_metadata_in_graph``;
-all inputs are stable-address runner buffers.
+The backend launches both builders during replay preparation into
+stable-address buffers. Every mode keeps the same full metadata contract.
 """
 
 from __future__ import annotations
@@ -16,6 +15,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.qsa import config as qsa_config
 from sglang.srt.layers.attention.qsa.metadata import qsa_ring_slots_per_request
 
 
@@ -33,11 +33,11 @@ def _qsa_graph_layout_kernel(
     num_tokens,
     num_padding,
     extend_len,  # uniform extend length (target verify); 0 -> extend_lens_ptr
-    MODE: tl.constexpr,  # 0 = decode, 1 = target verify, 2 = draft extend
+    MODE: tl.constexpr,  # QSA_GRAPH_MODE_* from qsa_config
 ):
     pid = tl.program_id(0)
 
-    if MODE == 0:
+    if MODE == qsa_config.QSA_GRAPH_MODE_DECODE:
         if pid < bs:
             real = pid < bs - num_padding
             seq_len = tl.load(seq_lens_ptr + pid).to(tl.int32)
@@ -56,7 +56,7 @@ def _qsa_graph_layout_kernel(
     real_reqs = bs - num_padding
     if pid == bs:
         # Tail program: dummy rows for the static capacity past the real layout.
-        if MODE == 1:
+        if MODE == qsa_config.QSA_GRAPH_MODE_TARGET_VERIFY:
             row_start = real_reqs * extend_len
         else:
             row_start = 0
@@ -70,7 +70,7 @@ def _qsa_graph_layout_kernel(
             tl.store(row_req_pool_ptr + row, 0)
         return
 
-    if MODE == 1:
+    if MODE == qsa_config.QSA_GRAPH_MODE_TARGET_VERIFY:
         eff = tl.where(pid < real_reqs, extend_len, 0)
         offset = tl.minimum(pid, real_reqs) * extend_len
     else:
@@ -82,7 +82,7 @@ def _qsa_graph_layout_kernel(
             eff = tl.where(j == pid, e_j, eff)
     base = tl.load(seq_lens_ptr + pid).to(tl.int32)
     req = tl.load(req_pool_ptr + pid).to(tl.int64)
-    if MODE == 1:
+    if MODE == qsa_config.QSA_GRAPH_MODE_TARGET_VERIFY:
         prefix = base
         limit = base + eff
     else:
@@ -97,10 +97,10 @@ def _qsa_graph_layout_kernel(
 
 
 @triton.jit
-def _qsa_graph_row_metadata_kernel(
-    # Row layout buffers (filled by the layout kernel).
-    row_seq_lens_ptr,
-    row_req_pool_ptr,
+def _store_qsa_indexer_row(
+    row,
+    seq_len,
+    req,
     # Graph output buffers.
     compressed_lens_ptr,
     write_locs_ptr,
@@ -117,9 +117,6 @@ def _qsa_graph_row_metadata_kernel(
     FULL_PAGE: tl.constexpr,  # full-KV tokens per page
     PAGE_BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    seq_len = tl.load(row_seq_lens_ptr + row).to(tl.int32)
-    req = tl.load(row_req_pool_ptr + row).to(tl.int64)
     token_row = req * req_to_token_row_stride
     current = tl.maximum(seq_len - 1, 0)
     last_loc = tl.load(req_to_token_ptr + token_row + current).to(tl.int32)
@@ -156,6 +153,47 @@ def _qsa_graph_row_metadata_kernel(
         tl.store(table_row + idx, tl.maximum(loc // FULL_PAGE, 0), mask=valid)
 
 
+@triton.jit
+def _qsa_graph_row_metadata_kernel(
+    row_seq_lens_ptr,
+    row_req_pool_ptr,
+    compressed_lens_ptr,
+    write_locs_ptr,
+    page_table_ptr,
+    logical_positions_ptr,
+    state_slots_ptr,
+    ring_locs_ptr,
+    req_to_token_ptr,
+    req_to_token_row_stride,
+    max_pages,
+    RATIO: tl.constexpr,
+    RING: tl.constexpr,
+    FULL_PAGE: tl.constexpr,
+    PAGE_BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    seq_len = tl.load(row_seq_lens_ptr + row).to(tl.int32)
+    req = tl.load(row_req_pool_ptr + row).to(tl.int64)
+    _store_qsa_indexer_row(
+        row,
+        seq_len,
+        req,
+        compressed_lens_ptr,
+        write_locs_ptr,
+        page_table_ptr,
+        logical_positions_ptr,
+        state_slots_ptr,
+        ring_locs_ptr,
+        req_to_token_ptr,
+        req_to_token_row_stride,
+        max_pages,
+        RATIO,
+        RING,
+        FULL_PAGE,
+        PAGE_BLOCK,
+    )
+
+
 def supports_graph_metadata_kernels(pool, device) -> bool:
     """Whether the CUDA fast path can serve this pool/device pair."""
 
@@ -178,6 +216,7 @@ def launch_graph_metadata(
     req_to_token,
     pool,
 ) -> None:
+    """Build full indexer metadata for one graph bucket."""
 
     indexer = metadata.indexer_metadata
     max_pages = indexer.graph_compressed_page_table.shape[1]

@@ -1041,8 +1041,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+        # The recurrent target_verify kernel reads q/k/v through their token
+        # strides, so views of the contiguous conv output skip the split copy.
+        verify_reads_views = (
+            _is_hip
+            and is_target_verify
+            and mamba_cache_params.replayssm_rawv is None
+            and mamba_cache_params.replayssm_d is None
+        )
         if (
-            (is_cuda() or is_hip() or is_xpu())
+            not verify_reads_views
+            and (is_cuda() or is_hip() or is_xpu())
             and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
             and not self._use_strided_target_verify_qkv
         ):
