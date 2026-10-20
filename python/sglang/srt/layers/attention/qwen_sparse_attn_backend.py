@@ -257,25 +257,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._graph_row_req_pool_indices = None
         self._trtllm_sparse_tables = {}
         self._mtp_shared_sparse_indices = None
-        self._shared_decode_metadata_supported = False
-        # Keep the reduced path limited to layouts served by direct paged
-        # GQA. Other devices/layouts retain full metadata for their fallback.
-        if (
-            is_gfx942_supported()
-            and self.qsa_profile is not None
-            and self.qsa_profile.variant == QSA_VARIANT_COMPRESSED
-            and getattr(runner, "kv_cache_dtype", None) == torch.bfloat16
-            and getattr(runner, "dtype", None) == torch.bfloat16
-            and getattr(config, "head_dim", None) in (128, 256)
-        ):
-            q_heads = getattr(config, "num_attention_heads", 0)
-            kv_heads = getattr(config, "num_key_value_heads", 0)
-            self._shared_decode_metadata_supported = (
-                kv_heads > 0
-                and q_heads > 0
-                and q_heads % kv_heads == 0
-                and q_heads // kv_heads <= 32
-            )
         self._trtllm_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
@@ -685,36 +666,6 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "mis-mapped to requests"
             )
         speculative_paged = self._is_speculative_paged_mode(forward_batch.forward_mode)
-        if self._can_skip_decode_indexer_metadata(forward_batch.forward_mode):
-            # No indexer or packed full-context gather consumes a token-slot
-            # table here. Preserve the row shape for the metadata contract.
-            lengths = forward_batch.seq_lens.to(torch.int32)
-            rows = lengths.numel()
-            if forward_batch.positions.shape[-1] != rows:
-                raise ValueError(
-                    "QSA decode requires exactly one query row per request"
-                )
-            requests = forward_batch.req_pool_indices[:rows]
-            mapping = torch.arange(rows, dtype=torch.int32, device=lengths.device)
-            table = torch.zeros((rows, 1), dtype=torch.int32, device=lengths.device)
-            indexer_metadata = QSAIndexerMetadata(
-                sequence_lengths=lengths,
-                token_to_batch_idx=mapping,
-                token_slot_table=table,
-                out_cache_loc=forward_batch.out_cache_loc,
-                token_to_kv_pool=self.token_to_kv_pool,
-                compress_ratio=self.compress_ratio,
-                block_topk=self.token_to_kv_pool.qsa_block_topk,
-                req_pool_indices=requests,
-                decode_logical_positions=(lengths - 1).clamp_min(0),
-            )
-            return QwenSparseAttnMetadata(
-                sequence_lengths=lengths,
-                token_to_batch_idx=mapping,
-                token_slot_table=table,
-                indexer_metadata=indexer_metadata,
-                row_req_pool_indices=requests,
-            )
         if speculative_paged:
             logical_positions = forward_batch.positions
             if logical_positions.ndim == 2:
@@ -1258,23 +1209,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         if bs <= 0 or num_rows <= 0:
             return
 
-        if self._can_skip_decode_indexer_metadata(forward_mode):
-            from sglang.srt.layers.attention.qsa.graph_metadata import (
-                launch_mtp_shared_decode_metadata,
-            )
-
-            launch_mtp_shared_decode_metadata(
-                seq_lens=seq_lens,
-                req_pool_indices=req_pool_indices,
-                sequence_lengths=metadata.sequence_lengths[None],
-                row_requests=metadata.row_req_pool_indices[None],
-                logical_positions=indexer.decode_logical_positions[None],
-                prefix_lengths=indexer.graph_prefix_lengths[None],
-                bs=bs,
-                num_padding=num_padding,
-            )
-            return
-
         if speculative:
             if forward_mode.is_target_verify():
                 mode = QSA_GRAPH_MODE_TARGET_VERIFY
@@ -1372,13 +1306,6 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     def set_mtp_shared_sparse_indices(self, state) -> None:
         self._mtp_shared_sparse_indices = state
-
-    def _can_skip_decode_indexer_metadata(self, mode) -> bool:
-        return (
-            self._shared_decode_metadata_supported
-            and self._mtp_shared_sparse_indices is not None
-            and mode == ForwardMode.DECODE
-        )
 
     def should_reuse_mtp_sparse_indices(self, forward_batch) -> bool:
         """Draft decode steps reuse the draft-extend selection."""
@@ -1991,7 +1918,6 @@ class QwenSparseMultiStepDraftBackend:
             QwenSparseAttnBackend(model_runner)
             for _ in range(speculative_num_steps - 1)
         ]
-        self._shared_decode_step_buffers = None
 
     @staticmethod
     def _as_cpu_lengths(seq_lens_cpu, seq_lens: torch.Tensor) -> torch.Tensor:
@@ -2078,22 +2004,6 @@ class QwenSparseMultiStepDraftBackend:
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for backend in self.attn_backends:
             backend.init_cuda_graph_state(max_bs, max_num_tokens)
-        # One launch writes all steps. Capture-time metadata views and all
-        # replay buckets retain these stable per-step addresses.
-        if self.attn_backends:
-            shape = (len(self.attn_backends), max_num_tokens)
-            buffers = tuple(
-                torch.zeros(shape, dtype=torch.int32, device=self.model_runner.device)
-                for _ in range(4)
-            )
-            for step, backend in enumerate(self.attn_backends):
-                (
-                    backend._graph_seq_lens,
-                    backend._graph_row_req_pool_indices,
-                    backend._graph_logical_positions,
-                    backend._graph_prefix_lengths,
-                ) = (buffer[step] for buffer in buffers)
-            self._shared_decode_step_buffers = buffers
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture: bool = False):
         if in_capture:
@@ -2119,36 +2029,6 @@ class QwenSparseMultiStepDraftBackend:
 
         num_padding = getattr(forward_batch, "num_padding", None)
         num_padding = num_padding if num_padding is not None else 0
-        buffers = self._shared_decode_step_buffers
-        if (
-            buffers is not None
-            and forward_batch.seq_lens.is_cuda
-            and all(
-                backend._can_skip_decode_indexer_metadata(ForwardMode.DECODE)
-                for backend in self.attn_backends
-            )
-        ):
-            from sglang.srt.layers.attention.qsa.graph_metadata import (
-                launch_mtp_shared_decode_metadata,
-            )
-
-            bs = forward_batch.batch_size
-            launch_mtp_shared_decode_metadata(
-                seq_lens=forward_batch.seq_lens,
-                req_pool_indices=forward_batch.req_pool_indices,
-                sequence_lengths=buffers[0],
-                row_requests=buffers[1],
-                logical_positions=buffers[2],
-                prefix_lengths=buffers[3],
-                bs=bs,
-                num_padding=max(0, min(int(num_padding), bs)),
-                first_step=1,
-            )
-            for backend in self.attn_backends:
-                backend.forward_metadata = backend._cuda_graph_metadata[
-                    (ForwardMode.DECODE, bs)
-                ]
-            return
         for step, backend in enumerate(self.attn_backends):
             step_batch = self._make_step_forward_batch(
                 forward_batch, step, num_padding=num_padding

@@ -16,9 +16,8 @@ never need the host.
   page ids, and the layer-independent indexer inputs (logical position,
   pending-ring state slot, trailing-group member ring slots).
 
-The backend launches these during replay preparation into stable-address
-buffers. Draft extend combines layout and row metadata in one launch; shared
-proposal decode only refreshes the fields consumed by attention and lookup.
+The backend launches both builders during replay preparation into
+stable-address buffers. Every mode keeps the same full metadata contract.
 """
 
 from __future__ import annotations
@@ -211,133 +210,6 @@ def _qsa_graph_row_metadata_kernel(
     )
 
 
-@triton.jit
-def _qsa_graph_draft_extend_metadata_kernel(
-    seq_lens_ptr,
-    req_pool_ptr,
-    extend_lens_ptr,
-    row_seq_lens_ptr,
-    row_prefix_lens_ptr,
-    row_req_pool_ptr,
-    compressed_lens_ptr,
-    write_locs_ptr,
-    page_table_ptr,
-    logical_positions_ptr,
-    state_slots_ptr,
-    ring_locs_ptr,
-    req_to_token_ptr,
-    req_to_token_row_stride,
-    max_pages,
-    bs,
-    num_padding,
-    RATIO: tl.constexpr,
-    RING: tl.constexpr,
-    FULL_PAGE: tl.constexpr,
-    PAGE_BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0)
-    seq_len, prefix, req = 1, 0, tl.full((), 0, tl.int64)
-    start = 0
-    # Same request-major, ragged layout as DRAFT_EXTEND_V2 in the layout kernel.
-    # Rows outside the live layout use the reserved request-0 sink.
-    for request in range(bs - num_padding):
-        count = tl.load(extend_lens_ptr + request).to(tl.int32)
-        if (row >= start) & (row < start + count):
-            base = tl.load(seq_lens_ptr + request).to(tl.int32)
-            prefix = tl.maximum(base - count, 0)
-            seq_len = tl.minimum(prefix + 1 + row - start, base)
-            req = tl.load(req_pool_ptr + request).to(tl.int64)
-        start += count
-    tl.store(row_seq_lens_ptr + row, seq_len)
-    tl.store(row_prefix_lens_ptr + row, prefix)
-    tl.store(row_req_pool_ptr + row, req.to(tl.int32))
-    _store_qsa_indexer_row(
-        row,
-        seq_len,
-        req,
-        compressed_lens_ptr,
-        write_locs_ptr,
-        page_table_ptr,
-        logical_positions_ptr,
-        state_slots_ptr,
-        ring_locs_ptr,
-        req_to_token_ptr,
-        req_to_token_row_stride,
-        max_pages,
-        RATIO,
-        RING,
-        FULL_PAGE,
-        PAGE_BLOCK,
-    )
-
-
-@triton.jit
-def _qsa_mtp_shared_decode_metadata_kernel(
-    seq_lens_ptr,
-    req_pool_ptr,
-    row_seq_lens_ptr,
-    row_req_pool_ptr,
-    logical_positions_ptr,
-    prefix_lens_ptr,
-    bs,
-    num_padding,
-    output_stride,
-    first_step,
-    BLOCK: tl.constexpr,
-):
-    request = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    step = tl.program_id(1)
-    live = request < bs - num_padding
-    length = tl.load(seq_lens_ptr + request, request < bs, 1).to(tl.int32)
-    length = tl.where(live, length + first_step + step, 1)
-    req = tl.load(req_pool_ptr + request, request < bs, 0).to(tl.int32)
-    req = tl.where(live, req, 0)
-    position = tl.maximum(length - 1, 0)
-    offset = step * output_stride + request
-    tl.store(row_seq_lens_ptr + offset, length, request < bs)
-    tl.store(row_req_pool_ptr + offset, req, request < bs)
-    tl.store(logical_positions_ptr + offset, position, request < bs)
-    tl.store(prefix_lens_ptr + offset, position, request < bs)
-
-
-def launch_mtp_shared_decode_metadata(
-    *,
-    seq_lens,
-    req_pool_indices,
-    sequence_lengths,
-    row_requests,
-    logical_positions,
-    prefix_lengths,
-    bs,
-    num_padding=0,
-    first_step=0,
-):
-    """Refresh all shared-index proposal steps without reading the KV pool.
-
-    Outputs are contiguous [steps, capacity] tensors. first_step=1 advances
-    a draft's base lengths; first_step=0 consumes already-advanced lengths.
-    Indexer buffers are deliberately untouched: shared decode never uses them.
-    """
-    if bs == 0 or sequence_lengths.shape[0] == 0:
-        return
-    _qsa_mtp_shared_decode_metadata_kernel[
-        (triton.cdiv(bs, 128), sequence_lengths.shape[0])
-    ](
-        seq_lens,
-        req_pool_indices,
-        sequence_lengths,
-        row_requests,
-        logical_positions,
-        prefix_lengths,
-        bs,
-        num_padding,
-        sequence_lengths.stride(0),
-        first_step,
-        BLOCK=128,
-        num_warps=1,
-    )
-
-
 def supports_graph_metadata_kernels(pool, device) -> bool:
     """Whether the CUDA fast path can serve this pool/device pair."""
 
@@ -360,40 +232,13 @@ def launch_graph_metadata(
     req_to_token,
     pool,
 ) -> None:
-    """Build full indexer metadata, combining draft-extend layout and stores."""
+    """Build full indexer metadata for one graph bucket."""
 
     indexer = metadata.indexer_metadata
     max_pages = indexer.graph_compressed_page_table.shape[1]
     row_seq_lens = metadata.sequence_lengths
     row_req_pool = metadata.row_req_pool_indices
     row_prefix_lens = indexer.graph_prefix_lengths
-
-    if mode == qsa_config.QSA_GRAPH_MODE_DRAFT_EXTEND_V2:
-        _qsa_graph_draft_extend_metadata_kernel[(num_rows,)](
-            seq_lens,
-            req_pool_indices,
-            extend_lens,
-            row_seq_lens,
-            row_prefix_lens,
-            row_req_pool,
-            indexer.graph_compressed_lengths,
-            indexer.graph_write_locs,
-            indexer.graph_compressed_page_table,
-            indexer.decode_logical_positions,
-            indexer.pending_ring_slots,
-            indexer.graph_ring_group_locs,
-            req_to_token,
-            req_to_token.stride(0),
-            max_pages,
-            bs,
-            num_padding,
-            RATIO=indexer.compress_ratio,
-            RING=qsa_ring_slots_per_request(indexer.compress_ratio),
-            FULL_PAGE=pool.qsa_compressed_page_size * indexer.compress_ratio,
-            PAGE_BLOCK=128,
-            num_warps=1,
-        )
-        return
 
     _qsa_graph_layout_kernel[(bs + 1,)](
         seq_lens,
