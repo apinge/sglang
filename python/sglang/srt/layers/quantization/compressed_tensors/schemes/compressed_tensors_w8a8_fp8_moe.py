@@ -312,18 +312,25 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 max_w13_scales, requires_grad=False
             )
 
-        if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
+        if (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and _use_aiter
+            and self.runner.runner_backend.is_aiter()
+        ):
             with torch.no_grad():
-                # Pre-shuffle weights
+                # Parameter wrapping drops the shuffle result's layout tag.
+                # Restore it so AITER does not read shuffled data as canonical.
                 layer.w13_weight = torch.nn.Parameter(
                     shuffle_weight(layer.w13_weight.data, (16, 16)),
                     requires_grad=False,
                 )
+                layer.w13_weight.is_shuffled = True
                 torch.cuda.empty_cache()
                 layer.w2_weight = torch.nn.Parameter(
                     shuffle_weight(layer.w2_weight.data, (16, 16)),
                     requires_grad=False,
                 )
+                layer.w2_weight.is_shuffled = True
                 torch.cuda.empty_cache()
 
         if (

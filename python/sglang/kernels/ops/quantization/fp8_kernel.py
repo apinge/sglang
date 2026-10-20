@@ -1134,10 +1134,13 @@ if _is_hip:
         absmax = input.abs().max(dim=1, keepdim=True).values
         absmax = torch.clamp(absmax, min=eps)
         scale_val = absmax / fp8_max
-        scale.copy_(scale_val)
+        scale[:M].copy_(scale_val)
         # Quantize
         output_data = torch.clamp(input / scale_val, fp8_min, fp8_max).to(fp8_dtype)
-        output.copy_(output_data)
+        output[:M].copy_(output_data)
+        if output.shape[0] > M:
+            output[M:].zero_()
+            scale[M:].fill_(1.0)
 
     def _native_dynamic_per_tensor_quant_fp8(output, input, scale):
         """Native PyTorch fallback for dynamic per-tensor FP8 quantization when AITER is disabled."""
@@ -1149,13 +1152,17 @@ if _is_hip:
         scale.view(-1).copy_(scale_val.view(-1))
         # Quantize
         output_data = torch.clamp(input / scale_val, fp8_min, fp8_max).to(fp8_dtype)
-        output.copy_(output_data)
+        output[: input.shape[0]].copy_(output_data)
+        if output.shape[0] > input.shape[0]:
+            output[input.shape[0] :].zero_()
 
     def _native_static_quant_fp8(output, input, scale):
         """Native PyTorch fallback for static FP8 quantization when AITER is disabled."""
         # Use tensor directly instead of .item() to avoid CPU-GPU sync
         output_data = torch.clamp(input / scale, fp8_min, fp8_max).to(fp8_dtype)
-        output.copy_(output_data)
+        output[: input.shape[0]].copy_(output_data)
+        if output.shape[0] > input.shape[0]:
+            output[input.shape[0] :].zero_()
 
     def scaled_fp8_quant(
         input: torch.Tensor,
