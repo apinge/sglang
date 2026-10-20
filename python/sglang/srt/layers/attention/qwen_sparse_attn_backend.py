@@ -19,6 +19,9 @@ import torch.nn.functional as F
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
+    QSA_GRAPH_MODE_DECODE,
+    QSA_GRAPH_MODE_DRAFT_EXTEND_V2,
+    QSA_GRAPH_MODE_TARGET_VERIFY,
     QSA_VARIANT_COMPRESSED,
     is_qwen_qsa,
     parse_qsa_profile,
@@ -45,13 +48,10 @@ from sglang.srt.utils import is_gfx942_supported, is_hip
 logger = logging.getLogger(__name__)
 
 
-# This only decides whether a target QSA backend may construct the PyHIP
+# This only decides whether a target or draft QSA backend may construct the PyHIP
 # attention wrapper. `PyHIPAttention.can_use_for_forward()` remains the per-forward
 # contract for mode, graph state, and real Q/K/V layout.
-_USE_PYHIP_QSA_ATTENTION = (
-    envs.SGLANG_USE_PYHIP_QSA.get()
-    and is_gfx942_supported()
-)
+_USE_PYHIP_QSA_ATTENTION = envs.SGLANG_USE_PYHIP_QSA.get() and is_gfx942_supported()
 
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
@@ -265,7 +265,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         if (
             _USE_PYHIP_QSA_ATTENTION
             and runner is not None
-            and not runner.is_draft_worker
             and runner.ps.attn_cp_size == runner.ps.attn_dcp_size == 1
             and runner.kv_cache_dtype == torch.bfloat16
             and profile is not None
@@ -276,7 +275,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             from sglang.srt.layers.attention.qsa.pyhip_backend import PyHIPAttention
 
             self._pyhip_attention = PyHIPAttention()
-            logger.info("Using installed PyHIP for gfx942 QSA prefill attention")
+            logger.info(
+                "Using installed PyHIP for gfx942 QSA prefill attention (draft=%s)",
+                runner.is_draft_worker,
+            )
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -300,25 +302,21 @@ class QwenSparseAttnBackend(AttentionBackend):
                 f"compress ratio ({self.compress_ratio}); got {draft_tokens}"
             )
 
-    @staticmethod
-    def _speculative_max_row_length(forward_batch, sequence_lengths) -> int:
+    def _speculative_max_row_length(self, forward_batch, sequence_lengths) -> int:
         """Column bound for the token-slot gather on speculative paged rows.
 
         Row lengths live only on device there (they come from the batch's
         positions, which depend on the accepted-token count), so bound them
         with the host-resident request lengths plus the draft window instead
         of syncing every forward. A few extra columns are harmless; a missing
-        CPU mirror falls back to one small readback.
+        CPU mirror uses the allocated token-table width. This is an eager
+        fallback only; graph replay builds its page table directly on device.
         """
         seq_lens_cpu = forward_batch.seq_lens_cpu
         if seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
-            logger.warning_once(
-                "QSA speculative metadata without CPU request lengths: the "
-                "token-slot bound reads them back once per forward"
-            )
-            return max(1, int(sequence_lengths.max()))
+            return self.req_to_token.shape[1]
         spec_info = forward_batch.spec_info
-        draft_window = int(spec_info.draft_token_num) if spec_info is not None else 0
+        draft_window = int(getattr(spec_info, "draft_token_num", 0) or 0)
         return max(1, int(seq_lens_cpu.max()) + draft_window)
 
     @staticmethod
@@ -343,7 +341,26 @@ class QwenSparseAttnBackend(AttentionBackend):
             # those tail rows to request row 0, mirroring the CUDA-graph
             # speculative layout padding, so gathers stay in bounds.
             repeats = extend_seq_lens[:batch_size].to(dtype=torch.long)
-            real_rows = int(repeats.sum().item())
+            cpu_lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
+            if cpu_lengths is None:
+                cpu_lengths = getattr(
+                    getattr(forward_batch, "spec_info", None),
+                    "extend_seq_lens_cpu",
+                    None,
+                )
+            if isinstance(cpu_lengths, torch.Tensor) and cpu_lengths.is_cuda:
+                cpu_lengths = None
+            if cpu_lengths is None:
+                # Fixed output capacity also covers ragged GPU-only batches:
+                # cumsum/searchsorted maps live tokens; padded tail maps to 0.
+                # Do not read the repeat total back just to allocate a mapping.
+                ends = repeats.cumsum(0)
+                total = ends[-1]
+                torch._assert_async(total <= num_rows)
+                rows = torch.arange(num_rows, device=repeats.device)
+                requests = torch.searchsorted(ends, rows, right=True)
+                return torch.where(rows < total, requests, 0)
+            real_rows = sum(int(n) for n in cpu_lengths[:batch_size])
             if real_rows > num_rows:
                 raise ValueError(
                     "QSA speculative query rows are fewer than the extend "
@@ -356,6 +373,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                     device=forward_batch.req_pool_indices.device,
                 ),
                 repeats,
+                output_size=real_rows,
             )
             padding = num_rows - real_rows
             if padding:
@@ -454,7 +472,9 @@ class QwenSparseAttnBackend(AttentionBackend):
                 f"capacity={num_tokens}, actual={actual_rows}"
             )
         repeats = extend_lengths.to(device=req_pool_indices.device, dtype=torch.long)
-        row_req_pool_indices = torch.repeat_interleave(req_pool_indices[:bs], repeats)
+        row_req_pool_indices = torch.repeat_interleave(
+            req_pool_indices[:bs], repeats, output_size=actual_rows
+        )
         # Draft-extend graphs always execute the captured static token shape,
         # while a replay can contain fewer accepted tokens.  The runner packs
         # real rows first and zero-fills the tail, so give those tail rows safe
@@ -675,7 +695,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             if forward_batch.seq_lens_cpu is not None:
                 max_length = int(forward_batch.seq_lens_cpu[:batch_size].max())
             else:
-                max_length = int(sequence_lengths.max())
+                max_length = self.req_to_token.shape[1]
             row_req_pool_indices = forward_batch.req_pool_indices[:batch_size]
             token_slot_table = self.req_to_token[
                 row_req_pool_indices.long(), :max_length
@@ -702,6 +722,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 if extend_seq_lens is None:
                     raise ValueError("QSA extend metadata requires extend_seq_lens")
+                extend_seq_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
                 token_to_batch_idx = torch.repeat_interleave(
                     torch.arange(
                         batch_size,
@@ -709,6 +730,13 @@ class QwenSparseAttnBackend(AttentionBackend):
                         dtype=torch.int32,
                     ),
                     extend_seq_lens.to(torch.long),
+                    # A host total avoids a readback that waits for all queued GPU
+                    # work (the whole target prefill, for the MTP draft extend).
+                    output_size=(
+                        None
+                        if extend_seq_lens_cpu is None
+                        else sum(extend_seq_lens_cpu)
+                    ),
                 )
                 # DP MAX_LEN pseudo-extend pads token rows after the real
                 # extend rows; the extra rows are trimmed downstream, but the
@@ -808,8 +836,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 int(length) for length in forward_batch.seq_lens_cpu[:batch_size]
             ]
             cpu_extend_lens = [
-                int(length)
-                for length in forward_batch.extend_seq_lens_cpu[:batch_size]
+                int(length) for length in forward_batch.extend_seq_lens_cpu[:batch_size]
             ]
             if any(
                 seq_len > extend_len
@@ -1184,15 +1211,15 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         if speculative:
             if forward_mode.is_target_verify():
-                mode = 1
+                mode = QSA_GRAPH_MODE_TARGET_VERIFY
                 extend_lens = None
                 extend_len = int(spec_info.draft_token_num)
             else:
-                mode = 2
+                mode = QSA_GRAPH_MODE_DRAFT_EXTEND_V2
                 extend_len = 0
                 extend_lens = self._stage_extend_lens(spec_info, bs, num_rows)
         else:
-            mode = 0
+            mode = QSA_GRAPH_MODE_DECODE
             extend_lens = None
             extend_len = 0
         launch_graph_metadata(
@@ -1307,30 +1334,16 @@ class QwenSparseAttnBackend(AttentionBackend):
             return
         if metadata is None:
             metadata = self.get_indexer_metadata(layer_id, forward_batch)
-        if metadata.is_cuda_graph or forward_batch.forward_mode.is_draft_extend_v2():
-            self._capture_mtp_sparse_indices_from_extend_lens(
-                topk_indices, forward_batch, metadata, layer_id
-            )
-            return
-        if metadata.req_pool_indices is None or metadata.req_pool_indices.numel() == 0:
-            return
-        state = self._mtp_shared_sparse_indices
-        row_to_req = metadata.get_token_to_batch_idx().long()
-        row_req_pool_indices = metadata.req_pool_indices[
-            row_to_req[: topk_indices.shape[0]]
-        ]
-        is_last = torch.ones_like(row_req_pool_indices, dtype=torch.bool)
-        if row_req_pool_indices.numel() > 1:
-            is_last[:-1] = row_req_pool_indices[:-1] != row_req_pool_indices[1:]
-        anchor_rows = is_last.nonzero().flatten()
-        req_rows = row_req_pool_indices[anchor_rows]
-        captured_lens = metadata.get_seqlens_expanded()[anchor_rows]
-        state.capture(topk_indices[anchor_rows], req_rows, captured_lens, layer_id)
+        # The post-prefill EXTEND anchors at block ends too; deriving them from
+        # extend lengths (not a nonzero() over rows) keeps this sync-free.
+        self._capture_mtp_sparse_indices_from_extend_lens(
+            topk_indices, forward_batch, metadata, layer_id
+        )
 
     @staticmethod
     def _capture_extend_seq_lens(forward_batch) -> torch.Tensor:
         """GPU extend lengths for speculative capture/layout, in the same
-        resolution order as the mode-2 in-graph layout kernels so both read
+        resolution order as the DRAFT_EXTEND_V2 in-graph layout kernels so both read
         the SAME replay-refreshed buffer."""
         spec_info = getattr(forward_batch, "spec_info", None)
         extend_seq_lens = getattr(spec_info, "extend_seq_lens_tensor", None)

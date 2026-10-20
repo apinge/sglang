@@ -8,7 +8,10 @@ import logging
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.qsa.metadata import build_rope_position_matrix
+from sglang.srt.layers.attention.qsa.metadata import (
+    build_group_ring_slots,
+    build_rope_position_matrix,
+)
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -196,9 +199,20 @@ class PyHIPIndexer:
                 metadata=metadata,
                 state_slots=state_slots,
             )
-        if batch.forward_mode == ForwardMode.DECODE or (
-            metadata.is_cuda_graph
-            and batch.forward_mode == ForwardMode.TARGET_VERIFY
+        draft_extend = batch.forward_mode == ForwardMode.DRAFT_EXTEND_V2
+        if draft_extend and getattr(
+            getattr(batch, "spec_info", None), "num_front_tokens", 0
+        ):
+            # Widened windows need separate ring-alias validation. The
+            # supported MTP window has at most compress_ratio token rows.
+            return None
+        if (
+            batch.forward_mode == ForwardMode.DECODE
+            or draft_extend
+            or (
+                metadata.is_cuda_graph
+                and batch.forward_mode == ForwardMode.TARGET_VERIFY
+            )
         ):
             return self._decode(
                 indexer=indexer,
@@ -207,7 +221,8 @@ class PyHIPIndexer:
                 logical=logical,
                 metadata=metadata,
                 state_slots=state_slots,
-                verify=batch.forward_mode == ForwardMode.TARGET_VERIFY,
+                verify=draft_extend or batch.forward_mode == ForwardMode.TARGET_VERIFY,
+                draft_extend=draft_extend,
             )
         return None
 
@@ -313,6 +328,7 @@ class PyHIPIndexer:
             and table.shape[0] == rows
             and table.is_contiguous()
             and table.shape[1] > 0
+            and table.shape[1] * 16 <= 65536
             and lengths.dtype == torch.int32
             and lengths.shape == (rows,)
             and lengths.is_contiguous()
@@ -320,7 +336,16 @@ class PyHIPIndexer:
         )
 
     def _decode(
-        self, *, indexer, hidden, positions, logical, metadata, state_slots, verify
+        self,
+        *,
+        indexer,
+        hidden,
+        positions,
+        logical,
+        metadata,
+        state_slots,
+        verify,
+        draft_extend=False,
     ):
         if metadata.is_cuda_graph:
             if any(
@@ -337,19 +362,52 @@ class PyHIPIndexer:
             groups = metadata.graph_ring_group_locs
             writes = metadata.graph_write_locs
         else:
+            if draft_extend:
+                if any(
+                    t is None
+                    for t in (
+                        metadata.write_locs,
+                        metadata.compress_sequence_ids,
+                        metadata.req_pool_indices,
+                        metadata.decode_logical_positions,
+                        metadata.decode_page_table,
+                        metadata.decode_lengths,
+                    )
+                ):
+                    return None
+                # Native eager plans compact completed groups and pad their
+                # capacity with slot-0 writes. PyHIP needs one entry per query
+                # row, including a slot-0 write for every non-boundary row.
+                writes = torch.zeros(
+                    len(hidden), dtype=torch.int32, device=hidden.device
+                )
+                writes.scatter_reduce_(
+                    0,
+                    metadata.compress_sequence_ids.long(),
+                    metadata.write_locs,
+                    reduce="amax",
+                    include_self=True,
+                )
+                groups = build_group_ring_slots(
+                    req_pool_indices=metadata.req_pool_indices,
+                    group_end_positions=metadata.decode_logical_positions.long(),
+                    sequence_ids=torch.arange(len(hidden), device=hidden.device),
+                    compress_ratio=indexer.compress_ratio,
+                )
+            else:
+                groups = metadata.compress_group_ring_locs
+                writes = metadata.write_locs
             if any(
                 t is None
                 for t in (
-                    metadata.write_locs,
-                    metadata.compress_group_ring_locs,
+                    writes,
+                    groups,
                     metadata.decode_logical_positions,
                     metadata.decode_page_table,
                     metadata.decode_lengths,
                 )
             ):
                 return None
-            groups = metadata.compress_group_ring_locs
-            writes = metadata.write_locs
         cache, table, lengths, _ = metadata.get_decode_mqa_inputs(indexer.layer_id)
         rows = len(hidden)
         groups, writes = groups[:rows], writes[:rows]
@@ -404,7 +462,9 @@ class PyHIPIndexer:
             verify=verify,
         )
         with torch.profiler.record_function(
-            "pyhip_qsa.indexer.verify" if verify else "pyhip_qsa.indexer.decode"
+            "pyhip_qsa.indexer.draft_extend"
+            if draft_extend
+            else "pyhip_qsa.indexer.verify" if verify else "pyhip_qsa.indexer.decode"
         ):
             if self.validation is not None:
                 return self.validation.decode(

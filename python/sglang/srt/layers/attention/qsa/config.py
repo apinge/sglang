@@ -34,6 +34,11 @@ QSA_VARIANT_TOKENWISE = "tokenwise"
 QSA_ROPE_MROPE = "mrope"
 QSA_ROPE_PLAIN = "plain"
 
+# Internal graph-metadata modes; independent of ForwardMode enum values.
+QSA_GRAPH_MODE_DECODE = 0
+QSA_GRAPH_MODE_TARGET_VERIFY = 1
+QSA_GRAPH_MODE_DRAFT_EXTEND_V2 = 2
+
 _COMPRESSED_FIELDS = (
     "indexer_n_heads",
     "indexer_kv_heads",

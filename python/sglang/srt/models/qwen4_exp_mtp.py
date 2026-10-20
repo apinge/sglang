@@ -6,6 +6,8 @@ from contextlib import ExitStack
 from typing import Optional
 
 import torch
+import triton
+import triton.language as tl
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -23,6 +25,29 @@ from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
+
+
+@triton.jit
+def _add_embeds_to_streams_kernel(
+    streams_ptr, embeds_ptr, H: tl.constexpr, HC: tl.constexpr, BLOCK: tl.constexpr
+):
+    token = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < H
+    embeds = tl.load(embeds_ptr + token * H + cols, mask=mask).to(tl.float32)
+    for stream in tl.static_range(HC):
+        ptr = streams_ptr + (token * HC + stream) * H + cols
+        value = tl.load(ptr, mask=mask).to(tl.float32) + embeds
+        tl.store(ptr, value.to(streams_ptr.dtype.element_ty), mask=mask)
+
+
+def _add_embeds_to_streams(streams: torch.Tensor, embeds: torch.Tensor) -> None:
+    """streams[t, s, :] += embeds[t, :] in place (vectorized broadcast add)."""
+    tokens, hc, hidden = streams.shape
+    block = 1024
+    _add_embeds_to_streams_kernel[(tokens, triton.cdiv(hidden, block))](
+        streams, embeds, H=hidden, HC=hc, BLOCK=block
+    )
 
 
 class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
@@ -112,6 +137,17 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
             *hidden_states.shape[:-1], self.hc_count, self.hidden_size
         )
         encoder_inputs = self.fc_hidden(decoder_view)
+        # Prefill-sized extends only; decode-sized adds are tiny and graph-captured.
+        if (
+            encoder_inputs.is_cuda
+            and encoder_inputs.dim() == 3
+            and encoder_inputs.shape[0] >= 256
+            and encoder_inputs.is_contiguous()
+            and input_embeds.is_contiguous()
+            and input_embeds.dtype == encoder_inputs.dtype
+        ):
+            _add_embeds_to_streams(encoder_inputs, input_embeds)
+            return encoder_inputs.view(orig_shape)
         return (input_embeds.unsqueeze(-2) + encoder_inputs).view(orig_shape)
 
     def _fuse_standard(
@@ -142,10 +178,12 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
     ) -> torch.Tensor:
         assert input_embeds is None
         input_embeds = forward_batch.mm_input_embeds
+        # Embeddings handed over by the target (multimodal, or shifted text
+        # prompt embeddings) still need each request's last (tail) row.
         if (
             forward_batch.forward_mode.is_extend()
-            and forward_batch.contains_mm_inputs()
             and not forward_batch.forward_mode.is_draft_extend_v2()
+            and (forward_batch.contains_mm_inputs() or input_embeds is not None)
         ):
             assert input_embeds is not None
             last_indices = (

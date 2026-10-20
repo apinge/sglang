@@ -1728,6 +1728,18 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
         # mm routine passes input_ids=None; PLE needs the real ids.
         if input_ids is None:
             input_ids = forward_batch.input_ids
+        spec_algorithm = forward_batch.spec_algorithm
+        if (
+            input_embeds is not None
+            and forward_batch.mm_input_embeds is None
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and spec_algorithm is not None
+            and spec_algorithm.is_eagle()
+            and not spec_algorithm.is_eagle3()
+        ):
+            # Text-only prefill: the MTP draft extend shifts these prompt
+            # embeddings instead of re-embedding (and all-reducing) every token.
+            forward_batch.mm_input_embeds = input_embeds
         model_output = super().forward(
             input_ids=input_ids,
             positions=positions,
