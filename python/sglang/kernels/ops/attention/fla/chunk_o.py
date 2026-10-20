@@ -11,6 +11,7 @@ import triton.language as tl
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.op import exp, safe_exp
 from sglang.kernels.ops.attention.fla.utils import check_shared_mem, is_nvidia_hopper
+from sglang.srt.environ import envs
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
@@ -143,11 +144,18 @@ def chunk_fwd_o(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    o = torch.zeros_like(v)
-
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
+    gfx942_tiles = (
+        envs.SGLANG_GFX942_GDN_PREFILL_TILES.get()
+        and torch.version.hip is not None
+        and K == V == 128
+        and torch.cuda.get_device_properties(q.device).gcnArchName.startswith("gfx942")
+    )
+    # Every valid output lane is written by the tiled kernel. Avoid clearing
+    # the full prefill output before immediately overwriting it.
+    o = torch.empty_like(v) if gfx942_tiles else torch.zeros_like(v)
     chunk_fwd_kernel_o[grid](
         q,
         k,
@@ -164,11 +172,11 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
-        BK=128,
+        BK=64 if gfx942_tiles else 128,
         BV=64,
         USE_G=g is not None,
         IS_VARLEN=cu_seqlens is not None,
         num_warps=4,
-        num_stages=2,
+        num_stages=1 if gfx942_tiles else 2,
     )
     return o

@@ -18,6 +18,7 @@ from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
     is_nvidia_hopper,
 )
+from sglang.srt.environ import envs
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
@@ -350,10 +351,24 @@ def chunk_gated_delta_rule_fwd_h(
 
     v_new = torch.empty_like(u) if save_new_value else None
 
+    gfx942_tiles = (
+        envs.SGLANG_GFX942_GDN_PREFILL_TILES.get()
+        and torch.version.hip is not None
+        and K == V == 128
+        and torch.cuda.get_device_properties(k.device).gcnArchName.startswith("gfx942")
+    )
+    # Keep production autotuning single-config: this kernel updates the state
+    # pool in place. The tuned path calls the JIT kernel directly.
+    kernel = (
+        chunk_gated_delta_rule_fwd_kernel_h_blockdim64.fn
+        if gfx942_tiles
+        else chunk_gated_delta_rule_fwd_kernel_h_blockdim64
+    )
+
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
-    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
+    kernel[grid](
         k=k,
         v=u,
         w=w,
@@ -382,5 +397,6 @@ def chunk_gated_delta_rule_fwd_h(
         IS_VARLEN=cu_seqlens is not None,
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
         USE_EXP2=use_exp2,
+        **({"BV": 64, "num_warps": 4, "num_stages": 2} if gfx942_tiles else {}),
     )
     return h, v_new

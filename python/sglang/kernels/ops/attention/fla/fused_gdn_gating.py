@@ -4,6 +4,42 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
+
+@triton.jit(do_not_specialize=["rows"])
+def _gfx942_gdn_gating(
+    g,
+    beta_output,
+    A_log,
+    a,
+    b,
+    dt_bias,
+    rows,
+    stride_a: tl.constexpr,
+    stride_b: tl.constexpr,
+    beta: tl.constexpr,
+    threshold: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row, head = index // 24, index % 24
+    mask = row < rows
+    alog = tl.load(A_log + head).to(tl.float32)
+    aa = tl.load(a + row * stride_a + head, mask, other=0).to(tl.float32)
+    bb = tl.load(b + row * stride_b + head, mask, other=0).to(tl.float32)
+    dt = tl.load(dt_bias + head).to(tl.float32)
+    x = aa + dt
+    softplus = tl.where(
+        beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
+    )
+    value = -tl.exp(alog) * softplus
+    tl.store(g + index, value, mask)
+    # Preserve the existing BF16 sigmoid boundary before storing FP32 beta.
+    tl.store(
+        beta_output + index, tl.sigmoid(bb).to(b.dtype.element_ty).to(tl.float32), mask
+    )
+
 
 # g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 # beta_output = b.sigmoid()
@@ -56,6 +92,29 @@ def fused_gdn_gating(
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
     beta_output = torch.empty(1, batch, num_heads, dtype=torch.float32, device=b.device)
+    if (
+        torch.version.hip is not None
+        and envs.SGLANG_GFX942_GDN_GATING.get()
+        and num_heads == 24
+        and a.stride(1) == b.stride(1) == 1
+        and torch.cuda.get_device_properties(a.device).gcnArchName.startswith("gfx942")
+    ):
+        _gfx942_gdn_gating[(triton.cdiv(batch * 24, 256),)](
+            g,
+            beta_output,
+            A_log,
+            a,
+            b,
+            dt_bias,
+            batch,
+            stride_a,
+            stride_b,
+            beta=beta,
+            threshold=threshold,
+            BLOCK=256,
+            num_warps=1,
+        )
+        return g, beta_output
     fused_gdn_gating_kernel[grid](
         g,
         beta_output,
