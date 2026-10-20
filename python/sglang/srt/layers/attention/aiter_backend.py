@@ -2708,10 +2708,12 @@ class AiterAttnBackend(AttentionBackend):
                         swa_page_table=_swa_page_table,
                     )
                 else:
-                    custom_mask = self.cuda_graph_custom_mask
-                    custom_mask[: spec_info.custom_mask.shape[0]] = (
-                        spec_info.custom_mask
-                    )
+                    custom_mask = None
+                    if spec_info is not None and spec_info.custom_mask is not None:
+                        custom_mask = self.cuda_graph_custom_mask
+                        custom_mask[: spec_info.custom_mask.shape[0]] = (
+                            spec_info.custom_mask
+                        )
                     seq_mask_len = max_q_len * (seq_lens + max_q_len)
                     mask_indptr = self.mask_indptr[: bs + 1]
                     mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
@@ -3490,8 +3492,8 @@ class AiterAttnBackend(AttentionBackend):
                     True,  # causal
                     self.forward_metadata.mask_indptr,
                     self.forward_metadata.max_extend_len,
-                    1.0,  # k_scale
-                    1.0,  # v_scale
+                    layer.k_scale_float if layer.k_scale is not None else 1.0,
+                    layer.v_scale_float if layer.v_scale is not None else 1.0,
                     layer.scaling,
                     logit_cap=layer.logit_cap,
                 )

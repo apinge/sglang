@@ -34,6 +34,7 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
         "FlashInferMLAAttnBackend",
         "FlashAttentionBackend",
         "TritonAttnBackend",
+        "AiterAttnBackend",
         "TRTLLMHAAttnBackend",
         "TRTLLMMLABackend",
         "XPUAttentionBackend",
