@@ -17,7 +17,9 @@ Qwen3.8
 
 2. Install aiter:
    ```bash
-   pip uninstall -y aiter
+   cd /opt
+   pip uninstall -y amd-aiter
+   rm -rf /opt/aiter ~/.aiter
    git clone https://github.com/apinge/aiter.git -b qwen38-flash-next-dev
    cd aiter
    # git checkout <target_commit>
@@ -27,7 +29,9 @@ Qwen3.8
 
 3. Setup pyhip
     ```bash
+    cd /opt
     pip uninstall -y pyhip
+    rm -rf pyhip
     git clone https://github.com/tingqli/pyhip.git -b dev
     pip install -e .
     cd ..
@@ -35,7 +39,9 @@ Qwen3.8
 
 4. Install sglang:
    ```bash
-   pip uninstall -y sglang
+   cd /opt
+   pip uninstall -y sglang sglang-kernel
+   rm -rf /opt/sglang
    git clone https://github.com/apinge/sglang.git -b qwen4_v0.5.21
    cd sglang
    # git checkout <target_commit>
