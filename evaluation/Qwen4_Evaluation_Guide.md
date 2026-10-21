@@ -1,11 +1,16 @@
 # Qwen3.5 & Qwen3.8 PTPC Model Evaluation Guide
 
 ## Target Model
-Qwen3.5
+Qwen3.5 + DFlash
+Target Model
 - [sammysun0711/Qwen3.5-397B-A17B-PTPC-FP8](https://huggingface.co/sammysun0711/Qwen3.5-397B-A17B-PTPC-FP8)
 - [sammysun0711/Qwen3.5-35B-A3B-PTPC-FP8](https://huggingface.co/sammysun0711/Qwen3.5-35B-A3B-PTPC-FP8)
 
-Qwen3.8
+Draft Model：
+- [z-lab/Qwen3.5-397B-A17B-DFlash](https://huggingface.co/z-lab/Qwen3.5-397B-A17B-DFlash)
+- [z-lab/Qwen3.5-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.5-35B-A3B-DFlash)
+
+Qwen3.8 + MTP
 - [sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16](https://huggingface.co/sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16)
 
 ## Set Environment
@@ -56,7 +61,7 @@ Qwen3.8
    SGLANG_BUILD_RUST_EXTS=none pip install -e "python[all_hip]"
    ```
 
-## Qwen3.5 Evaluation
+## Qwen3.5 Target Only Evaluation
 ### Launch server
 Target model: [sammysun0711/Qwen3.5-397B-A17B-PTPC-FP8](https://huggingface.co/sammysun0711/Qwen3.5-397B-A17B-PTPC-FP8)
 ```bash
@@ -83,7 +88,65 @@ Target model: [sammysun0711/Qwen3.5-35B-A3B-PTPC-FP8](https://huggingface.co/sam
 ./run_qwen35_pure_text_profile.sh
 ```
 
-## Qwen3.8 Evaluation
+## Qwen3.5 Target Only Evaluation
+### Launch server
+Target model: [sammysun0711/Qwen3.5-397B-A17B-PTPC-FP8](https://huggingface.co/sammysun0711/Qwen3.5-397B-A17B-PTPC-FP8)
+```bash
+./launch_qwen3.5-397B-fp8_tp8_disable_prefix_cache.sh
+```
+
+Target model: [sammysun0711/Qwen3.5-35B-A3B-PTPC-FP8](https://huggingface.co/sammysun0711/Qwen3.5-35B-A3B-PTPC-FP8)
+```bash
+./launch_qwen3.5-35B-fp8_tp4_disable_prefix_cache.sh
+```
+
+### Run benchmark
+```bash
+./run_qwen35_pure_text_bench.sh
+```
+
+### Run GSM8K Accuracy verification
+```bash
+./run_gsm8k.sh
+```
+
+### Run Profile
+```bash
+./run_qwen35_pure_text_profile.sh
+```
+
+
+## Qwen3.5 + DFlash Evaluation
+### Launch server
+Target model: [sammysun0711/Qwen3.5-397B-A17B-PTPC-FP8](https://huggingface.co/sammysun0711/Qwen3.5-397B-A17B-PTPC-FP8)
+Draft mdoel: [z-lab/Qwen3.5-397B-A17B-DFlash](https://huggingface.co/z-lab/Qwen3.5-397B-A17B-DFlash)
+```bash
+./launch_qwen3.5-397B-fp8_tp8_dflash_with_prefix_cache.sh
+```
+
+Target model: [sammysun0711/Qwen3.5-35B-A3B-PTPC-FP8](https://huggingface.co/sammysun0711/Qwen3.5-35B-A3B-PTPC-FP8)
+Draft model: [z-lab/Qwen3.5-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.5-35B-A3B-DFlash)
+```bash
+./launch_qwen3.5-35B-fp8_tp1_dflash_with_prefix_cache_mfs0.7_bs32.sh
+```
+
+### Run benchmark
+```bash
+./run_qwen35_pure_text_bench.sh
+```
+
+### Run GSM8K Accuracy verification
+```bash
+./run_gsm8k.sh
+```
+
+### Run Profile
+```bash
+./run_qwen35_pure_text_profile.sh
+```
+
+
+## Qwen3.8 + MTP Evaluation
 
 ### Launch server
 Target model: [sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16](https://huggingface.co/sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16)
