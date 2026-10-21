@@ -36,7 +36,7 @@ Qwen3.8
 4. Install sglang:
    ```bash
    pip uninstall -y sglang
-   git clone https://github.com/sammysun0711/sglang.git -b qwen4_v0.5.21
+   git clone https://github.com/apinge/sglang.git -b qwen4_v0.5.21
    cd sglang
    # git checkout <target_commit>
    # Compile sgl-kernel

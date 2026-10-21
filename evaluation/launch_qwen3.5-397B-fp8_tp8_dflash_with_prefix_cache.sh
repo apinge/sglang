@@ -15,7 +15,7 @@ export SGLANG_USE_IPC_POOL_HANDLE_CACHE=1
 export TVM_FFI_DISABLE_TORCH_C_DLPACK=1 # pip uninstall torch-c-dlpack-ext
 
 model=/models/Qwen3.5-397B-A17B-PTPC-FP8
-model1=/models/Qwen3.5-397B-A17B-DFlash/
+draft_model=/models/Qwen3.5-397B-A17B-DFlash/
 
 # --disable-radix-cache
 python3 -m sglang.launch_server \
@@ -27,7 +27,7 @@ python3 -m sglang.launch_server \
  --enable-multimodal \
  --trust-remote-code \
  --speculative-algorithm DFLASH \
- --speculative-draft-model-path ${model1} \
+ --speculative-draft-model-path ${draft_model} \
  --speculative-num-draft-tokens 16 \
  --speculative-draft-attention-backend triton \
  --chunked-prefill-size 32768 \

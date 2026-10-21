@@ -14,7 +14,7 @@ export HIP_GDN_SORT_IDX_BS=32768
 export TVM_FFI_DISABLE_TORCH_C_DLPACK=1 # pip uninstall torch-c-dlpack-ext
 
 model=/models/Qwen3.5-35B-A3B-PTPC-FP8/
-model1=/models/Qwen3.5-35B-A3B-DFlash
+draft_model=/models/Qwen3.5-35B-A3B-DFlash
 
 python3 -m sglang.launch_server \
  --port 7080 \
@@ -23,7 +23,7 @@ python3 -m sglang.launch_server \
  --reasoning-parser qwen3 \
  --tool-call-parser qwen3_coder \
  --speculative-algorithm DFLASH \
- --speculative-draft-model-path ${model1} \
+ --speculative-draft-model-path ${draft_model} \
  --speculative-num-draft-tokens 16 \
  --speculative-draft-attention-backend triton \
  --enable-multimodal \
