@@ -1,18 +1,28 @@
-# Set Environment
+# Qwen3.5 & Qwen3.8 PTPC Model Evaluation Guide
+
+## Target Model
+Qwen3.5
+- [sammysun0711/Qwen3.5-397B-A17B-PTPC-FP8](https://huggingface.co/sammysun0711/Qwen3.5-397B-A17B-PTPC-FP8)
+- [sammysun0711/Qwen3.5-35B-A3B-PTPC-FP8](https://huggingface.co/sammysun0711/Qwen3.5-35B-A3B-PTPC-FP8)
+
+Qwen3.8
+- [sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16](https://huggingface.co/sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16)
+
+## Set Environment
 
 1. Docker image:
    ```bash
-   rocm/ali-private:ubuntu22.04_rocm7.14.0_cp310_torch2.12.0_sglang_c9ef753_aiter_4752a40_20260923_v2
+   rocm/ali-private:ubuntu22.04_rocm7.14.0_cp310_torch2.12.0_sglang_d0a5b96_aiter_b7aed05_20261020
    ```
 
 2. Install aiter:
    ```bash
    pip uninstall -y aiter
-   git clone -b qwen38-flash-next-dev https://github.com/apinge/aiter.git
+   git clone https://github.com/apinge/aiter.git -b qwen38-flash-next-dev
    cd aiter
-   git checkout <target_commit>
+   # git checkout <target_commit>
    git submodule sync && git submodule update --init --recursive
-   python3 setup.py develop
+   pip install -e .
    ```
 
 3. Setup pyhip
@@ -26,9 +36,9 @@
 4. Install sglang:
    ```bash
    pip uninstall -y sglang
-   git clone https://github.com/sammysun0711/sglang.git -b qwen4_v0.5.21 
+   git clone https://github.com/sammysun0711/sglang.git -b qwen4_v0.5.21
    cd sglang
-   git checkout <target_commit>
+   # git checkout <target_commit>
    # Compile sgl-kernel
    pip install --upgrade pip
    cd python/sglang/kernels/aot
@@ -40,54 +50,52 @@
    SGLANG_BUILD_RUST_EXTS=none pip install -e "python[all_hip]"
    ```
 
-# Qwen3.5 Evaluation
-## Launch server
+## Qwen3.5 Evaluation
+### Launch server
+Target model: [sammysun0711/Qwen3.5-397B-A17B-PTPC-FP8](https://huggingface.co/sammysun0711/Qwen3.5-397B-A17B-PTPC-FP8)
 ```bash
 ./launch_qwen3.5-397B-fp8_tp8_disable_prefix_cache.sh
 ```
 
-## Run benchmark
+Target model: [sammysun0711/Qwen3.5-35B-A3B-PTPC-FP8](https://huggingface.co/sammysun0711/Qwen3.5-35B-A3B-PTPC-FP8)
+```bash
+./launch_qwen3.5-35B-fp8_tp4_disable_prefix_cache.sh
+```
+
+### Run benchmark
 ```bash
 ./run_qwen35_pure_text_bench.sh
 ```
 
-## GSM8K Accuracy verification
+### Run GSM8K Accuracy verification
 ```bash
 ./run_gsm8k.sh
 ```
 
-# Qwen3.5 Evaluation
-## Launch server
+### Run Profile
 ```bash
-./launch_qwen3.5-397B-fp8_tp8_disable_prefix_cache.sh
+./run_qwen35_pure_text_profile.sh
 ```
 
-## Run benchmark
-```bash
-./run_qwen35_pure_text_bench.sh
-```
+## Qwen3.8 Evaluation
 
-## GSM8K Accuracy verification
-```bash
-./run_gsm8k.sh
-```
-
-
-# Qwen3.8 Evaluation
-## Launch server
+### Launch server
+Target model: [sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16](https://huggingface.co/sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16)
 ```bash
 ./launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2.sh
 ```
 
-## Run benchmark
+### Run benchmark
 ```bash
 ./run_qwen38_pure_text_bench.sh
 ```
 
-## GSM8K Accuracy verification
+### Run GSM8K Accuracy verification
 ```bash
 ./run_gsm8k.sh
 ```
 
-# Profile
-./run_sgl_profile.sh
+### Run Profile
+```bash
+./run_qwen38_pure_text_profile.sh
+```

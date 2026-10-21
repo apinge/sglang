@@ -15,7 +15,7 @@ export HIP_GDN_SORT_IDX_BS=32768
 export TVM_FFI_DISABLE_TORCH_C_DLPACK=1 # pip uninstall torch-c-dlpack-ext
 
 # --watchdog-timeout 1200 for profile
-model=/models/offical_qwen3p5_397B_ptpc
+model=/models/Qwen3.5-397B-A17B-PTPC-FP8
 python3 -m sglang.launch_server \
         --port 7080 \
         --model-path ${model} \

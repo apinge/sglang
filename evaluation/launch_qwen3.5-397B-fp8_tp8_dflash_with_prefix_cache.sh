@@ -14,7 +14,7 @@ export SGLANG_USE_IPC_POOL_HANDLE_CACHE=1
 #export HIP_GDN_SORT_IDX_BS=32768
 export TVM_FFI_DISABLE_TORCH_C_DLPACK=1 # pip uninstall torch-c-dlpack-ext
 
-model=/models/offical_qwen3p5_397B_ptpc
+model=/models/Qwen3.5-397B-A17B-PTPC-FP8
 model1=/models/Qwen3.5-397B-A17B-DFlash/
 
 # --disable-radix-cache

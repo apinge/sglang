@@ -12,8 +12,8 @@ mkdir -p "$(dirname -- "${LOG_FILE}")"
 exec > >(tee "${LOG_FILE}") 2>&1
 printf 'Logging to: %s\n' "${LOG_FILE}"
 
-MODEL_PATH="${MODEL_PATH:-/models/Qwen3.8-Flash-Next-PTPC-FP8}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3.8-Flash-Next-PTPC-FP8}"
+MODEL_PATH="${MODEL_PATH:-/models/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-7080}"
 TP_SIZE="${TP_SIZE:-2}"
