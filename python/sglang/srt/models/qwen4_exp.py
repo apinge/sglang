@@ -2284,6 +2284,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if isinstance(module, Qwen3_5GatedDeltaNet):
                 module.finalize_fused_in_proj()
 
+        # The self-referencing PLE shard loader forms a closure cycle containing
+        # params_dict. Release its parameter aliases before FP8 postprocessing
+        # replaces weights, or the old GPU storage survives until cyclic GC.
+        params_dict.clear()
+
         return loaded_params
 
     def precompile_kernels_after_loading(self) -> None:
