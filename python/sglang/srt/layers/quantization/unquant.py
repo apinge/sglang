@@ -34,6 +34,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
     get_exec,
+    get_forward,
     get_lora,
     get_platform,
 )
@@ -502,6 +503,26 @@ class UnquantizedLinearMethod(LinearMethodBase):
         elif getattr(layer.weight, "aiter_trans_weight", False):
             # Must precede the tgemm.mm branch below, which would otherwise
             # swallow every aiter case and leave this path unreachable.
+            if (
+                envs.SGLANG_ROCM_HIPB_DECODE_GEMV.get()
+                and get_forward().hipb_linear_decode
+                and bias is None
+                and x.ndim == 2
+                and x.dtype == torch.bfloat16
+                and x.is_contiguous()
+                and layer.weight.shape == (4096, 16)
+                and layer.weight.stride() == (1, 4096)
+                and 0 < x.shape[0] <= 32
+            ):
+                from sglang.kernels.ops.gemm.swizzled_bf16_gemv import swizzled_gemv
+
+                return swizzled_gemv(
+                    x,
+                    layer.weight,
+                    bn=1 if x.shape[0] == 1 else 2,
+                    bk=4096 if x.shape[0] == 1 else 1024,
+                    num_warps=4,
+                )
             return rocm_aiter_swizzle_hipb_unquantized_gemm(x, layer.weight, bias)
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:

@@ -93,7 +93,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -114,6 +118,7 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_forward,
     get_lora,
     get_parallel,
     get_stream,
@@ -1780,6 +1785,37 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     @torch.no_grad()
     def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        input_deepstack_embeds: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        if not envs.SGLANG_ROCM_HIPB_DECODE_GEMV.get():
+            return self._forward(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors,
+                input_deepstack_embeds,
+            )
+        with get_forward().scoped(
+            hipb_linear_decode=forward_batch.forward_mode == ForwardMode.DECODE
+        ):
+            return self._forward(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors,
+                input_deepstack_embeds,
+            )
+
+    @torch.no_grad()
+    def _forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
