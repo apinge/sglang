@@ -11,6 +11,11 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.ops.gemm.swizzled_bf16_gemv import (
+    can_use_swizzled_gemv,
+    can_write_swizzled_gemv_output,
+    swizzled_gemv,
+)
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
@@ -506,16 +511,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if (
                 envs.SGLANG_ROCM_HIPB_DECODE_GEMV.get()
                 and get_forward().hipb_linear_decode
-                and bias is None
-                and x.ndim == 2
-                and x.dtype == torch.bfloat16
-                and x.is_contiguous()
-                and layer.weight.shape == (4096, 16)
-                and layer.weight.stride() == (1, 4096)
-                and 0 < x.shape[0] <= 32
+                and can_use_swizzled_gemv(x, layer.weight, bias)
             ):
-                from sglang.kernels.ops.gemm.swizzled_bf16_gemv import swizzled_gemv
-
                 return swizzled_gemv(
                     x,
                     layer.weight,
@@ -575,6 +572,20 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         """Run an inference-only BF16 linear into caller-owned storage."""
         if getattr(layer.weight, "aiter_trans_weight", False):
+            if (
+                envs.SGLANG_ROCM_HIPB_DECODE_GEMV.get()
+                and get_forward().hipb_linear_decode
+                and can_use_swizzled_gemv(x, layer.weight, bias)
+                and can_write_swizzled_gemv_output(x, layer.weight, output)
+            ):
+                return swizzled_gemv(
+                    x,
+                    layer.weight,
+                    bn=1 if x.shape[0] == 1 else 2,
+                    bk=4096 if x.shape[0] == 1 else 1024,
+                    num_warps=4,
+                    output=output,
+                )
             output.copy_(self.apply(layer, x, bias))
             return output
         if (
