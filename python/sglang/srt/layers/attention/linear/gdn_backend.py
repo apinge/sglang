@@ -8,6 +8,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -406,6 +407,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        if (
+            _is_hip
+            and envs.SGLANG_USE_AITER_GDN_PREFILL.get()
+            and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+            and not self.is_draft_worker
+            and not self.enable_unified_memory
+            and not get_memory().enable_page_major_kv_layout
+        ):
+            from sglang.srt.layers.attention.linear.kernels.gdn_aiter import (
+                maybe_build_aiter_gdn_prefill_metadata,
+            )
+
+            self.forward_metadata.aiter_gdn_prefill_metadata = (
+                maybe_build_aiter_gdn_prefill_metadata(
+                    forward_batch, self.forward_metadata
+                )
+            )
         if self.forward_metadata.has_mamba_track_mask:
             self.forward_metadata.mamba_track_mask_indices = (
                 forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
@@ -740,6 +758,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                aiter_gdn_prefill_metadata=(
+                    forward_metadata.aiter_gdn_prefill_metadata
+                    if not needs_state_gather
+                    else None
+                ),
                 state_checkpoint_cu_starts=(
                     forward_metadata.state_checkpoint_cu_starts
                 ),
