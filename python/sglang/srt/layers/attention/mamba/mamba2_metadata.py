@@ -18,11 +18,14 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+if TYPE_CHECKING:
+    from aiter.ops.prefill_batch_metadata import GatedDeltaRulePrefillMetadata
 
 
 @dataclass(kw_only=True)
@@ -58,6 +61,8 @@ class ForwardMetadata:
     state_checkpoint_cu_starts: Optional[torch.Tensor] = None
     num_state_checkpoints: int = 0
     state_checkpoint_every_n_tokens: int = 0
+    # Built once per ordinary prefill and reused by all GDN layers.
+    aiter_gdn_prefill_metadata: Optional["GatedDeltaRulePrefillMetadata"] = None
 
     is_target_verify: bool = False
     draft_token_num: int = 1
