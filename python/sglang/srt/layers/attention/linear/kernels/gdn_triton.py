@@ -1,5 +1,6 @@
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
@@ -179,6 +180,28 @@ class TritonGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple:
+        prefill_metadata = kwargs.get("aiter_gdn_prefill_metadata")
+        if envs.SGLANG_USE_AITER_GDN_PREFILL.get() and prefill_metadata is not None:
+            from sglang.srt.layers.attention.linear.kernels.gdn_aiter import (
+                aiter_gdn_prefill,
+                aiter_gdn_prefill_supported,
+            )
+
+            if aiter_gdn_prefill_supported(
+                q, k, v, g, beta, ssm_states, cache_indices, query_start_loc
+            ):
+                return aiter_gdn_prefill(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    prefill_metadata=prefill_metadata,
+                )
+
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         if is_npu():
