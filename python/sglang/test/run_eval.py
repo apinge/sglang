@@ -9,6 +9,7 @@ import os
 import statistics
 import time
 import warnings
+from pathlib import Path
 
 from sglang.test.sgl_eval_utils import (
     SGL_EVAL_BENCHMARKS,
@@ -116,6 +117,29 @@ def run_eval(args):
     # Lazy import to avoid circular dependency with test_utils
     from sglang.test.test_utils import dump_metric
 
+    output_dir = getattr(args, "output_dir", None)
+    strict = getattr(args, "strict", False)
+    if strict and (
+        not output_dir
+        or args.eval_name != "gsm8k"
+        or getattr(args, "api", "chat") != "chat"
+    ):
+        raise ValueError("--strict requires GSM8K, chat API, and --output-dir")
+    if output_dir:
+        if getattr(args, "repeat", 1) != 1:
+            raise ValueError(
+                "Use separate output directories/invocations for repeated evaluations"
+            )
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if any(
+            (output_dir / f"{args.eval_name}{suffix}").exists()
+            for suffix in [".json", ".html", "-examples.jsonl"]
+        ):
+            raise ValueError(
+                "Evaluation output files already exist; use a fresh output directory"
+            )
+
     warnings.warn(
         "sglang.test.run_eval is deprecated; its legacy scorers will be removed. "
         "Use sglang.test.sgl_eval_utils.run_sgl_eval or `sgl-eval run` instead.",
@@ -167,6 +191,9 @@ def run_eval(args):
             num_threads=args.num_threads,
             num_shots=getattr(args, "num_shots", 5),
             data_path=getattr(args, "gsm8k_data_path", None),
+            record_path=str(output_dir / "gsm8k-examples.jsonl")
+            if output_dir
+            else None,
         )
     elif args.eval_name == "mixed_prefix_gsm8k":
         from sglang.test.simple_eval_mixed_prefix_gsm8k import MixedPrefixGSM8KEval
@@ -261,17 +288,48 @@ def run_eval(args):
 
     print_accept_length_summary(samplers)
 
+    if args.eval_name == "gsm8k" and output_dir:
+        metrics.update(eval_obj.request_metrics())
+        metrics.update(
+            model=sampler.model,
+            max_tokens=sampler.max_tokens,
+            threads=args.num_threads,
+            protocol=f"gsm8k-guide-5shot-{args.num_examples}-v1",
+        )
+
     # Dump reports
     file_stem = f"{args.eval_name}_{sampler.model.replace('/', '_')}"
-    report_filename = f"/tmp/{file_stem}.html"
+    report_filename = (
+        str(output_dir / f"{args.eval_name}.html")
+        if output_dir
+        else f"/tmp/{file_stem}.html"
+    )
     print(f"Writing report to {report_filename}")
     with open(report_filename, "w") as fh:
         fh.write(make_report(result))
     print(metrics)
-    result_filename = f"/tmp/{file_stem}.json"
+    result_filename = (
+        str(output_dir / f"{args.eval_name}.json")
+        if output_dir
+        else f"/tmp/{file_stem}.json"
+    )
     with open(result_filename, "w") as f:
         f.write(json.dumps(metrics, indent=2))
     print(f"Writing results to {result_filename}")
+
+    if strict:
+        selection = metrics["selection"]
+        if (
+            metrics["scored"] != args.num_examples
+            or metrics["completed"] != args.num_examples
+            or metrics["errors"]
+            or metrics["empty_outputs"]
+            or len(set(selection["example_ids"])) != args.num_examples
+            or set(selection["prompt_ids"]) & set(selection["example_ids"])
+        ):
+            raise RuntimeError(
+                "Incomplete GSM8K evaluation; structured results were preserved"
+            )
 
     if getattr(args, "return_latency", False):
         return metrics, latency
@@ -311,6 +369,16 @@ if __name__ == "__main__":
         help="API mode: 'chat' for /v1/chat/completions, 'completion' for /v1/completions, 'generate' for SGLang-native /generate",
     )
     parser.add_argument("--num-examples", type=int)
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        help="Write JSON, HTML, and GSM8K example records here",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail incomplete GSM8K chat evaluations after saving results",
+    )
     parser.add_argument("--num-threads", type=int, default=512)
     parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=None)

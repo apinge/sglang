@@ -3,8 +3,12 @@
 # which needs randomized completion-style prefixes sgl-eval does not produce.
 
 import ast
+import hashlib
+import json
 import random
 import re
+import threading
+from pathlib import Path
 from typing import Optional
 
 from sglang.test import simple_eval_common as common
@@ -50,6 +54,7 @@ class GSM8KEval(Eval):
         num_threads: int = 64,
         num_shots: int = 5,
         data_path: Optional[str] = None,
+        record_path: Optional[str] = None,
     ):
         self._num_threads = num_threads
         self._num_shots = num_shots
@@ -61,6 +66,31 @@ class GSM8KEval(Eval):
 
         all_lines = list(read_jsonl(filename))
         pool_size = self._setup_prefix_pool(all_lines, num_shots)
+        self._requested_examples = num_examples
+        self._records = []
+        self._record_lock = threading.Lock()
+        self._record_path = Path(record_path) if record_path else None
+        if self._record_path:
+            if self._record_path.exists():
+                raise ValueError(
+                    f"Refusing to append to existing results: {self._record_path}"
+                )
+            self._record_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def example_id(row):
+            return hashlib.sha256(
+                json.dumps(row, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+
+        self._selection = {
+            "sha256": hashlib.sha256(Path(filename).read_bytes()).hexdigest(),
+            "rows": len(all_lines),
+            "shots": pool_size,
+            "prompt_ids": [example_id(row) for row in all_lines[:pool_size]],
+            "example_ids": [
+                example_id(row) for row in all_lines[pool_size:][:num_examples]
+            ],
+        }
         # The evaluation data should not include the few-shot examples to prevent data leakage.
         self._lines = all_lines[pool_size:]
         if num_examples is not None:
@@ -88,11 +118,32 @@ class GSM8KEval(Eval):
 
             try:
                 response_text = sampler(prompt_messages)
-            except Exception:
+                request_error = None
+            except Exception as exc:
                 response_text = ""
+                request_error = str(exc)
 
             extracted_answer = get_answer_value(response_text)
             score = float(extracted_answer == correct_answer)
+
+            if self._record_path:
+                request_info = getattr(sampler, "get_last_request_info", lambda: {})()
+                record = {
+                    "index": idx,
+                    "example_id": self._selection["example_ids"][idx],
+                    "status": "error" if request_error else "completed",
+                    **request_info,
+                    "content": response_text,
+                    "extracted_answer": extracted_answer,
+                    "correct_answer": correct_answer,
+                    "correct": bool(score),
+                }
+                if request_error:
+                    record.update(status="error", error=request_error)
+                with self._record_lock:
+                    self._records.append(record)
+                    with self._record_path.open("a", encoding="utf-8") as stream:
+                        stream.write(json.dumps(record, allow_nan=False) + "\n")
 
             html = common.jinja_env.from_string(HTML_JINJA).render(
                 prompt_messages=prompt_messages,
@@ -109,6 +160,25 @@ class GSM8KEval(Eval):
             fn, list(range(len(self._lines))), num_threads=self._num_threads
         )
         return common.aggregate_results(results, default_stats=("mean", "std"))
+
+    def request_metrics(self):
+        """Expose completeness independently of mathematical accuracy."""
+        records = self._records
+        return {
+            "requested": self._requested_examples,
+            "scored": len(records),
+            "completed": sum(row["status"] == "completed" for row in records),
+            "errors": sum(row["status"] != "completed" for row in records),
+            "empty_outputs": sum(not row["content"].strip() for row in records),
+            "truncated": sum(row.get("finish_reason") == "length" for row in records),
+            "correct": sum(row["correct"] for row in records),
+            "selection": self._selection,
+            "records_sha256": hashlib.sha256(
+                self._record_path.read_bytes()
+            ).hexdigest(),
+            "scorer_file": __file__,
+            "scorer_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        }
 
 
 class MixedPrefixGSM8KEval(GSM8KEval):

@@ -2,6 +2,7 @@
 
 import os
 import resource
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -115,6 +116,7 @@ class ChatCompletionSampler(SamplerBase):
         self._completion_tokens: list[int] = []
         self.record_meta_info = record_meta_info
         self._meta_infos: List[Dict[str, Any]] = []
+        self._request_local = threading.local()
         print(
             f"ChatCompletionSampler initialized with {self.system_message=} {self.temperature=} {self.max_tokens=} {self.reasoning_effort=} {self.extra_body=} {self.stop=} {self.record_meta_info=}"
         )
@@ -140,7 +142,12 @@ class ChatCompletionSampler(SamplerBase):
     def _pack_message(self, role: str, content: Any):
         return {"role": str(role), "content": content}
 
+    def get_last_request_info(self) -> dict:
+        """Metadata for the current worker thread's most recent request."""
+        return dict(getattr(self._request_local, "info", {}))
+
     def __call__(self, message_list: MessageList) -> str:
+        self._request_local.info = {"status": "error", "attempts": 0}
         if self.system_message:
             message_list = [
                 self._pack_message("system", self.system_message)
@@ -150,6 +157,7 @@ class ChatCompletionSampler(SamplerBase):
             extra_body = {**(self.extra_body or {}), "return_meta_info": True}
         trial = 0
         while trial < 6:  # 126 seconds in total
+            self._request_local.info["attempts"] = trial + 1
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
@@ -167,12 +175,22 @@ class ChatCompletionSampler(SamplerBase):
                         self._meta_infos.append(meta_info)
                 if response.usage and response.usage.completion_tokens is not None:
                     self._completion_tokens.append(response.usage.completion_tokens)
+                self._request_local.info.update(
+                    status="completed",
+                    finish_reason=response.choices[0].finish_reason,
+                    completion_tokens=response.usage.completion_tokens
+                    if response.usage
+                    else None,
+                )
+                self._request_local.info.pop("error", None)
                 return response.choices[0].message.content or ""
             # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are rerunning MMMU
             except openai.BadRequestError as e:
+                self._request_local.info["error"] = str(e)
                 print("Bad Request Error", e)
                 return ""
             except Exception as e:
+                self._request_local.info["error"] = str(e)
                 exception_backoff = 2**trial  # expontial back off
                 print(
                     f"Rate limit exception so wait and retry {trial} after {exception_backoff} sec",
