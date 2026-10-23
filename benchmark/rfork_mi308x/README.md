@@ -274,6 +274,10 @@ stale. Supporting it needs a per-quant-method "rebuild post-processing state aft
 and the guard was not bypassed.
 
 ## Tools in this directory
+- `bench_startup.py`: one command for the startup matrix (loader x kernel cache x page cache, optional
+  R-Fork seed), per-phase timings, `results.csv` + `summary.md`. Example:
+  `python benchmark/rfork_mi308x/bench_startup.py --configs disk,rfork_nccl,rfork_mooncake --kernel-cache warm --page-cache warm --repeat 3 --out /tmp/startup`
+  (`--dry-run` lists the runs, `--reparse` recomputes phases from existing logs).
 - `time_startup.sh`: launch one instance, wait for ready, print timings (optionally evicting model cache first).
 - `evict_model_cache.py`: per-model page-cache residency and eviction.
 - `first_requests_latency.py`: latency of the first request rounds (lazy JIT).
