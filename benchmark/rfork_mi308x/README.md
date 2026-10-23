@@ -27,6 +27,36 @@ runs on 2026-10-23; failures are reported as observed.
 Measured with the same timing script (`time_startup.sh`, launch to "fired up" wall time, warm page cache, warm kernel cache):
 disk load about 130 s; R-Fork RCCL 77-81 s; R-Fork Mooncake 76-77 s. A completely cold node (empty kernel cache) needs about 267 s.
 
+## Startup time breakdown by phase (TP4, seconds)
+Each column adds one optimization to the previous one. Phase times come from the instance logs (1 s timestamp
+resolution, TP0 or slowest rank); "launch to ready" is wall time from `time_startup.sh`. Page cache is warm in all
+four columns (see the note below for cold page cache).
+
+| Phase | Original: no kernel cache, disk load (`exp1/cold`) | + kernel cache restored (`exp1/migrated`) | + R-Fork, RCCL (`nccl_client_t1/t2`, mean) | R-Fork via Mooncake instead (`client_t1/t2`, mean) |
+|---|---|---|---|---|
+| 1. Process launch and Python imports (before the first log line) | 14.6 | 14.3 | 14.7 | 15.2 |
+| 2. Args, tokenizer, distributed init until weight loading starts | 34 | 35 | 36 | 35 |
+| (of which distributed init) | (16.8) | (18.4) | (19.0) | (18.8) |
+| 3a. Weight loading: model init + read/transfer + post-processing | 53.2 | 54.8 | 4.9 | 3.0 |
+| 3b. PyHIP GR read kernel warmup (JIT inside load_weight) | 67.3 | 4.1 | 3.6 | 3.7 |
+| 4. Decode CUDA graph capture | 35.1 | 11.2 | 11.2 | 10.8 |
+| 5. Rest until ready (KV allocation, server warmup, lazy Triton/FlyDSL JIT) | 61.9 | 7.8 | 8.8 | 8.7 |
+| **Launch to ready (wall)** | **266.6** | **127.3** | **79.2** | **76.7** |
+| **Saved by this step** | - | **-139.3** | **-48.1** | **-2.5 vs RCCL** |
+
+Where each saving comes from:
+- Kernel cache (-139.3 s): 3b -63.2 (PyHIP GR read / FlyDSL compile), 5 -54.1 (lazy JIT during warmup),
+  4 -23.9 (graph capture no longer compiles). Of this, `~/.flydsl` alone accounts for about 77 s
+  (cache without `~/.flydsl`: 204.5 s).
+- R-Fork (-48.1 s): almost all in 3a (54.8 to 4.9 s). 149k per-tensor `load_weights` calls are replaced by 1449
+  broadcasts of already-processed tensors (about 5 s for 65.26 GB per rank).
+- Mooncake vs RCCL (-2.5 s): 3a only (4.9 to 3.0 s).
+- Phases 1, 2 and 4 (about 60 s together) are untouched by any of these; they are the remaining floor.
+
+Cold page cache (only affects phase 3a of disk loading; kernel cache warm): default loader 72.3 s cold vs 62.4 s warm
+(+9.9 s); fastsafetensors (nogds) 65.0 s cold (-7.3 s vs default cold); runai_streamer (libaio_direct) 66.9 s cold
+(-5.4 s, but +34 GB GPU memory per rank). R-Fork does not read the disk, so it is unaffected.
+
 ## 1. P2P weight pull: R-Fork over RCCL
 ### Usage
 ```bash
