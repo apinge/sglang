@@ -89,6 +89,8 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    check_nccl_transfer_manifest,
+    get_nccl_transfer_tensors,
     trigger_transferring_weights_request,
 )
 from sglang.srt.model_loader.utils import (
@@ -3251,6 +3253,16 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
                 model = _initialize_model(model_config, self.load_config, quant_config)
+                if (
+                    load_config.remote_instance_weight_loader_backend
+                    != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
+                ):
+                    # The seed sends post-processed tensors (repacked, requantized),
+                    # so match its layout before the raw byte copy, as ShardedStateLoader does.
+                    for _, module in model.named_modules():
+                        quant_method = getattr(module, "quant_method", None)
+                        if quant_method is not None:
+                            quant_method.process_weights_after_loading(module)
 
         if (
             load_config.remote_instance_weight_loader_backend
@@ -3327,11 +3339,13 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         load_config = self.load_config
         instance_ip = socket.gethostbyname(socket.gethostname())
         start_build_group_tic = time.time()
-        client.build_group(
+        success, message = client.build_group(
             gpu_id=device_config.gpu_id,
             tp_rank=load_config.tp_rank,
             instance_ip=instance_ip,
         )
+        if not success:
+            raise RuntimeError(f"Failed to build weight transfer group: {message}")
         current_platform.synchronize()
         end_build_group_tic = time.time()
         logger.debug(
@@ -3351,8 +3365,17 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             t.start()
 
         start_get_weights_tic = time.time()
+        named_tensors = get_nccl_transfer_tensors(model)
+        manifest_ok, manifest_message = check_nccl_transfer_manifest(
+            named_tensors=named_tensors,
+            group=client._model_update_group,
+            device=torch.device("cuda", device_config.gpu_id),
+        )
+        if not manifest_ok:
+            raise RuntimeError(manifest_message)
+        logger.info(f"Receiving weights from remote instance: {manifest_message}")
         with set_default_torch_dtype(model_config.dtype):
-            for _, tensor in model.named_parameters():
+            for _, tensor in named_tensors:
                 torch.distributed.broadcast(
                     tensor.data,
                     src=0,
@@ -3360,6 +3383,8 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 )
             current_platform.synchronize()
 
+            # Raw copies bypass weight_loader hooks that fill derived buffers (gemma_weight).
+            PreshardedModelLoader._rebind_parameter_aliases(model)
             _post_load_weights(model)
         end_get_weights_tic = time.time()
         logger.debug(

@@ -7,6 +7,10 @@ from typing import Any, Callable, Optional
 import torch
 import torch.distributed as dist
 
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    check_nccl_transfer_manifest,
+    get_nccl_transfer_tensors,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import init_custom_process_group
 from sglang.srt.utils.network import NetworkAddress
@@ -90,9 +94,9 @@ class WeightExporter:
         group_port = ports_list[self.tp_rank]
         group_name = f"{group_name}_{group_port}_{self.tp_rank}"
 
-        if self._weights_send_group[group_name] is not None:
-            send_group = self._weights_send_group[group_name]
-        else:
+        # Missing when init failed on this rank (e.g. port in use); report instead of crashing the seed.
+        send_group = self._weights_send_group.get(group_name)
+        if send_group is None:
             message = f"Group {group_name} not in _weights_send_group list. Please call `init_weights_send_group_for_remote_instance` first."
             logger.error(message)
             return False, message
@@ -102,14 +106,24 @@ class WeightExporter:
         na = NetworkAddress(master_address, group_port)
         message = ""
         try:
-            for _, weights in self.get_model().named_parameters():
-                torch.distributed.broadcast(
-                    weights,
-                    src=0,
-                    group=send_group,
-                )
-            success = True
-            message = f"Succeeded to send weights through {na.to_host_port_str()} {group_name}."
+            named_tensors = get_nccl_transfer_tensors(self.get_model())
+            manifest_ok, manifest_message = check_nccl_transfer_manifest(
+                named_tensors=named_tensors,
+                group=send_group,
+                device=torch.device("cuda", self.gpu_id),
+            )
+            if manifest_ok:
+                for _, weights in named_tensors:
+                    torch.distributed.broadcast(
+                        weights,
+                        src=0,
+                        group=send_group,
+                    )
+                success = True
+                message = f"Succeeded to send weights through {na.to_host_port_str()} {group_name}: {manifest_message}."
+            else:
+                message = manifest_message
+                logger.error(message)
         except Exception as e:
             message = f"Failed to send weights: {e}."
             logger.error(message)

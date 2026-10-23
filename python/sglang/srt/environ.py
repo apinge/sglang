@@ -463,6 +463,9 @@ class Envs:
     # NaN-fill the unified memory pool at boot (debug repro switch).
     SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
+    # Directory for per-rank post-load weight checksums (params + buffers);
+    # diff two instances' files to verify remote-instance loading.
+    SGLANG_DEBUG_WEIGHT_CHECKSUM_DIR = EnvStr(None)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)

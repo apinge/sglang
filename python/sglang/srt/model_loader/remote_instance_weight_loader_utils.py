@@ -1,13 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import enum
+import hashlib
 import importlib
 import importlib.util
 import logging
+import os
 import time
-from typing import List
+from typing import List, Tuple
 
 import requests
+import torch
+
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +21,55 @@ class RemoteInstanceWeightLoaderBackend(str, enum.Enum):
     NCCL = "nccl"
     TRANSFER_ENGINE = "transfer_engine"
     MODELEXPRESS = "modelexpress"
+
+
+def get_nccl_transfer_tensors(
+    model: torch.nn.Module,
+) -> List[Tuple[str, torch.Tensor]]:
+    # Buffers are excluded: some are runtime caches the seed grows while serving
+    # (RoPE cos_sin_cache), and load-time derived ones are recomputed by the client.
+    return list(model.named_parameters())
+
+
+def check_nccl_transfer_manifest(
+    *,
+    named_tensors: List[Tuple[str, torch.Tensor]],
+    group,
+    device: torch.device,
+) -> Tuple[bool, str]:
+    """Collective on the 2-rank transfer group; both sides get the same verdict.
+
+    A mismatched broadcast sequence deadlocks RCCL instead of raising, so compare a
+    digest of (name, shape, dtype) before sending any tensor.
+    """
+    manifest = "".join(
+        f"{name}:{tuple(t.shape)}:{t.dtype}\n" for name, t in named_tensors
+    )
+    digest = int.from_bytes(
+        hashlib.sha256(manifest.encode()).digest()[:8], "little", signed=True
+    )
+    total_bytes = sum(t.numel() * t.element_size() for _, t in named_tensors)
+    debug_dir = envs.SGLANG_DEBUG_WEIGHT_CHECKSUM_DIR.get()
+    if debug_dir is not None:
+        os.makedirs(debug_dir, exist_ok=True)
+        rank = torch.distributed.get_rank()
+        with open(
+            os.path.join(debug_dir, f"transfer_manifest_rank{rank}.txt"), "w"
+        ) as f:
+            f.write(manifest)
+    local = torch.tensor(
+        [digest, len(named_tensors), total_bytes], dtype=torch.int64, device=device
+    )
+    gathered = [torch.empty_like(local) for _ in range(2)]
+    torch.distributed.all_gather(gathered, local, group=group)
+    seed, client = (g.tolist() for g in gathered)
+    if seed == client:
+        return True, f"{len(named_tensors)} tensors, {total_bytes} bytes"
+    return False, (
+        "Seed and client tensor manifests differ: "
+        f"seed has {seed[1]} tensors / {seed[2]} bytes, "
+        f"client has {client[1]} tensors / {client[2]} bytes"
+    )
 
 
 def trigger_init_weights_send_group_for_remote_instance_request(
