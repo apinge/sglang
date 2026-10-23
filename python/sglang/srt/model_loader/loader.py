@@ -111,6 +111,7 @@ from sglang.srt.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     fastsafetensors_weights_iterator,
+    time_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
     get_gguf_extra_tensor_names,
@@ -944,7 +945,12 @@ class DefaultModelLoader(BaseModelLoader):
                 )
 
             self.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
+                model,
+                time_weights_iterator(
+                    self._get_all_weights(model_config, model),
+                    self.load_config.load_format,
+                ),
+                target_device,
             )
 
         self.counter_after_loading_weights = time.perf_counter()
@@ -4243,7 +4249,12 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 )
 
             DefaultModelLoader.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
+                model,
+                time_weights_iterator(
+                    self._get_all_weights(model_config, model),
+                    self.load_config.load_format,
+                ),
+                target_device,
             )
 
         return model.eval()

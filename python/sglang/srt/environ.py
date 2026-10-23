@@ -466,6 +466,8 @@ class Envs:
     # Directory for per-rank post-load weight checksums (params + buffers);
     # diff two instances' files to verify remote-instance loading.
     SGLANG_DEBUG_WEIGHT_CHECKSUM_DIR = EnvStr(None)
+    # Log time blocked on the checkpoint weight iterator (read/deserialize) vs loading.
+    SGLANG_DEBUG_WEIGHT_ITER_TIMING = EnvBool(False)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)

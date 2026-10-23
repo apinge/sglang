@@ -27,6 +27,63 @@ runs on 2026-10-23; failures are reported as observed.
 Measured with the same timing script (`time_startup.sh`, launch to "fired up" wall time, warm page cache, warm kernel cache):
 disk load about 130 s; R-Fork RCCL 77-81 s; R-Fork Mooncake 76-77 s. A completely cold node (empty kernel cache) needs about 267 s.
 
+## Full server launch commands
+Every run used `scripts/launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2.sh` (TP_SIZE=4, PORT set per run);
+extra args are appended by the script. Expanded, this is exactly what was executed (copied from the `Launching:` lines
+in the logs). `PYTHONPATH=<repo>/python` points at this branch.
+
+```bash
+export SGLANG_USE_AITER=1 SGLANG_GR_READ_FLYDSL=1 SGLANG_USE_PYHIP_QSA=1 AITER_MOE_PADDING_SIZE=64
+COMMON_ARGS=(
+  --model-path /models/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16
+  --served-model-name Qwen/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16
+  --host 0.0.0.0 --tp-size 4
+  --attention-backend aiter --moe-runner-backend aiter --kv-cache-dtype auto
+  --chunked-prefill-size 16384 --watchdog-timeout 1200 --disable-radix-cache
+  --mem-fraction-static 0.85 --max-running-requests 32 --cuda-graph-max-bs-decode 32
+  --no-ple-offload-embedding
+)
+```
+
+Disk-load baseline / seed for the RCCL backend (GPU0-3):
+```bash
+HIP_VISIBLE_DEVICES=0,1,2,3 sglang serve "${COMMON_ARGS[@]}" --port 7090
+```
+
+R-Fork client, RCCL backend (GPU4-7; same as `scripts/launch_qwen38_flash_next_fp8_mi308x_rfork_client.sh` with SEED_PORT=7090):
+```bash
+HIP_VISIBLE_DEVICES=4,5,6,7 sglang serve "${COMMON_ARGS[@]}" --port 7091 \
+  --load-format remote_instance --remote-instance-weight-loader-backend nccl \
+  --remote-instance-weight-loader-seed-instance-ip 127.0.0.1 \
+  --remote-instance-weight-loader-seed-instance-service-port 7090 \
+  --remote-instance-weight-loader-send-weights-group-ports '[62000,62001,62002,62003]'
+```
+
+R-Fork over Mooncake (both instances see all 8 GPUs, as HIP IPC needs the peer device visible):
+```bash
+export MOONCAKE_PROTOCOL=hip
+# seed (GPU0-3)
+sglang serve "${COMMON_ARGS[@]}" --port 7090 --base-gpu-id 0 \
+  --remote-instance-weight-loader-start-seed-via-transfer-engine
+# client (GPU4-7)
+sglang serve "${COMMON_ARGS[@]}" --port 7091 --base-gpu-id 4 \
+  --load-format remote_instance --remote-instance-weight-loader-backend transfer_engine \
+  --remote-instance-weight-loader-seed-instance-ip 127.0.0.1 \
+  --remote-instance-weight-loader-seed-instance-service-port 7090
+```
+
+Storage loaders (GPU0-3, add one of):
+```bash
+--load-format fastsafetensors --model-loader-extra-config '{"enable_gds": false}'
+RUNAI_STREAMER_FS_STRATEGY=libaio_direct  ... --load-format runai_streamer
+--weight-loader-prefetch-checkpoints
+--weight-loader-disable-mmap
+```
+
+Kernel-cache experiments: same baseline command with `HOME=<dir>` (empty = cold; restored bundle = warm).
+Debug switches used: `SGLANG_DEBUG_WEIGHT_CHECKSUM_DIR=<dir>` (per-tensor checksums), `SGLANG_DEBUG_WEIGHT_ITER_TIMING=1`
+(iterator timing, section 4).
+
 ## Startup time breakdown by phase (TP4, seconds)
 Each column adds one optimization to the previous one. Phase times come from the instance logs (1 s timestamp
 resolution, TP0 or slowest rank); "launch to ready" is wall time from `time_startup.sh`. Page cache is warm in all
@@ -165,6 +222,31 @@ Raw file-to-GPU throughput of one file on one GPU (`fst_raw_throughput.py`; comp
 
 The storage is a 4x NVMe RAID0 (`/dev/md127`). fastsafetensors reads with O_DIRECT: residency stayed at 0.0% after a cold read, so these are real disk reads.
 As in the doc, 16 threads / 16 MB is best, and nogds is much faster than mmap (about 9-30x here).
+
+Where the disk-loader time goes, per rank (`SGLANG_DEBUG_WEIGHT_ITER_TIMING=1`; every rank iterates all 149,318
+tensors / 236.5 GB and keeps its TP slice). "Blocked on iterator" = time the loader waited for the next tensor
+(read / deserialize / distribute, not hidden by read-ahead); "outside" = `load_weights` itself. Ranges across 4 ranks.
+
+| Loader | Page cache | Blocked on iterator | of which: file read to GPU | Outside iterator (`load_weights`) | load_weight |
+|---|---|---|---|---|---|
+| default (multi-thread, mmap) | cold | 4.9-11.5 s | not separable | 54.8-74.3 s | 85.3 s |
+| default | warm | 2.2-2.6 s | not separable | 55.7-58.0 s | about 62 s |
+| fastsafetensors (nogds) | cold | 38.2-38.5 s | **4.4-9.4 s** (`copy_files_to_device`) | 21.7-22.0 s | 68.4 s |
+| fastsafetensors (nogds) | warm | 38.1-38.4 s | 4.8-9.9 s | 21.8-22.1 s | about 68 s |
+| runai_streamer (libaio_direct) | cold | 17.2-17.7 s | not separable | 34.9-39.3 s | 61.2 s |
+| runai_streamer (libaio_direct) | warm | 17.2-18.0 s | not separable | 35.7-39.2 s | 61.7 s |
+
+- **Pure disk read is 4-10 s per rank** (fastsafetensors reads each rank's share of files straight to GPU; cold and warm
+  are the same because it uses O_DIRECT). The rest of its blocked time (24.8-29.9 s, `get_tensor`) is the per-tensor
+  broadcast of 149k tensors owned by other ranks.
+- With the default loader, read-ahead threads hide almost all I/O (2-12 s blocked); the time is in `load_weights`.
+- `load_weights` is cheaper when tensors already sit on the GPU (fastsafetensors 22 s vs 56 s), but that gain is eaten
+  by the per-tensor distribution.
+- Where `load_weights` spends its time (CPU micro-benchmarks with the real tensor names and shapes; not a profile):
+  linear scan of the 1536-entry `expert_params_mapping` per expert tensor (avg 768 substring checks), about 14 s for
+  147,456 expert tensors vs 0.13 s with a dict lookup; 147k narrow + small H2D copies (about 0.49 MB each) plus
+  per-channel scales, about 9 s; the remaining about 30 s is per-call Python dispatch in `FusedMoE.weight_loader`
+  (estimated by subtraction).
 
 Findings:
 - Raw I/O is not the bottleneck at this scale: at 13-21 GB/s the whole 220 GiB could be read in roughly 10-17 s, yet
