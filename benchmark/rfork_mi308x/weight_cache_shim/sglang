@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# PATH shim: lets the stock launch script start a standalone weight cache daemon
+# with exactly the same server args (`sglang serve ARGS` -> daemon ARGS).
+if [[ "${1:-}" == "serve" ]]; then
+  shift
+  exec python3 -m sglang.srt.weight_cache.daemon "$@"
+fi
+echo "weight_cache_shim only handles 'sglang serve'" >&2
+exit 2

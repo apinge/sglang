@@ -3448,6 +3448,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             logger.error(f"batch transfer failed, error: {ret}")
             return False
 
+        PreshardedModelLoader._rebind_parameter_aliases(model)
         _post_load_weights(model)
 
         return True
