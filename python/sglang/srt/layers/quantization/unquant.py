@@ -11,6 +11,11 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.ops.gemm.swizzled_bf16_gemv import (
+    can_use_swizzled_gemv,
+    can_write_swizzled_gemv_output,
+    swizzled_gemv,
+)
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
@@ -34,6 +39,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
     get_exec,
+    get_forward,
     get_lora,
     get_platform,
 )
@@ -60,6 +66,10 @@ if TYPE_CHECKING:
 
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUUnquantMoEMethod,
+)
+from sglang.srt.layers.quantization.compressed_tensors.utils import (
+    AiterHipblaslt,
+    rocm_aiter_swizzle_hipb_unquantized_gemm,
 )
 
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -458,6 +468,23 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
 
+        if _use_aiter and get_bool_env_var("SGLANG_ROCM_USE_AITER_LINEAR_SHUFFLE"):
+            AiterHipblaslt._initialize_hipblaslt()
+            layout = (16, 16)
+            weight = layer.weight
+            if AiterHipblaslt.can_shuffle(weight.shape[0], weight.shape[1], layout):
+                shuffled_weight = shuffle_weight(weight, layout).t()
+                trans = True
+            else:
+                shuffled_weight = weight
+                trans = False
+
+            layer.weight = Parameter(shuffled_weight.data, requires_grad=False)
+            # Tag the parameter rather than self: a quant-method instance is not
+            # guaranteed to be per-layer, and apply() must not misread another
+            # layer's layout.
+            layer.weight.aiter_trans_weight = trans
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -477,6 +504,23 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
+
+        elif getattr(layer.weight, "aiter_trans_weight", False):
+            # Must precede the tgemm.mm branch below, which would otherwise
+            # swallow every aiter case and leave this path unreachable.
+            if (
+                envs.SGLANG_ROCM_HIPB_DECODE_GEMV.get()
+                and get_forward().hipb_linear_decode
+                and can_use_swizzled_gemv(x, layer.weight, bias)
+            ):
+                return swizzled_gemv(
+                    x,
+                    layer.weight,
+                    bn=1 if x.shape[0] == 1 else 2,
+                    bk=4096 if x.shape[0] == 1 else 1024,
+                    num_warps=4,
+                )
+            return rocm_aiter_swizzle_hipb_unquantized_gemm(x, layer.weight, bias)
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
@@ -527,6 +571,23 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run an inference-only BF16 linear into caller-owned storage."""
+        if getattr(layer.weight, "aiter_trans_weight", False):
+            if (
+                envs.SGLANG_ROCM_HIPB_DECODE_GEMV.get()
+                and get_forward().hipb_linear_decode
+                and can_use_swizzled_gemv(x, layer.weight, bias)
+                and can_write_swizzled_gemv_output(x, layer.weight, output)
+            ):
+                return swizzled_gemv(
+                    x,
+                    layer.weight,
+                    bn=1 if x.shape[0] == 1 else 2,
+                    bk=4096 if x.shape[0] == 1 else 1024,
+                    num_warps=4,
+                    output=output,
+                )
+            output.copy_(self.apply(layer, x, bias))
+            return output
         if (
             _enable_bf16_splitk_gemm
             and bias is None

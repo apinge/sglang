@@ -28,6 +28,9 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.quantization.compressed_tensors.utils import (
+    rocm_aiter_swizzle_hipb_fp8_gemm,
+)
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import (
     get_exec,
@@ -2355,14 +2358,36 @@ def apply_fp8_ptpc_linear(
     compressed_tensor_quant: bool = False,
 ) -> torch.Tensor:
     """FP8 per-token per-channel linear. Only used with the aiter (ROCm) backend."""
+    # Set at load time by CompressedTensorsW8A8Fp8.process_weights_after_loading when
+    # SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB is on AND the shape was swizzleable, in
+    # which case `weight` is stored (K, N) and `weight_scale` is transposed to match.
+    # Reading the tag rather than the env var keeps shapes that failed can_shuffle --
+    # which keep the (N, K) aiter layout -- on the gemm_a8w8_bpreshuffle path.
+    hipb_swizzled = getattr(weight, "hipb_swizzled", False)
+
     # Handle pre-quantized (fp8_tensor, scale) tuple from fused RMSNorm+Quant
     if isinstance(input, tuple):
-        q_input, x_scale = input
+        q_input, x_scale = input[0], input[1]
+        leading_shape = q_input.shape[:-1]
+        out_dtype = input[2] if len(input) > 2 else torch.bfloat16
         q_input = q_input.view(-1, q_input.shape[-1])
-        output_shape = [*q_input.shape[:-1], weight.shape[0]]
-        output = aiter.gemm_a8w8_bpreshuffle(
-            q_input, weight, x_scale, weight_scale, None, torch.bfloat16
-        )
+        if hipb_swizzled:
+            # weight is transposed (K, N)
+            output_shape = [*leading_shape, weight.shape[1]]
+            output = rocm_aiter_swizzle_hipb_fp8_gemm(
+                q_input,
+                weight,
+                x_scale,
+                weight_scale,
+                None,
+                out_dtype=out_dtype,
+            )
+        else:
+            # weight is in (N, K)
+            output_shape = [*leading_shape, weight.shape[0]]
+            output = aiter.gemm_a8w8_bpreshuffle(
+                q_input, weight, x_scale, weight_scale, None, out_dtype
+            )
         if bias is not None:
             output = output + bias
         return output.view(*output_shape)
@@ -2370,21 +2395,38 @@ def apply_fp8_ptpc_linear(
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
 
-    # weight is transposed (K, N)
-    output_shape = [*input.shape[:-1], weight.shape[1]]
-
     q_input, x_scale = aiter.per_token_quant_hip(input_2d, quant_dtype=aiter.dtypes.fp8)
 
-    per_tensor_weights = (weight_scale.numel() == 1) and weight_scale.dim() < 2
-    per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
+    if hipb_swizzled:
+        # weight is transposed (K, N)
+        output_shape = [*input.shape[:-1], weight.shape[1]]
+        output = rocm_aiter_swizzle_hipb_fp8_gemm(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            None,
+            out_dtype=torch.bfloat16 if input_scale is not None else input.dtype,
+        )
+    else:
+        # weight is transposed (K, N)
+        output_shape = [*input.shape[:-1], weight.shape[1]]
 
-    if not (per_tensor_weights and per_tensor_activations):
-        # weight is in (N, K)
-        output_shape = [*input.shape[:-1], weight.shape[0]]
+        per_tensor_weights = (weight_scale.numel() == 1) and weight_scale.dim() < 2
+        per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
 
-    output = aiter.gemm_a8w8_bpreshuffle(
-        q_input, weight, x_scale, weight_scale, None, input.dtype
-    )
+        if not (per_tensor_weights and per_tensor_activations):
+            # weight is in (N, K)
+            output_shape = [*input.shape[:-1], weight.shape[0]]
+
+        output = aiter.gemm_a8w8_bpreshuffle(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            None,
+            torch.bfloat16 if input_scale is not None else input.dtype,
+        )
     if bias is not None:
         output = output + bias
     return output.view(*output_shape)
