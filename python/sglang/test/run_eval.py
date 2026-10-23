@@ -318,12 +318,13 @@ def run_eval(args):
     print(f"Writing results to {result_filename}")
 
     if strict:
+        # An empty/truncated answer is still a completed request and stays in
+        # the accuracy denominator. Strictness validates execution, not quality.
         selection = metrics["selection"]
         if (
             metrics["scored"] != args.num_examples
             or metrics["completed"] != args.num_examples
             or metrics["errors"]
-            or metrics["empty_outputs"]
             or len(set(selection["example_ids"])) != args.num_examples
             or set(selection["prompt_ids"]) & set(selection["example_ids"])
         ):
