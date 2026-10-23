@@ -1,0 +1,30 @@
+name: Qwen4 CI comments
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  actions: write
+
+concurrency:
+  group: qwen4-command-${{ github.repository }}-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  command:
+    name: Qwen4 maintainer command
+    if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/ci ')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          # issue_comment uses the trusted default branch, never the PR checkout.
+          persist-credentials: false
+      - name: Authorize and dispatch or retry the existing workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 evaluation/qwen4/ci_comments.py

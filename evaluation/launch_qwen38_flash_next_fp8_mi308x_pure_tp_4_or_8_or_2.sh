@@ -4,6 +4,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PLE_OFFLOAD_EMBEDDING="${PLE_OFFLOAD_EMBEDDING:-0}"
+MTP="${MTP:-1}"
+[[ "$MTP" == 0 || "$MTP" == 1 ]] || { echo "MTP must be 0 or 1" >&2; exit 2; }
 LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/logs/qwen3.8_flash_next_fp8_mi308x_pure_tp_4_or_8_pleoffload${PLE_OFFLOAD_EMBEDDING}_$(date -u +%Y%m%dT%H%M%SZ).log}"
 mkdir -p "$(dirname -- "${LOG_FILE}")"
 # Capture both this script's preflight checks and all sglang serve output.
@@ -47,7 +49,7 @@ if [[ "${PLE_OFFLOAD_EMBEDDING}" != "0" && "${PLE_OFFLOAD_EMBEDDING}" != "1" ]];
 fi
 
 
-python - "${TP_SIZE}" <<'PY'
+"${SERVER_PYTHON:-python}" - "${TP_SIZE}" <<'PY'
 import sys
 
 import torch
@@ -77,7 +79,7 @@ export SGLANG_USE_AITER=1
 # export CUDA_VISIBLE_DEVICES=4,5,6,7
 # export HIP_VISIBLE_DEVICES=4,5,6,7
 command=(
-  sglang serve
+  "${SERVER_PYTHON:-python}" -m sglang.launch_server
   --model-path "${MODEL_PATH}"
   --served-model-name "${SERVED_MODEL_NAME}"
   --host "${HOST}"
@@ -92,12 +94,13 @@ command=(
   --mem-fraction-static "${MEM_FRACTION_STATIC}"
   --max-running-requests "${MAX_RUNNING_REQUESTS}"
   --cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE}"
-  --speculative-algorithm EAGLE
-  --speculative-num-steps 3
-  --speculative-eagle-topk 1
-  --speculative-num-draft-tokens 4
-  --speculative-moe-runner-backend triton
 )
+
+if [[ "$MTP" == 1 ]]; then
+  command+=(--speculative-algorithm EAGLE --speculative-num-steps 3
+            --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
+            --speculative-moe-runner-backend triton)
+fi
 
 # Use an explicit negative flag for the control run so the A/B result cannot be
 # affected by an upstream model-specific default.

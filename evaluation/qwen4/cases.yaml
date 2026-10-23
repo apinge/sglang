@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "groups": {
+    "q35-35b": {
+      "directory": "Qwen3.5-35B-A3B-PTPC-FP8",
+      "draft_directory": "Qwen3.5-35B-A3B-DFlash",
+      "gpus": 4
+    },
+    "q35-397b": {
+      "directory": "Qwen3.5-397B-A17B-PTPC-FP8",
+      "draft_directory": "Qwen3.5-397B-A17B-DFlash",
+      "gpus": 8
+    },
+    "q38-flash": {
+      "directory": "Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16",
+      "gpus": 2
+    }
+  },
+  "cases": [
+    {
+      "id": "q35-35b-tp4-base",
+      "group": "q35-35b",
+      "tp": 4,
+      "mode": "base",
+      "prefix_cache": false,
+      "input_tokens": 8000,
+      "output_tokens": 500,
+      "launch_script": "launch_qwen3.5-35B-fp8_tp4_disable_prefix_cache.sh",
+      "launch_env": {},
+      "benchmark_script": "run_qwen35_pure_text_bench.sh"
+    },
+    {
+      "id": "q35-35b-tp1-dflash",
+      "group": "q35-35b",
+      "tp": 1,
+      "mode": "dflash",
+      "prefix_cache": true,
+      "input_tokens": 8000,
+      "output_tokens": 500,
+      "launch_script": "launch_qwen3.5-35B-fp8_tp1_dflash_with_prefix_cache_mfs0.7_bs32.sh",
+      "launch_env": {},
+      "benchmark_script": "run_qwen35_pure_text_bench.sh"
+    },
+    {
+      "id": "q35-397b-tp8-base",
+      "group": "q35-397b",
+      "tp": 8,
+      "mode": "base",
+      "prefix_cache": false,
+      "input_tokens": 8000,
+      "output_tokens": 500,
+      "launch_script": "launch_qwen3.5-397B-fp8_tp8_disable_prefix_cache.sh",
+      "launch_env": {},
+      "benchmark_script": "run_qwen35_pure_text_bench.sh"
+    },
+    {
+      "id": "q35-397b-tp8-dflash",
+      "group": "q35-397b",
+      "tp": 8,
+      "mode": "dflash",
+      "prefix_cache": true,
+      "input_tokens": 8000,
+      "output_tokens": 500,
+      "launch_script": "launch_qwen3.5-397B-fp8_tp8_dflash_with_prefix_cache.sh",
+      "launch_env": {},
+      "benchmark_script": "run_qwen35_pure_text_bench.sh"
+    },
+    {
+      "id": "q38-flash-tp2-base",
+      "group": "q38-flash",
+      "tp": 2,
+      "mode": "base",
+      "prefix_cache": false,
+      "input_tokens": 12000,
+      "output_tokens": 350,
+      "launch_script": "launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2.sh",
+      "launch_env": {
+        "TP_SIZE": "2",
+        "MTP": "0"
+      },
+      "benchmark_script": "run_qwen38_pure_text_bench.sh"
+    },
+    {
+      "id": "q38-flash-tp2-mtp",
+      "group": "q38-flash",
+      "tp": 2,
+      "mode": "mtp",
+      "prefix_cache": false,
+      "input_tokens": 12000,
+      "output_tokens": 350,
+      "launch_script": "launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2.sh",
+      "launch_env": {
+        "TP_SIZE": "2",
+        "MTP": "1"
+      },
+      "benchmark_script": "run_qwen38_pure_text_bench.sh"
+    }
+  ]
+}

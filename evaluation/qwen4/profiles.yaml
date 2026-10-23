@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "full": {
+      "performance": true,
+      "accuracy": true,
+      "prompts": 128,
+      "warmups": 10,
+      "examples": 200,
+      "repeats": 1
+    },
+    "smoke": {
+      "performance": true,
+      "accuracy": true,
+      "prompts": 2,
+      "warmups": 1,
+      "examples": 2,
+      "repeats": 1
+    },
+    "calibration": {
+      "performance": true,
+      "accuracy": true,
+      "prompts": 128,
+      "warmups": 10,
+      "examples": 200,
+      "repeats": 3
+    },
+    "profile": {
+      "performance": true,
+      "accuracy": false,
+      "prompts": 4,
+      "warmups": 10,
+      "examples": 0,
+      "repeats": 1,
+      "output_tokens": 5,
+      "profiler": true
+    }
+  },
+  "defaults": {
+    "base_image": "rocm/ali-private:ubuntu22.04_rocm7.14.0_cp310_torch2.12.0_sglang_d0a5b96_aiter_b7aed05_20261020",
+    "gate_mode": "observe",
+    "port": 7080,
+    "seed": 42,
+    "concurrency": 1,
+    "gsm8k_shots": 5,
+    "gsm8k_max_tokens": 16384,
+    "gsm8k_threads": 512,
+    "timeouts": {
+      "lock": 3600,
+      "build": 7200,
+      "startup": 3600,
+      "performance": 3600,
+      "accuracy": 7200,
+      "stop": 60
+    }
+  }
+}

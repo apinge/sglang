@@ -1,0 +1,74 @@
+name: Qwen4 MI308X CI
+run-name: Qwen4 CI pr=${{ github.event.pull_request.number || inputs.pr_number || 0 }} sha=${{ github.event.pull_request.head.sha || inputs.candidate_sha || github.sha }}
+
+on:
+  pull_request_target:
+    branches: [qwen4_v0.5.21]
+    types: [opened, reopened, synchronize, ready_for_review, labeled]
+  schedule:
+    - cron: "0 20 * * *"
+  workflow_dispatch:
+    inputs:
+      profile:
+        type: choice
+        options: [full, smoke, calibration, profile]
+        default: full
+      cases:
+        description: "Optional JSON case-ID array for smoke/profile"
+        type: string
+        default: ""
+      base_image:
+        description: "Optional tag/digest override; blank uses QWEN4_BASE_IMAGE or the configured default"
+        type: string
+        default: ""
+      sglang_ref:
+        description: "Optional SGLang SHA/ref override"
+        type: string
+      aiter_ref:
+        description: "Optional AITER SHA/ref; otherwise latest target head"
+        type: string
+      pyhip_ref:
+        description: "Optional pyhip SHA/ref; otherwise locked"
+        type: string
+      gsm8k_num_examples:
+        description: "Optional scored-example override (full: 200; smoke: 2)"
+        type: string
+        default: ""
+      pr_number:
+        description: "PR to evaluate (used by /ci run)"
+        type: string
+        default: ""
+      candidate_sha:
+        description: "Expected PR head for a comment dispatch"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  actions: read
+  statuses: write
+
+concurrency:
+  group: qwen4-${{ github.repository }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
+
+jobs:
+  evaluate:
+    # pull_request_target supplies the trusted base workflow. Candidate code is
+    # fetched only after the reusable workflow's hosted authorization step.
+    uses: ./.github/workflows/_qwen4-eval.yml
+    with:
+      harness_sha: ${{ github.sha }}
+      profile: ${{ inputs.profile || 'full' }}
+      cases: ${{ inputs.cases || '' }}
+      base_image: ${{ inputs.base_image || vars.QWEN4_BASE_IMAGE || '' }}
+      sglang_ref: ${{ inputs.sglang_ref || '' }}
+      aiter_ref: ${{ inputs.aiter_ref || '' }}
+      pyhip_ref: ${{ inputs.pyhip_ref || '' }}
+      gsm8k_num_examples: ${{ inputs.gsm8k_num_examples || '' }}
+      pr_number: ${{ inputs.pr_number || '' }}
+      candidate_sha: ${{ inputs.candidate_sha || '' }}
+    secrets:
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
