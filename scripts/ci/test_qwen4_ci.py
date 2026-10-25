@@ -3,8 +3,10 @@
 import argparse
 import http.server
 import json
+import os
 import re
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -19,6 +21,72 @@ from qwen4_ci import (
     validate_accuracy,
     wait_ready,
 )
+
+
+@pytest.mark.parametrize("status", [401, 403, 404])
+def test_prepare_api_failure_is_actionable_and_never_writes_a_plan(tmp_path, status):
+    fake_gh = tmp_path / "gh"
+    reason = (
+        "Bad credentials"
+        if status == 401
+        else "Forbidden"
+        if status == 403
+        else "Not Found"
+    )
+    fake_gh.write_text(
+        f"#!/bin/sh\nprintf '%s\\n' 'gh: {reason} (HTTP {status})' >&2\nexit 1\n"
+    )
+    fake_gh.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+        "GITHUB_EVENT_NAME": "workflow_dispatch",
+        "GITHUB_REPOSITORY": "apinge/sglang",
+        "INPUT_PR_NUMBER": "65",
+    }
+    env.pop("GITHUB_EVENT_PATH", None)
+    output = tmp_path / "plan"
+    result = subprocess.run(
+        [sys.executable, str(ci.ROOT), "prepare", "--output", str(output)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode != 0
+    assert f"HTTP {status}" in result.stderr and "Traceback" not in result.stderr
+    assert not (output / "plan.json").exists()
+    if status == 401:
+        assert (
+            "GH_TOKEN/GITHUB_TOKEN" in result.stderr
+            and "gh auth login" in result.stderr
+        )
+    else:
+        assert (
+            "repository permissions" in result.stderr
+            and "gh auth login" not in result.stderr
+        )
+
+
+@pytest.mark.parametrize("explicit_path", [True, False])
+def test_missing_plan_exits_before_docker_with_prepare_instructions(
+    tmp_path, explicit_path
+):
+    env = dict(os.environ)
+    env.pop("QWEN4_PLAN", None)
+    argv = [sys.executable, str(ci.ROOT), "run", "--output", str(tmp_path / "results")]
+    if explicit_path:
+        argv += ["--plan", str(tmp_path / "missing/plan.json")]
+    result = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 2
+    assert "prepare" in result.stderr and "Traceback" not in result.stderr
+    assert not (tmp_path / "results").exists()
+
+
+def test_non_github_command_failure_keeps_its_original_exit_code():
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        ci.command([sys.executable, "-c", "raise SystemExit(7)"])
+    assert error.value.returncode == 7
 
 
 @pytest.mark.parametrize(

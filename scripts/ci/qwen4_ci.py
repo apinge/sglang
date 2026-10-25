@@ -436,9 +436,25 @@ def validate_accuracy(path, examples):
 
 def command(argv, **kwargs):
     kwargs.setdefault("timeout", 120)
-    return subprocess.run(
-        argv, check=True, text=True, stdout=subprocess.PIPE, **kwargs
-    ).stdout.strip()
+    github_request = argv[:2] == ["gh", "api"]
+    if github_request:
+        kwargs.setdefault("stderr", subprocess.PIPE)
+    try:
+        return subprocess.run(
+            argv, check=True, text=True, stdout=subprocess.PIPE, **kwargs
+        ).stdout.strip()
+    except subprocess.CalledProcessError as exc:
+        if not github_request:
+            raise
+        detail = (exc.stderr or "GitHub API request failed").strip()
+        hint = "Check GitHub repository permissions and the requested source ref."
+        if "HTTP 401" in detail or "Bad credentials" in detail:
+            hint = (
+                "GitHub authentication failed. GH_TOKEN/GITHUB_TOKEN override gh's "
+                "saved login. For a local run, check those overrides and use "
+                "gh auth login --hostname github.com --web."
+            )
+        raise SystemExit(f"{detail}\n{hint}") from None
 
 
 def github(path, payload=None):
@@ -534,6 +550,7 @@ def prepare(args):
     if pr:
         plan["status_target"] = {"repo": repository, "sha": pr["head"]["sha"]}
     write_json(Path(args.output) / "plan.json", plan)
+    print(f"Prepared plan: {Path(args.output) / 'plan.json'}", flush=True)
     actions_output("plan", json.dumps(plan))
     actions_output("enabled", "true")
     actions_summary(
@@ -920,6 +937,7 @@ def run(plan, args):
     output.mkdir(parents=True, exist_ok=True)
     if any(output.iterdir()):
         raise ValueError("Use a fresh output directory for each attempt")
+    print(f"Starting Docker CI; results: {output}", flush=True)
     models = Path(args.models_root).resolve()
     datasets = Path(args.datasets_root or models / "benchmark_datasets").resolve()
     runtime = {"host": socket.gethostname(), "errors": [], "containers": {}}
@@ -1280,6 +1298,10 @@ def report(plan, output, job_result="success"):
         },
     )
     (output / "summary.md").write_text(text)
+    print(
+        f"{title}: {'FAILED' if failed else 'PASSED'}; report: {output / 'summary.md'}",
+        flush=True,
+    )
     return int(failed)
 
 
@@ -1313,6 +1335,13 @@ def main():
         return prepare(args)
     if args.command == "local":
         return run_local(args)
+    if args.plan and not Path(args.plan).is_file():
+        parser.error(
+            f"Plan file not found: {args.plan}. Run prepare successfully before "
+            f"{args.command}; a failed prepare does not create a plan."
+        )
+    if not args.plan and not os.environ.get("QWEN4_PLAN"):
+        parser.error("A plan is required: pass --plan after a successful prepare.")
     plan = read_json(args.plan) if args.plan else json.loads(os.environ["QWEN4_PLAN"])
     if args.command == "install":
         install(plan)
