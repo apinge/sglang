@@ -37,12 +37,12 @@ BRANCHES = {"sglang": "qwen4_v0.5.21", "aiter": "qwen38-flash-next-dev"}
 # User-approved references from the previous 200-example full-02 run.
 # Update deliberately; never learn a baseline from the candidate being tested.
 GSM8K_BASELINES = {
-    "q35-35b-tp4-base": 0.970,
-    "q35-35b-tp1-dflash": 0.970,
-    "q35-397b-tp8-base": 0.990,
-    "q35-397b-tp8-dflash": 0.985,
-    "q38-flash-tp2-base": 0.980,
-    "q38-flash-tp2-mtp": 0.985,
+    "Qwen3.5-35B-TP4-Base": 0.970,
+    "Qwen3.5-35B-TP1-DFlash": 0.970,
+    "Qwen3.5-397B-TP8-Base": 0.990,
+    "Qwen3.5-397B-TP8-DFlash": 0.985,
+    "Qwen3.8-Flash-TP2-Base": 0.980,
+    "Qwen3.8-Flash-TP2-MTP": 0.985,
 }
 GSM8K_MAX_RELATIVE_DROP = 0.02
 DATASETS = {
@@ -57,42 +57,42 @@ GROUPS = {
 # Case ID, target group, TP, speculative mode, existing launch script.
 RECIPES = [
     (
-        "q35-35b-tp4-base",
+        "Qwen3.5-35B-TP4-Base",
         "q35-35b",
         4,
         "base",
         "launch_qwen3.5-35B-fp8_tp4_disable_prefix_cache.sh",
     ),
     (
-        "q35-35b-tp1-dflash",
+        "Qwen3.5-35B-TP1-DFlash",
         "q35-35b",
         1,
         "dflash",
         "launch_qwen3.5-35B-fp8_tp1_dflash_with_prefix_cache_mfs0.7_bs32.sh",
     ),
     (
-        "q35-397b-tp8-base",
+        "Qwen3.5-397B-TP8-Base",
         "q35-397b",
         8,
         "base",
         "launch_qwen3.5-397B-fp8_tp8_disable_prefix_cache.sh",
     ),
     (
-        "q35-397b-tp8-dflash",
+        "Qwen3.5-397B-TP8-DFlash",
         "q35-397b",
         8,
         "dflash",
         "launch_qwen3.5-397B-fp8_tp8_dflash_with_prefix_cache.sh",
     ),
     (
-        "q38-flash-tp2-base",
+        "Qwen3.8-Flash-TP2-Base",
         "q38-flash",
         2,
         "base",
         "launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2.sh",
     ),
     (
-        "q38-flash-tp2-mtp",
+        "Qwen3.8-Flash-TP2-MTP",
         "q38-flash",
         2,
         "mtp",
@@ -418,7 +418,7 @@ def number(value, name, minimum=0, maximum=None):
     return value
 
 
-def validate_performance(path, prompts, output_tokens, profiling=False):
+def validate_performance(path, prompts, output_tokens, profiling=False, speculative=False):
     lines = [line for line in Path(path).read_text().splitlines() if line.strip()]
     if len(lines) != 1:
         raise ValueError("Expected exactly one fresh performance record")
@@ -441,12 +441,14 @@ def validate_performance(path, prompts, output_tokens, profiling=False):
         raise ValueError(
             "Benchmark output lengths do not match the requested fixed workload"
         )
-    for key in ["mean_ttft_ms", "mean_tpot_ms", "output_throughput"]:
+    for key in ["mean_ttft_ms", "mean_tpot_ms", "output_throughput", "request_throughput"]:
         number(
             data.get(key),
             key,
             minimum=0 if profiling and key == "mean_tpot_ms" else 1e-12,
         )
+    if speculative or data.get("accept_length") is not None:
+        number(data.get("accept_length"), "accept_length", minimum=1e-12)
     return data
 
 
@@ -627,21 +629,17 @@ def publish_status(plan, state):
         )
 
 
-def check_base_runtime(before, after, requirements, managed):
-    """Check installed versions, without asking pip to solve another environment."""
+def normalize_distribution(name):
+    return name.lower().replace("_", "-")
+
+
+def hip_requirements(requirements):
+    """HIP runtime requirements for these cases, without the diffusion extras."""
     from packaging.requirements import Requirement
 
-    versions = {p["name"].lower().replace("_", "-"): p["version"] for p in after}
-    errors = []
-    for package in before:
-        name = package["name"].lower().replace("_", "-")
-        if name not in managed and versions.get(name) != package["version"]:
-            errors.append(
-                f"Base package {name}: expected {package['version']}, found {versions.get(name, 'missing')}"
-            )
     # Expand only SGLang's own HIP runtime extras. Diffusion/tracing are outside
     # these six cases, and unversioned self-extras must not fetch a PyPI SGLang.
-    pending, seen, checked = ["", "srt_hip"], set(), set()
+    pending, seen, selected, keys = ["", "srt_hip"], set(), [], set()
     while pending:
         extra = pending.pop()
         if extra in seen:
@@ -651,18 +649,59 @@ def check_base_runtime(before, after, requirements, managed):
             requirement = Requirement(raw)
             if requirement.marker and not requirement.marker.evaluate({"extra": extra}):
                 continue
-            name = requirement.name.lower().replace("_", "-")
-            if name == "sglang":
+            if normalize_distribution(requirement.name) == "sglang":
                 pending.extend(requirement.extras - seen)
                 continue
-            checked.add(str(requirement))
-            version = versions.get(name)
-            if version is None or not requirement.specifier.contains(
-                version, prereleases=True
-            ):
-                errors.append(
-                    f"HIP runtime requires {requirement}; installed {version or 'missing'}"
-                )
+            key = str(requirement)
+            if key not in keys:
+                keys.add(key)
+                selected.append(requirement)
+    return selected
+
+
+def unmet_hip_requirements(requirements, packages):
+    versions = {
+        normalize_distribution(package["name"]): package["version"]
+        for package in packages
+    }
+    unmet = []
+    for requirement in hip_requirements(requirements):
+        version = versions.get(normalize_distribution(requirement.name))
+        if version is None or not requirement.specifier.contains(
+            version, prereleases=True
+        ):
+            unmet.append(requirement)
+    return unmet
+
+
+def check_base_runtime(before, after, requirements, managed, replaced=()):
+    """Check installed versions, without asking pip to solve another environment."""
+    versions = {
+        normalize_distribution(package["name"]): package["version"]
+        for package in after
+    }
+    replaced = {normalize_distribution(name) for name in replaced}
+    errors = []
+    for package in before:
+        name = normalize_distribution(package["name"])
+        if (
+            name not in managed
+            and name not in replaced
+            and versions.get(name) != package["version"]
+        ):
+            errors.append(
+                f"Base package {name}: expected {package['version']}, found {versions.get(name, 'missing')}"
+            )
+    checked = []
+    for requirement in hip_requirements(requirements):
+        checked.append(str(requirement))
+        version = versions.get(normalize_distribution(requirement.name))
+        if version is None or not requirement.specifier.contains(
+            version, prereleases=True
+        ):
+            errors.append(
+                f"HIP runtime requires {requirement}; installed {version or 'missing'}"
+            )
     if errors:
         raise RuntimeError(
             "Base image is incompatible with this candidate; update the base image or explicit dependency pins:\n"
@@ -779,8 +818,42 @@ def install(plan):
         raise RuntimeError(
             "An installed module resolves outside the candidate checkout"
         )
+    # The base image is close to this candidate but not identical. Install only
+    # the missing or mismatched HIP pins. Every other distribution, including
+    # torch and triton, stays constrained so pip never resolves all_hip.
+    gaps = unmet_hip_requirements(inspection["requirements"], installed)
+    replaced = []
+    if gaps:
+        requests = []
+        for requirement in gaps:
+            name = normalize_distribution(requirement.name)
+            if name not in replaced:
+                replaced.append(name)
+            request = f"{requirement.name}{requirement.specifier}"
+            if request not in requests:
+                requests.append(request)
+        print(
+            "Installing HIP pins missing from the base image: "
+            + ", ".join(requests),
+            flush=True,
+        )
+        pin_constraints = Path("/ci/hip-constraints.txt")
+        pin_constraints.write_text(
+            "\n".join(
+                f"{package['name']}=={package['version']}"
+                for package in installed
+                if normalize_distribution(package["name"]) not in set(replaced)
+            )
+            + "\n"
+        )
+        subprocess.run(
+            pip + ["install", *requests],
+            check=True,
+            env={**env, "PIP_CONSTRAINT": str(pin_constraints)},
+        )
+        installed = json.loads(command(pip + ["list", "--format=json"], env=env))
     checked = check_base_runtime(
-        packages, installed, inspection["requirements"], managed
+        packages, installed, inspection["requirements"], managed, replaced
     )
     subprocess.run(
         [sys.executable, "-c", "import sglang.launch_server"], env=env, check=True
@@ -800,7 +873,14 @@ def install(plan):
             "sources": plan["sources"],
             "modules": origins,
             "packages": installed,
-            "dependency_policy": "SGLang source-only install; existing base dependencies preserved",
+            "dependency_policy": (
+                "SGLang source-only install; base image preserved except HIP pins "
+                + ", ".join(
+                    f"{requirement.name}{requirement.specifier}" for requirement in gaps
+                )
+                if gaps
+                else "SGLang source-only install; existing base dependencies preserved"
+            ),
             "checked_hip_requirements": checked,
         },
     )
@@ -841,8 +921,98 @@ def gpu_idle():
         time.sleep(1)
 
 
-def run_group(plan, group, output, models, datasets, client_root):
+def selected_case_ids(args):
+    """All six cases, unless --case or QWEN4_CASES names a unique subset."""
+    provided = getattr(args, "cases", None)
+    if not provided and os.environ.get("QWEN4_CASES"):
+        provided = [os.environ["QWEN4_CASES"]]
+    if not provided:
+        return [case["id"] for case in CASES]
+    ids = []
+    for item in provided:
+        ids.extend(part.strip() for part in str(item).split(",") if part.strip())
+    known = {case["id"] for case in CASES}
+    if not ids or any(case_id not in known for case_id in ids) or len(ids) != len(set(ids)):
+        raise ValueError(
+            "Case ids must be a unique subset of: "
+            + ", ".join(case["id"] for case in CASES)
+        )
+    return ids
+
+
+def groups_to_run(case_ids):
+    chosen = set(case_ids)
+    return [
+        group
+        for group in GROUPS
+        if any(case["id"] in chosen and case["group"] == group for case in CASES)
+    ]
+
+
+def adopt_previous_results(reuse, output, selected):
+    """Copy passed cases that this attempt is not going to run again."""
+    reuse = Path(reuse).resolve()
+    selected = set(selected)
+    if not reuse.is_dir():
+        raise ValueError(f"Previous results not found: {reuse}")
+    required = [
+        "execution.json",
+        "launch.json",
+        "server.log",
+        "server-info.json",
+        "smoke.json",
+        "performance.jsonl",
+        "gsm8k.json",
+    ]
+    adopted = {}
+    for case in CASES:
+        if case["id"] in selected:
+            continue
+        source = reuse / case["group"] / case["id"]
+        missing = [name for name in required if not (source / name).is_file()]
+        if missing:
+            raise ValueError(
+                f"Previous {case['id']} cannot be reused ({', '.join(missing)} missing). "
+                f"Rerun it with --case {case['id']}"
+            )
+        state = read_json(source / "execution.json")
+        if (
+            state.get("case_id") != case["id"]
+            or state.get("errors")
+            or any(
+                state.get("phases", {}).get(phase) != 0
+                for phase in ("performance", "accuracy")
+            )
+            or not isinstance(state.get("container_id"), str)
+            or not state["container_id"]
+        ):
+            raise ValueError(
+                f"Previous {case['id']} did not pass. Rerun it with --case {case['id']}"
+            )
+        shutil.copytree(
+            source,
+            output / case["group"] / case["id"],
+            ignore=shutil.ignore_patterns("cache"),
+        )
+        adopted[case["id"]] = state["container_id"]
+    return adopted
+
+
+def case_selection(args):
+    selected = selected_case_ids(args)
+    reuse = (getattr(args, "reuse", None) or os.environ.get("QWEN4_REUSE") or "").strip()
+    if set(selected) != {case["id"] for case in CASES} and not reuse:
+        raise ValueError(
+            "A partial case list needs --reuse PREVIOUS_RESULTS so the other passed "
+            "cases are kept. Example: --case Qwen3.5-397B-TP8-DFlash --reuse "
+            "/path/to/previous/results"
+        )
+    return selected, reuse
+
+
+def run_group(plan, group, output, models, datasets, client_root, case_ids=None):
     output.mkdir(parents=True, exist_ok=True)
+    chosen = set(case_ids) if case_ids is not None else {case["id"] for case in CASES}
     client_env = clean_environment(
         {
             "PYTHONPATH": str(client_root / "python"),
@@ -875,7 +1045,7 @@ def run_group(plan, group, output, models, datasets, client_root):
         raise ValueError(
             "Client imported the candidate instead of the pinned evaluator"
         )
-    for original in [c for c in CASES if c["group"] == group]:
+    for original in [c for c in CASES if c["group"] == group and c["id"] in chosen]:
         print(f"Starting {original['id']}", flush=True)
         case = {
             **original,
@@ -1056,9 +1226,41 @@ def run(plan, args):
     if any(output.iterdir()):
         raise ValueError("Use a fresh output directory for each attempt")
     print(f"Starting Docker CI; results: {output}", flush=True)
+    try:
+        selected, reuse = case_selection(args)
+    except ValueError as exc:
+        runtime = {"host": socket.gethostname(), "errors": [str(exc)], "containers": {}}
+        write_json(output / "manifest.json", plan)
+        write_json(output / "runtime.json", runtime)
+        print(str(exc), file=sys.stderr, flush=True)
+        return report(plan, output)
+    if reuse and set(selected) != {case["id"] for case in CASES}:
+        try:
+            runtime_reused = adopt_previous_results(reuse, output, selected)
+        except ValueError as exc:
+            runtime = {
+                "host": socket.gethostname(),
+                "errors": [str(exc)],
+                "containers": {},
+            }
+            write_json(output / "manifest.json", plan)
+            write_json(output / "runtime.json", runtime)
+            print(str(exc), file=sys.stderr, flush=True)
+            return report(plan, output)
+    else:
+        runtime_reused = {}
+    print(
+        "Cases: " + ", ".join(selected) + (f"; reusing {reuse}" if runtime_reused else ""),
+        flush=True,
+    )
     models = Path(args.models_root).resolve()
     datasets = Path(args.datasets_root or models / "benchmark_datasets").resolve()
-    runtime = {"host": socket.gethostname(), "errors": [], "containers": {}}
+    runtime = {
+        "host": socket.gethostname(),
+        "errors": [],
+        "containers": {},
+        "reused_containers": runtime_reused,
+    }
     key = os.environ.get("QWEN4_RUN_KEY", f"{os.getpid()}-{time.time_ns()}")
     if not re.fullmatch(r"[a-zA-Z0-9-]+", key):
         raise ValueError("Invalid run identifier")
@@ -1142,10 +1344,10 @@ def run(plan, args):
                 runtime["image_id"] = command(
                     ["docker", "image", "inspect", "--format={{.Id}}", image]
                 )
-            for group in GROUPS:
+            for group in groups_to_run(selected):
                 print(f"Starting target container: {group}", flush=True)
                 directory = output / group
-                directory.mkdir()
+                directory.mkdir(parents=True, exist_ok=True)
                 name = f"{image.replace(':', '-')}-{group}"
                 cid = command(
                     [
@@ -1208,6 +1410,15 @@ def run(plan, args):
                             "/models",
                             "--datasets-root",
                             str(Path("/models") / relative),
+                        ]
+                        + [
+                            arg
+                            for case_id in selected
+                            if any(
+                                case["id"] == case_id and case["group"] == group
+                                for case in CASES
+                            )
+                            for arg in ("--case", case_id)
                         ],
                         directory / "container.log",
                     ).wait(30000, progress=True)
@@ -1284,7 +1495,25 @@ def run_local(args):
         "mode": "existing-container",
         "base_image": "Existing environment; image build/digest not verified",
     }
-    runtime = {"host": socket.gethostname(), "errors": [], "containers": {}}
+    try:
+        selected, reuse = case_selection(args)
+        reused = (
+            adopt_previous_results(reuse, output, selected)
+            if reuse and set(selected) != {case["id"] for case in CASES}
+            else {}
+        )
+    except ValueError as exc:
+        runtime = {"host": socket.gethostname(), "errors": [str(exc)], "containers": {}}
+        write_json(output / "manifest.json", plan)
+        write_json(output / "runtime.json", runtime)
+        print(str(exc), file=sys.stderr, flush=True)
+        return report(plan, output)
+    runtime = {
+        "host": socket.gethostname(),
+        "errors": [],
+        "containers": {},
+        "reused_containers": reused,
+    }
     write_json(output / "manifest.json", plan)
     container = f"existing:{socket.gethostname()}"
     original_id = os.environ.get("QWEN4_CONTAINER_ID")
@@ -1295,10 +1524,18 @@ def run_local(args):
                 output / "assets.json",
                 preflight(models, datasets, 2 if args.smoke else 200),
             )
-            for group in GROUPS:
+            for group in groups_to_run(selected):
                 runtime["containers"][group] = container
                 write_json(output / "runtime.json", runtime)
-                run_group(plan, group, output / group, models, datasets, client)
+                run_group(
+                    plan,
+                    group,
+                    output / group,
+                    models,
+                    datasets,
+                    client,
+                    case_ids=selected,
+                )
     except BaseException as exc:
         runtime["errors"].append(f"{type(exc).__name__}: {exc}")
     finally:
@@ -1323,13 +1560,21 @@ def report(plan, output, job_result="success"):
     if job_result != "success":
         errors.append(f"GitHub GPU job: {job_result}")
     containers = runtime.get("containers", {})
+    reused = runtime.get("reused_containers", {})
     local = plan.get("mode") == "existing-container"
     if not isinstance(containers, dict) or not all(
         isinstance(value, str) and value for value in containers.values()
     ):
         containers = {}
-    if set(containers) != set(GROUPS) or len(set(containers.values())) != (
-        1 if local else 3
+    if not isinstance(reused, dict) or not all(
+        isinstance(value, str) and value for value in reused.values()
+    ):
+        errors.append("Malformed reused container identities")
+        reused = {}
+    started = {case["group"] for case in CASES if case["id"] not in reused}
+    if set(containers) != started or (
+        containers
+        and len(set(containers.values())) != (1 if local else len(containers))
     ):
         errors.append("Missing target groups or incorrect container identities")
     try:
@@ -1368,10 +1613,11 @@ def report(plan, output, job_result="success"):
         try:
             state = read_json(directory / "execution.json")
             row["errors"].extend(state["errors"])
+            expected = reused.get(case["id"]) or containers.get(case["group"])
             if (
                 state["case_id"] != case["id"]
-                or not containers.get(case["group"])
-                or state.get("container_id") != containers[case["group"]]
+                or not expected
+                or state.get("container_id") != expected
             ):
                 raise ValueError("Case/container identity does not match")
             for phase in ["performance", "accuracy"]:
@@ -1386,17 +1632,27 @@ def report(plan, output, job_result="success"):
             try:
                 data = (
                     validate_performance(
-                        directory / "performance.jsonl", prompts, case["output_tokens"]
+                        directory / "performance.jsonl",
+                        prompts,
+                        case["output_tokens"],
+                        speculative=case["mode"] in {"dflash", "mtp"},
                     )
                     if phase == "performance"
                     else validate_accuracy(directory / "gsm8k.json", examples)
                 )
                 keys = (
-                    ["completed", "mean_ttft_ms", "mean_tpot_ms", "output_throughput"]
+                    [
+                        "completed",
+                        "mean_ttft_ms",
+                        "mean_tpot_ms",
+                        "output_throughput",
+                        "request_throughput",
+                        "accept_length",
+                    ]
                     if phase == "performance"
                     else ["score", "scored", "completed"]
                 )
-                row[phase] = {key: data[key] for key in keys}
+                row[phase] = {key: data.get(key) for key in keys}
             except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 row["errors"].append(f"{phase}: {exc}")
         if not plan["smoke"] and row["accuracy"]:
@@ -1426,7 +1682,13 @@ def report(plan, output, job_result="success"):
         " | ".join(f"{name}: `{s['sha']}`" for name, s in plan["sources"].items())
         + "\n\n"
     )
-    text += "| Case | Status | GSM8K | Reference / minimum | Performance completed | TTFT (ms) | TPOT (ms) | Output tokens/s |\n|---|---|---:|---:|---:|---:|---:|---:|\n"
+    if reused:
+        text += (
+            "Reused passed cases: "
+            + ", ".join(f"`{case['id']}`" for case in CASES if case["id"] in reused)
+            + "\n\n"
+        )
+    text += "| Case | Status | GSM8K | Reference / minimum | Performance completed | QPS | TTFT (ms) | TPOT (ms) | Output tokens/s | Accept length |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n"
     for row in rows:
         a, p = row["accuracy"], row["performance"]
         status = {"not_run": "⚪ Not run", "failed": "❌ Failed", "passed": "✅ Pass"}[
@@ -1434,8 +1696,10 @@ def report(plan, output, job_result="success"):
         ]
         metrics = [
             f"{p[k]:.3f}" if p else "—"
-            for k in ["mean_ttft_ms", "mean_tpot_ms", "output_throughput"]
+            for k in ["request_throughput", "mean_ttft_ms", "mean_tpot_ms", "output_throughput"]
         ]
+        accept = p.get("accept_length") if p else None
+        metrics.append(f"{accept:.3f}" if isinstance(accept, (int, float)) else "—")
         accuracy = f"{a['score']:.3%} ({a['scored']}/{examples})" if a else "—"
         completed = f"{p['completed']}/{prompts}" if p else "—"
         threshold = (
@@ -1487,6 +1751,16 @@ def main():
     parser.add_argument("--client-root", default="/ci/src/client")
     parser.add_argument("--group", choices=GROUPS)
     parser.add_argument(
+        "--case",
+        action="append",
+        dest="cases",
+        help="Case to run. Repeat or comma-separate. Default: all six. A subset requires --reuse.",
+    )
+    parser.add_argument(
+        "--reuse",
+        help="Previous results directory. Passed cases omitted from --case are copied in.",
+    )
+    parser.add_argument(
         "--smoke",
         action="store_true",
         help="Prepare a diagnostic 2-request/2-example run",
@@ -1519,6 +1793,10 @@ def main():
         if not args.group:
             parser.error("container requires --group")
         models = Path(args.models_root).resolve()
+        try:
+            selected = selected_case_ids(args)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from None
         run_group(
             plan,
             args.group,
@@ -1526,6 +1804,7 @@ def main():
             models,
             Path(args.datasets_root or models / "benchmark_datasets").resolve(),
             Path(args.client_root).resolve(),
+            case_ids=selected,
         )
         return 0
     if args.command == "run":

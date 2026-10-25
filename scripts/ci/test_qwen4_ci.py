@@ -226,6 +226,96 @@ def test_image_install_reuses_base_dependencies_and_checks_fresh_imports(
     assert "PYTHONPATH" not in aiter_options["env"]
 
 
+def test_image_install_adds_only_missing_hip_pins(
+    tmp_path, monkeypatch, plan, runtime_packages
+):
+    from pathlib import Path
+
+    root = tmp_path / "ci"
+    root.mkdir()
+    package = root / "src/sglang/python"
+    package.mkdir(parents=True)
+    (package / "pyproject_other.toml").write_text("# alternate HIP metadata\n")
+    monkeypatch.setattr(
+        ci,
+        "Path",
+        lambda path: (
+            root / str(path).removeprefix("/ci/")
+            if str(path).startswith("/ci/")
+            else Path(path)
+        ),
+    )
+    before = [dict(item) for item in runtime_packages] + [
+        {"name": "sentencepiece", "version": "0.2.2"},
+        {"name": "xgrammar", "version": "0.2.1"},
+    ]
+    satisfied = [dict(item) for item in before]
+    next(item for item in satisfied if item["name"] == "sglang")["version"] = (
+        "0.0.0.dev2"
+    )
+    pinned = [dict(item) for item in satisfied]
+    next(item for item in pinned if item["name"] == "sentencepiece")["version"] = (
+        "0.2.1"
+    )
+    next(item for item in pinned if item["name"] == "xgrammar")["version"] = "0.2.7"
+    pinned.extend(
+        [
+            {"name": "outlines", "version": "0.1.11"},
+            {"name": "petit-kernel", "version": "0.0.2"},
+        ]
+    )
+    lists = []
+    calls = []
+
+    def command(argv, **kwargs):
+        if argv[:2] == ["git", "-C"]:
+            return plan["sources"][Path(argv[2]).name]["sha"]
+        if argv[-2:] == ["list", "--format=json"]:
+            lists.append(True)
+            return json.dumps((before, satisfied, pinned)[len(lists) - 1])
+        return json.dumps(
+            {
+                "origins": {
+                    n: str(root / "src" / n / n / "__init__.py")
+                    for n in ["sglang", "aiter", "pyhip"]
+                },
+                "requirements": [
+                    "sglang[runtime_common]; extra == 'srt_hip'",
+                    "sglang[runtime_base]; extra == 'runtime_common'",
+                    "sentencepiece==0.2.1; extra == 'runtime_base'",
+                    "outlines==0.1.11; extra == 'runtime_common'",
+                    "xgrammar==0.2.7; extra == 'runtime_common'",
+                    "petit_kernel==0.0.2; extra == 'srt_hip'",
+                    "torch; extra == 'srt_hip'",
+                    "diffusers==99; extra == 'diffusion_hip'",
+                ],
+            }
+        )
+
+    monkeypatch.setattr(ci, "command", command)
+    monkeypatch.setattr(
+        ci.subprocess, "run", lambda argv, **kwargs: calls.append((argv, kwargs))
+    )
+    ci.install(plan)
+    pin_args, pin_options = next(
+        (argv, options)
+        for argv, options in calls
+        if "sentencepiece==0.2.1" in argv
+    )
+    assert "outlines==0.1.11" in pin_args
+    assert "xgrammar==0.2.7" in pin_args
+    assert "petit_kernel==0.0.2" in pin_args
+    assert "--no-deps" not in pin_args and all("[all_hip]" not in arg for arg in pin_args)
+    frozen = Path(pin_options["env"]["PIP_CONSTRAINT"]).read_text()
+    assert "torch==2.12.0+rocm7.14" in frozen
+    assert "sentencepiece" not in frozen and "xgrammar" not in frozen
+    assert "outlines" not in frozen and "petit" not in frozen
+    info = ci.read_json(root / "build.json")
+    assert info["packages"] == pinned
+    assert "sentencepiece==0.2.1" in info["dependency_policy"]
+    assert all("diffusers" not in item for item in info["checked_hip_requirements"])
+
+
 @pytest.mark.parametrize(
     "mode,requested,strict",
     [
@@ -688,6 +778,8 @@ def complete_results(tmp_path, plan):
                     "mean_ttft_ms": 10,
                     "mean_tpot_ms": 2,
                     "output_throughput": 50,
+                    "request_throughput": 0.5,
+                    "accept_length": 3.5 if case["mode"] in {"dflash", "mtp"} else None,
                 }
             )
             + "\n"
@@ -702,6 +794,13 @@ def test_smoke_accuracy_is_diagnostic_when_all_six_cases_complete(
     summary = ci.read_json(complete_results / "summary.json")
     assert len(summary["cases"]) == 6
     assert all(row["accuracy"]["score"] == 0 for row in summary["cases"])
+    text = (complete_results / "summary.md").read_text()
+    assert "| QPS |" in text and "| Accept length |" in text
+    by_case = {row["case"]: row for row in summary["cases"]}
+    assert by_case["Qwen3.5-35B-TP4-Base"]["performance"]["request_throughput"] == 0.5
+    assert by_case["Qwen3.5-35B-TP4-Base"]["performance"]["accept_length"] is None
+    assert by_case["Qwen3.5-35B-TP1-DFlash"]["performance"]["accept_length"] == 3.5
+    assert by_case["Qwen3.8-Flash-TP2-MTP"]["performance"]["accept_length"] == 3.5
 
 
 def test_existing_container_report_does_not_claim_docker_isolation(
@@ -737,7 +836,7 @@ def test_local_runner_visits_groups_and_preserves_failure_evidence(
 
     groups = []
 
-    def group(*args):
+    def group(*args, **kwargs):
         groups.append(args[1])
         if group_failure:
             raise RuntimeError("fixture group failure")
@@ -1001,6 +1100,118 @@ def test_docker_one_build_three_owned_containers_and_failure_cleanup(
             "--network=none" in c and any(v.endswith(":/models:ro") for v in c)
             for c in creates
         )
+
+
+def test_partial_run_requires_previous_results_before_docker(
+    tmp_path, monkeypatch, plan
+):
+    monkeypatch.setattr(
+        ci,
+        "ManagedProcess",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("docker started")),
+    )
+    args = argparse.Namespace(
+        output=str(tmp_path / "results"),
+        models_root=str(tmp_path / "models"),
+        datasets_root=None,
+        lock=str(tmp_path / "host.lock"),
+        cases=["Qwen3.5-397B-TP8-DFlash"],
+        reuse=None,
+    )
+    assert ci.run(plan, args) == 1
+    text = (tmp_path / "results" / "summary.md").read_text()
+    assert "--reuse" in text and "Qwen3.5-397B-TP8-DFlash" in text
+
+
+def test_reuse_copies_passed_cases_and_rejects_a_failed_one(tmp_path, complete_results):
+    rerun = ci.CASES[0]["id"]
+    kept = ci.CASES[1]
+    cache = complete_results / kept["group"] / kept["id"] / "cache"
+    cache.mkdir()
+    (cache / "blob").write_text("skip")
+    output = tmp_path / "next"
+    output.mkdir()
+    adopted = ci.adopt_previous_results(complete_results, output, [rerun])
+    assert rerun not in adopted and kept["id"] in adopted
+    assert (output / kept["group"] / kept["id"] / "gsm8k.json").is_file()
+    assert not (output / kept["group"] / kept["id"] / "cache").exists()
+    failed = ci.CASES[2]
+    state = ci.read_json(complete_results / failed["group"] / failed["id"] / "execution.json")
+    state["errors"] = ["boom"]
+    ci.write_json(complete_results / failed["group"] / failed["id"] / "execution.json", state)
+    with pytest.raises(ValueError, match=failed["id"]):
+        ci.adopt_previous_results(complete_results, tmp_path / "again", [rerun])
+
+
+def test_report_accepts_one_rerun_beside_reused_cases(complete_results, plan):
+    rerun = ci.CASES[0]
+    runtime = ci.read_json(complete_results / "runtime.json")
+    runtime["containers"] = {rerun["group"]: "rerun-container"}
+    runtime["reused_containers"] = {
+        case["id"]: case["group"] + "-container"
+        for case in ci.CASES
+        if case["id"] != rerun["id"]
+    }
+    ci.write_json(complete_results / "runtime.json", runtime)
+    state = ci.read_json(complete_results / rerun["group"] / rerun["id"] / "execution.json")
+    state["container_id"] = "rerun-container"
+    ci.write_json(complete_results / rerun["group"] / rerun["id"] / "execution.json", state)
+    assert ci.report(plan, complete_results) == 0
+    assert "Reused passed cases" in (complete_results / "summary.md").read_text()
+    assert "`Qwen3.5-35B-TP1-DFlash`" in (complete_results / "summary.md").read_text()
+
+
+def test_docker_rerun_starts_only_the_selected_group(tmp_path, monkeypatch, plan):
+    calls = []
+
+    class Process:
+        def __init__(self, argv, log_path, **kwargs):
+            calls.append(argv)
+
+        def wait(self, *args, **kwargs):
+            return 0
+
+    def command(argv, **kwargs):
+        calls.append(argv)
+        if argv[:2] == ["docker", "info"]:
+            return "/raid/docker"
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return (
+                "sha256:built"
+                if any(item.startswith("--format") for item in argv)
+                else json.dumps(
+                    [{"Id": "sha256:base", "RepoDigests": ["image@sha256:" + "a" * 64]}]
+                )
+            )
+        if argv[:2] == ["docker", "create"]:
+            return "cid"
+        return ""
+
+    monkeypatch.setattr(ci, "ManagedProcess", Process)
+    monkeypatch.setattr(ci, "command", command)
+    monkeypatch.setattr(ci, "preflight", lambda *args: {"gsm8k": {}})
+    monkeypatch.setattr(ci.shutil, "which", lambda name: None)
+    monkeypatch.setenv("QWEN4_WORK_ROOT", str(tmp_path / "work"))
+    reused = {
+        case["id"]: "old-" + case["id"]
+        for case in ci.CASES
+        if case["id"] != "Qwen3.8-Flash-TP2-MTP"
+    }
+    monkeypatch.setattr(ci, "adopt_previous_results", lambda *args: reused)
+    args = argparse.Namespace(
+        output=str(tmp_path / "results"),
+        models_root=str(tmp_path / "models"),
+        datasets_root=None,
+        lock=str(tmp_path / "host.lock"),
+        cases=["Qwen3.8-Flash-TP2-MTP"],
+        reuse=str(tmp_path / "previous"),
+    )
+    assert ci.run(plan, args) == 1
+    creates = [argv for argv in calls if argv[:2] == ["docker", "create"]]
+    execs = [argv for argv in calls if "container" in argv]
+    assert len(creates) == 1 and len(execs) == 1
+    assert "q38-flash" in execs[0]
+    assert execs[0].count("--case") == 1 and "Qwen3.8-Flash-TP2-MTP" in execs[0]
 
 
 def test_build_failure_marks_cases_not_run_without_missing_file_noise(tmp_path, plan):

@@ -30,6 +30,18 @@ on:
         description: 'Diagnostic: two performance requests and two GSM8K examples per case'
         type: boolean
         default: false
+      case:
+        description: 'Comma-separated case ids to rerun: Qwen3.5-35B-TP4-Base, Qwen3.5-35B-TP1-DFlash, Qwen3.5-397B-TP8-Base, Qwen3.5-397B-TP8-DFlash, Qwen3.8-Flash-TP2-Base, Qwen3.8-Flash-TP2-MTP. Empty runs all six.'
+        type: string
+        default: ''
+      reuse_run_id:
+        description: 'Earlier run id whose passed results to keep when case is set'
+        type: string
+        default: ''
+      reuse_artifact:
+        description: 'Artifact from that run. Defaults to qwen4-results-1'
+        type: string
+        default: ''
   workflow_call:
     inputs:
       harness_sha:
@@ -51,6 +63,18 @@ on:
       smoke:
         type: boolean
         default: false
+      case:
+        description: 'Comma-separated case ids to rerun: Qwen3.5-35B-TP4-Base, Qwen3.5-35B-TP1-DFlash, Qwen3.5-397B-TP8-Base, Qwen3.5-397B-TP8-DFlash, Qwen3.8-Flash-TP2-Base, Qwen3.8-Flash-TP2-MTP. Empty runs all six.'
+        type: string
+        default: ''
+      reuse_run_id:
+        description: 'Earlier run id whose passed results to keep when case is set'
+        type: string
+        default: ''
+      reuse_artifact:
+        description: 'Artifact from that run. Defaults to qwen4-results-1'
+        type: string
+        default: ''
     secrets:
       DOCKER_PASSWORD:
         required: false
@@ -116,6 +140,9 @@ jobs:
     if: needs.prepare.outputs.enabled == 'true'
     runs-on: ${{ fromJSON(vars.QWEN4_RUNNER_LABELS || '["self-hosted"]') }}
     timeout-minutes: 1440
+    permissions:
+      contents: read
+      actions: read
     outputs:
       artifact_name: ${{ steps.paths.outputs.artifact_name }}
     env:
@@ -129,6 +156,7 @@ jobs:
           mkdir -p "$QWEN4_WORK_ROOT"
           work_dir=$(mktemp -d "$QWEN4_WORK_ROOT/qwen4-$QWEN4_RUN_KEY.XXXXXX")
           echo "RESULTS=$work_dir/results" >> "$GITHUB_ENV"
+          echo "PREVIOUS=$work_dir/previous" >> "$GITHUB_ENV"
           echo "DOCKER_CONFIG=$work_dir/docker-config" >> "$GITHUB_ENV"
           echo "artifact_name=qwen4-results-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -145,9 +173,19 @@ jobs:
           if [ -n "$DOCKER_PASSWORD" ]; then
             printf '%s' "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
           fi
+      - name: Restore passed cases from an earlier run
+        if: ${{ inputs.case && inputs.reuse_run_id }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ${{ inputs.reuse_artifact || 'qwen4-results-1' }}
+          path: ${{ env.PREVIOUS }}
+          run-id: ${{ inputs.reuse_run_id }}
+          github-token: ${{ github.token }}
       - name: Build once and run three target pairs
         env:
           MODELS_ROOT: ${{ vars.QWEN4_MODELS_ROOT || '/raid/models' }}
+          QWEN4_CASES: ${{ inputs.case || '' }}
+          QWEN4_REUSE: ${{ inputs.case && inputs.reuse_run_id && env.PREVIOUS || '' }}
         run: python3 scripts/ci/qwen4_ci.py run --output "$RESULTS" --models-root "$MODELS_ROOT"
       - name: Clean up this attempt's containers and image
         if: always()
