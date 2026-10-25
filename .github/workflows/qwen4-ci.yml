@@ -1,74 +1,201 @@
 name: Qwen4 MI308X CI
-run-name: Qwen4 CI pr=${{ github.event.pull_request.number || inputs.pr_number || 0 }} sha=${{ github.event.pull_request.head.sha || inputs.candidate_sha || github.sha }}
+run-name: Qwen4 CI (${{ github.event_name }}, PR ${{ github.event.pull_request.number || inputs.pr_number || 'none' }})
 
 on:
+  # This hosted check can run while this workflow is still being introduced.
+  pull_request:
+    branches: [qwen4_v0.5.21]
+    paths: ['.github/workflows/qwen4-ci.yml', 'scripts/ci/*qwen4*', 'evaluation/**', 'python/sglang/test/**']
+  # GPU control comes from the trusted target branch after initial installation.
   pull_request_target:
     branches: [qwen4_v0.5.21]
     types: [opened, reopened, synchronize, ready_for_review, labeled]
   schedule:
-    - cron: "0 20 * * *"
+    - cron: '0 20 * * *'
   workflow_dispatch:
     inputs:
-      profile:
-        type: choice
-        options: [full, smoke, calibration, profile]
-        default: full
-      cases:
-        description: "Optional JSON case-ID array for smoke/profile"
+      pr_number:
+        description: 'Optional PR to test, including a draft for a manual pilot'
         type: string
-        default: ""
       base_image:
-        description: "Optional tag/digest override; blank uses QWEN4_BASE_IMAGE or the configured default"
+        description: 'Optional base image tag/digest override'
         type: string
-        default: ""
       sglang_ref:
-        description: "Optional SGLang SHA/ref override"
+        description: 'SGLang ref; otherwise PR head or target branch head'
         type: string
       aiter_ref:
-        description: "Optional AITER SHA/ref; otherwise latest target head"
+        description: 'AITER ref; otherwise PR head or latest target branch head'
         type: string
-      pyhip_ref:
-        description: "Optional pyhip SHA/ref; otherwise locked"
+      smoke:
+        description: 'Diagnostic: two performance requests and two GSM8K examples per case'
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      harness_sha:
+        description: 'Pinned SGLang controller SHA for the AITER caller'
         type: string
-      gsm8k_num_examples:
-        description: "Optional scored-example override (full: 200; smoke: 2)"
-        type: string
-        default: ""
+        required: true
       pr_number:
-        description: "PR to evaluate (used by /ci run)"
         type: string
-        default: ""
-      candidate_sha:
-        description: "Expected PR head for a comment dispatch"
+        default: ''
+      base_image:
         type: string
-        default: ""
+        default: ''
+      sglang_ref:
+        type: string
+        default: ''
+      aiter_ref:
+        type: string
+        default: ''
+      smoke:
+        type: boolean
+        default: false
+    secrets:
+      DOCKER_PASSWORD:
+        required: false
 
 permissions:
   contents: read
-  pull-requests: read
-  issues: read
-  actions: read
-  statuses: write
 
 concurrency:
   group: qwen4-${{ github.repository }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' || github.event_name == 'pull_request' }}
 
 jobs:
-  evaluate:
-    # pull_request_target supplies the trusted base workflow. Candidate code is
-    # fetched only after the reusable workflow's hosted authorization step.
-    uses: ./.github/workflows/_qwen4-eval.yml
-    with:
-      harness_sha: ${{ github.sha }}
-      profile: ${{ inputs.profile || 'full' }}
-      cases: ${{ inputs.cases || '' }}
-      base_image: ${{ inputs.base_image || vars.QWEN4_BASE_IMAGE || '' }}
-      sglang_ref: ${{ inputs.sglang_ref || '' }}
-      aiter_ref: ${{ inputs.aiter_ref || '' }}
-      pyhip_ref: ${{ inputs.pyhip_ref || '' }}
-      gsm8k_num_examples: ${{ inputs.gsm8k_num_examples || '' }}
-      pr_number: ${{ inputs.pr_number || '' }}
-      candidate_sha: ${{ inputs.candidate_sha || '' }}
-    secrets:
-      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+  validate:
+    name: Qwen4 CPU validation
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Check the driver and evaluation contracts
+        run: |
+          python3 -m venv "$RUNNER_TEMP/qwen4-tests"
+          "$RUNNER_TEMP/qwen4-tests/bin/pip" install pytest==8.3.5
+          "$RUNNER_TEMP/qwen4-tests/bin/python" -m pytest scripts/ci/test_qwen4_ci.py -q
+          for script in evaluation/launch_qwen*.sh evaluation/run_gsm8k.sh evaluation/run_qwen*_pure_text_bench.sh; do
+            bash -n "$script"
+          done
+
+  prepare:
+    name: Qwen4 authorization and sources
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      statuses: write
+    outputs:
+      enabled: ${{ steps.prepare.outputs.enabled }}
+      plan: ${{ steps.prepare.outputs.plan }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: apinge/sglang
+          ref: ${{ inputs.harness_sha || github.sha }}
+          persist-credentials: false
+      - name: Authorize before resolving or executing candidate code
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QWEN4_CI_LABEL: ${{ vars.QWEN4_CI_LABEL || 'run-qwen4-ci' }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          INPUT_BASE_IMAGE: ${{ inputs.base_image || vars.QWEN4_BASE_IMAGE }}
+          INPUT_SGLANG_REF: ${{ inputs.sglang_ref }}
+          INPUT_AITER_REF: ${{ inputs.aiter_ref }}
+          INPUT_SMOKE: ${{ inputs.smoke }}
+        run: python3 scripts/ci/qwen4_ci.py prepare --output "$RUNNER_TEMP/qwen4-plan"
+
+  gpu:
+    name: Qwen4 six cases on MI308X
+    needs: prepare
+    if: needs.prepare.outputs.enabled == 'true'
+    runs-on: ${{ fromJSON(vars.QWEN4_RUNNER_LABELS || '["self-hosted"]') }}
+    timeout-minutes: 1440
+    outputs:
+      artifact_name: ${{ steps.paths.outputs.artifact_name }}
+    env:
+      QWEN4_PLAN: ${{ needs.prepare.outputs.plan }}
+      QWEN4_RUN_KEY: ${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Set this attempt's paths
+        id: paths
+        run: |
+          echo "RESULTS=$RUNNER_TEMP/qwen4-$QWEN4_RUN_KEY" >> "$GITHUB_ENV"
+          echo "DOCKER_CONFIG=$RUNNER_TEMP/qwen4-docker-$QWEN4_RUN_KEY" >> "$GITHUB_ENV"
+          echo "artifact_name=qwen4-results-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: apinge/sglang
+          ref: ${{ inputs.harness_sha || github.sha }}
+          persist-credentials: false
+      - name: Authenticate the base image pull
+        env:
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ vars.QWEN4_DOCKER_USERNAME || 'alishared' }}
+        run: |
+          mkdir -p "$DOCKER_CONFIG"
+          if [ -n "$DOCKER_PASSWORD" ]; then
+            printf '%s' "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+          fi
+      - name: Build once and run three target pairs
+        env:
+          MODELS_ROOT: ${{ vars.QWEN4_MODELS_ROOT || '/raid/models' }}
+        run: python3 scripts/ci/qwen4_ci.py run --output "$RESULTS" --models-root "$MODELS_ROOT"
+      - name: Clean up this attempt's containers and image
+        if: always()
+        run: |
+          for container in $(docker ps -aq --filter "label=qwen4.run=$QWEN4_RUN_KEY"); do
+            docker exec "$container" chown -R "$(id -u):$(id -g)" /results || true
+            docker rm -f "$container"
+          done
+          docker image rm "qwen4-ci:$QWEN4_RUN_KEY" 2>/dev/null || true
+          rm -rf -- "$DOCKER_CONFIG"
+      - name: Preserve available summary
+        if: always()
+        run: |
+          if [ -f "$RESULTS/summary.md" ]; then
+            cat "$RESULTS/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: ${{ steps.paths.outputs.artifact_name }}
+          path: |
+            ${{ env.RESULTS }}/**
+            !${{ env.RESULTS }}/**/cache/**
+          if-no-files-found: error
+          retention-days: 30
+
+  report:
+    name: Qwen4 CI Report
+    needs: [prepare, gpu]
+    if: always() && needs.prepare.outputs.enabled == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: apinge/sglang
+          ref: ${{ inputs.harness_sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        # A report-only retry keeps the original GPU job's output and artifact.
+        if: needs.gpu.outputs.artifact_name != ''
+        continue-on-error: true
+        with:
+          name: ${{ needs.gpu.outputs.artifact_name }}
+          path: qwen4-results
+      - name: Publish every expected case and return the result
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QWEN4_PLAN: ${{ needs.prepare.outputs.plan }}
+          GPU_JOB_RESULT: ${{ needs.gpu.result }}
+        run: python3 scripts/ci/qwen4_ci.py report --output qwen4-results
