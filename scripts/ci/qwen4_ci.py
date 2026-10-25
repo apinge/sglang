@@ -627,6 +627,50 @@ def publish_status(plan, state):
         )
 
 
+def check_base_runtime(before, after, requirements, managed):
+    """Check installed versions, without asking pip to solve another environment."""
+    from packaging.requirements import Requirement
+
+    versions = {p["name"].lower().replace("_", "-"): p["version"] for p in after}
+    errors = []
+    for package in before:
+        name = package["name"].lower().replace("_", "-")
+        if name not in managed and versions.get(name) != package["version"]:
+            errors.append(
+                f"Base package {name}: expected {package['version']}, found {versions.get(name, 'missing')}"
+            )
+    # Expand only SGLang's own HIP runtime extras. Diffusion/tracing are outside
+    # these six cases, and unversioned self-extras must not fetch a PyPI SGLang.
+    pending, seen, checked = ["", "srt_hip"], set(), set()
+    while pending:
+        extra = pending.pop()
+        if extra in seen:
+            continue
+        seen.add(extra)
+        for raw in requirements:
+            requirement = Requirement(raw)
+            if requirement.marker and not requirement.marker.evaluate({"extra": extra}):
+                continue
+            name = requirement.name.lower().replace("_", "-")
+            if name == "sglang":
+                pending.extend(requirement.extras - seen)
+                continue
+            checked.add(str(requirement))
+            version = versions.get(name)
+            if version is None or not requirement.specifier.contains(
+                version, prereleases=True
+            ):
+                errors.append(
+                    f"HIP runtime requires {requirement}; installed {version or 'missing'}"
+                )
+    if errors:
+        raise RuntimeError(
+            "Base image is incompatible with this candidate; update the base image or explicit dependency pins:\n"
+            + "\n".join(sorted(set(errors)))
+        )
+    return sorted(checked)
+
+
 def install(plan):
     """Image build only: follow the evaluation guide without upgrading the base stack."""
     root = Path("/ci/src")
@@ -678,7 +722,10 @@ def install(plan):
         **os.environ,
         "PIP_CONSTRAINT": str(constraints),
         "SGLANG_BUILD_RUST_EXTS": "none",
+        "AITER_USE_SYSTEM_TRITON": "1",
     }
+    # Some base images point PYTHONPATH at their original /opt/aiter checkout.
+    env.pop("PYTHONPATH", None)
     subprocess.run(
         pip
         + [
@@ -708,20 +755,23 @@ def install(plan):
     if (package / "pyproject_other.toml").exists():
         shutil.copyfile(package / "pyproject_other.toml", package / "pyproject.toml")
     subprocess.run(
-        pip + ["install", "--no-build-isolation", "-e", str(package) + "[all_hip]"],
+        pip + ["install", "--no-deps", "--no-build-isolation", "-e", str(package)],
         check=True,
         env=env,
     )
     # Module resolution works without importing AITER, whose import needs a GPU.
-    origins = json.loads(
+    installed = json.loads(command(pip + ["list", "--format=json"], env=env))
+    inspection = json.loads(
         command(
             [
                 sys.executable,
                 "-c",
-                "import importlib.util,json; print(json.dumps({n:importlib.util.find_spec(n).origin for n in ['sglang','aiter','pyhip']}))",
-            ]
+                "import importlib.util,importlib.metadata,json; print(json.dumps({'origins': {n:importlib.util.find_spec(n).origin for n in ['sglang','aiter','pyhip']}, 'requirements': importlib.metadata.requires('sglang')}))",
+            ],
+            env=env,
         )
     )
+    origins = inspection["origins"]
     if any(
         not Path(path).resolve().is_relative_to(root / name)
         for name, path in origins.items()
@@ -729,12 +779,29 @@ def install(plan):
         raise RuntimeError(
             "An installed module resolves outside the candidate checkout"
         )
+    checked = check_base_runtime(
+        packages, installed, inspection["requirements"], managed
+    )
+    subprocess.run(
+        [sys.executable, "-c", "import sglang.launch_server"], env=env, check=True
+    )
+    subprocess.run(
+        [sys.executable, "-c", "import sglang.test.run_eval"],
+        env={**env, "PYTHONPATH": str(root / "client/python")},
+        check=True,
+    )
+    print(
+        "Base runtime preserved; HIP requirements and GPU-free entrypoint imports passed",
+        flush=True,
+    )
     write_json(
         "/ci/build.json",
         {
             "sources": plan["sources"],
             "modules": origins,
-            "packages": json.loads(command(pip + ["list", "--format=json"])),
+            "packages": installed,
+            "dependency_policy": "SGLang source-only install; existing base dependencies preserved",
+            "checked_hip_requirements": checked,
         },
     )
 

@@ -90,6 +90,142 @@ def test_non_github_command_failure_keeps_its_original_exit_code():
     assert error.value.returncode == 7
 
 
+@pytest.fixture
+def runtime_packages():
+    return [
+        {"name": name, "version": version}
+        for name, version in [
+            ("sglang", "0.0.0.dev1"),
+            ("torch", "2.12.0+rocm7.14"),
+            ("triton", "3.8.0+rocm7.14"),
+            ("numpy", "2.2.6"),
+            ("transformers", "5.12.1"),
+        ]
+    ]
+
+
+def test_runtime_checks_follow_hip_extras_without_resolving_diffusion(runtime_packages):
+    after = [dict(p) for p in runtime_packages]
+    after[0]["version"] = "0.0.0.dev2"
+    requirements = [
+        "numpy>=2",
+        "sglang[runtime_common]; extra == 'srt_hip'",
+        "sglang[runtime_base]; extra == 'runtime_common'",
+        "sglang[srt_hip]; extra == 'runtime_base'",  # Self-extra cycles terminate.
+        "transformers==5.12.1; extra == 'runtime_base'",
+        "torch; extra == 'srt_hip'",
+        "diffusers==99; extra == 'diffusion_hip'",
+        "missing-package; python_version < '3.0'",
+    ]
+    checked = ci.check_base_runtime(runtime_packages, after, requirements, {"sglang"})
+    assert any("transformers" in r for r in checked)
+    assert any("torch" in r for r in checked)
+    assert all("diffusers" not in r and "missing-package" not in r for r in checked)
+
+
+@pytest.mark.parametrize("change", ["torch", "triton", "removed"])
+def test_runtime_checks_reject_replaced_or_removed_base_packages(
+    runtime_packages, change
+):
+    after = [dict(p) for p in runtime_packages]
+    if change == "removed":
+        after = [p for p in after if p["name"] != "triton"]
+    else:
+        next(p for p in after if p["name"] == change)["version"] = "9.0.0"
+    with pytest.raises(RuntimeError, match="Base package"):
+        ci.check_base_runtime(runtime_packages, after, [], {"sglang"})
+
+
+@pytest.mark.parametrize(
+    "requirement",
+    ["missing-package; extra == 'srt_hip'", "transformers>=6; extra == 'srt_hip'"],
+)
+def test_runtime_checks_reject_missing_or_incompatible_candidate_requirements(
+    runtime_packages, requirement
+):
+    with pytest.raises(RuntimeError, match="HIP runtime requires"):
+        ci.check_base_runtime(
+            runtime_packages, runtime_packages, [requirement], {"sglang"}
+        )
+
+
+@pytest.mark.parametrize("replace_triton", [False, True])
+def test_image_install_reuses_base_dependencies_and_checks_fresh_imports(
+    tmp_path, monkeypatch, plan, runtime_packages, replace_triton
+):
+    from pathlib import Path
+
+    root = tmp_path / "ci"
+    root.mkdir()
+    package = root / "src/sglang/python"
+    package.mkdir(parents=True)
+    (package / "pyproject_other.toml").write_text("# alternate HIP metadata\n")
+    monkeypatch.setattr(
+        ci,
+        "Path",
+        lambda path: (
+            root / str(path).removeprefix("/ci/")
+            if str(path).startswith("/ci/")
+            else Path(path)
+        ),
+    )
+    monkeypatch.setenv("PYTHONPATH", "/opt/aiter")
+    monkeypatch.setenv("AITER_USE_SYSTEM_TRITON", "0")
+    calls, snapshots = [], []
+    after = [dict(p) for p in runtime_packages]
+    after[0]["version"] = "0.0.0.dev2"
+    if replace_triton:
+        after[2]["version"] = "3.7.0"
+
+    def command(argv, **kwargs):
+        if argv[:2] == ["git", "-C"]:
+            return plan["sources"][Path(argv[2]).name]["sha"]
+        if argv[-2:] == ["list", "--format=json"]:
+            snapshots.append(True)
+            return json.dumps(runtime_packages if len(snapshots) == 1 else after)
+        assert "PYTHONPATH" not in kwargs["env"]
+        return json.dumps(
+            {
+                "origins": {
+                    n: str(root / "src" / n / n / "__init__.py")
+                    for n in ["sglang", "aiter", "pyhip"]
+                },
+                "requirements": ["numpy>=2", "torch; extra == 'srt_hip'"],
+            }
+        )
+
+    monkeypatch.setattr(ci, "command", command)
+    monkeypatch.setattr(
+        ci.subprocess, "run", lambda argv, **kwargs: calls.append((argv, kwargs))
+    )
+    if replace_triton:
+        with pytest.raises(RuntimeError, match="Base package triton"):
+            ci.install(plan)
+        assert not (root / "build.json").exists()
+    else:
+        ci.install(plan)
+        info = ci.read_json(root / "build.json")
+        assert info["packages"] == after and info["checked_hip_requirements"]
+        imports = [(a, k) for a, k in calls if "-c" in a]
+        assert any("import sglang.launch_server" in a for a, _ in imports)
+        assert any(
+            k["env"].get("PYTHONPATH") == str(root / "src/client/python")
+            for _, k in imports
+        )
+    install_args, options = next(
+        (a, k) for a, k in calls if "-e" in a and str(package) in a
+    )
+    assert "--no-deps" in install_args and "--no-build-isolation" in install_args
+    assert all("[all_hip]" not in arg for arg in install_args)
+    assert "PYTHONPATH" not in options["env"]
+    assert options["env"]["AITER_USE_SYSTEM_TRITON"] == "1"
+    aiter_args, aiter_options = next(
+        (a, k) for a, k in calls if "-e" in a and str(root / "src/aiter") in a
+    )
+    assert aiter_options["env"]["AITER_USE_SYSTEM_TRITON"] == "1"
+    assert "PYTHONPATH" not in aiter_options["env"]
+
+
 @pytest.mark.parametrize(
     "mode,requested,strict",
     [
