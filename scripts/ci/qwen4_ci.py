@@ -31,9 +31,20 @@ EVALUATION = (
     else ROOT.parent / "evaluation"
 )
 BASE_IMAGE = "rocm/ali-private:ubuntu22.04_rocm7.14.0_cp310_torch2.12.0_sglang_d0a5b96_aiter_b7aed05_20261020"
-CLIENT_SHA = "bd574bea3bc69dae3c7b10f300ce410a29fb6698"
+CLIENT_SHA = "fc6ddbbf7aac80167ea04cc00bf200af8adf2b85"
 PYHIP_SHA = "edde17b08ffe0dab0360fe3b1aa042b56ac72e1c"
 BRANCHES = {"sglang": "qwen4_v0.5.21", "aiter": "qwen38-flash-next-dev"}
+# User-approved references from the previous 200-example full-02 run.
+# Update deliberately; never learn a baseline from the candidate being tested.
+GSM8K_BASELINES = {
+    "q35-35b-tp4-base": 0.970,
+    "q35-35b-tp1-dflash": 0.970,
+    "q35-397b-tp8-base": 0.990,
+    "q35-397b-tp8-dflash": 0.985,
+    "q38-flash-tp2-base": 0.980,
+    "q38-flash-tp2-mtp": 0.985,
+}
+GSM8K_MAX_RELATIVE_DROP = 0.02
 DATASETS = {
     "gsm8k/test.jsonl": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
     "ShareGPT_V3_unfiltered_cleaned_split.json": "35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4",
@@ -409,42 +420,17 @@ def validate_performance(path, prompts, output_tokens, profiling=False):
     return data
 
 
-def validate_accuracy(path, examples, selection):
+def validate_accuracy(path, examples):
     data = read_json(path)
     for key in ["requested", "scored", "completed"]:
-        if data.get(key) != examples:
+        if type(data.get(key)) is not int or data[key] != examples:
             raise ValueError(f"GSM8K {key} must equal {examples}")
-    if data.get("errors") != 0:
+    if type(data.get("errors")) is not int or data["errors"] != 0:
         raise ValueError("GSM8K has terminal request errors")
     number(data.get("score"), "GSM8K score", maximum=1)
-    if data.get("selection") != selection:
-        raise ValueError("GSM8K selected different dataset/examples")
-    rows_path = Path(path).with_name("gsm8k-examples.jsonl")
-    if file_hash(rows_path) != data.get("records_sha256"):
-        raise ValueError("GSM8K raw examples are missing or changed")
-    import json
-
-    rows = [
-        json.loads(line) for line in rows_path.read_text().splitlines() if line.strip()
-    ]
-    if any(
-        r.get("status") != "completed" or not isinstance(r.get("content"), str)
-        for r in rows
-    ):
-        raise ValueError("GSM8K raw examples contain failed or malformed requests")
     report = Path(path).with_name("gsm8k.html")
     if not report.is_file() or report.stat().st_size == 0:
         raise ValueError("GSM8K HTML report is missing")
-    ids = [r["example_id"] for r in rows]
-    if (
-        len(ids) != examples
-        or len(set(ids)) != examples
-        or set(ids) != set(selection["example_ids"])
-    ):
-        raise ValueError("GSM8K raw examples do not cover the expected selection")
-    correct = sum(r["correct"] is True for r in rows)
-    if not math.isclose(correct / examples, data["score"], abs_tol=1e-12):
-        raise ValueError("GSM8K summary and per-example score disagree")
     return data
 
 
@@ -550,7 +536,9 @@ def prepare(args):
     write_json(Path(args.output) / "plan.json", plan)
     actions_output("plan", json.dumps(plan))
     actions_output("enabled", "true")
-    actions_summary("Qwen4 sources resolved once; numerical thresholds are advisory.\n")
+    actions_summary(
+        "Qwen4 sources resolved once; full runs enforce the GSM8K accuracy threshold.\n"
+    )
     publish_status(plan, "pending")
     return 0
 
@@ -579,7 +567,11 @@ def publish_status(plan, state):
             {
                 "state": state,
                 "context": "Qwen4 CI",
-                "description": "Execution/completeness checks; numerical thresholds advisory",
+                "description": (
+                    "Smoke diagnostics; numerical thresholds advisory"
+                    if plan["smoke"]
+                    else "GSM8K relative drop <=2%; performance advisory"
+                ),
                 "target_url": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
             },
         )
@@ -767,6 +759,7 @@ def run_group(plan, group, output, models, datasets, client_root):
             "Client imported the candidate instead of the pinned evaluator"
         )
     for original in [c for c in CASES if c["group"] == group]:
+        print(f"Starting {original['id']}", flush=True)
         case = {
             **original,
             "served_model_name": f"qwen4-{os.getpid()}-{original['id']}",
@@ -1090,6 +1083,70 @@ def run(plan, args):
     return report(plan, output)
 
 
+def run_local(args):
+    """Run the full model suite in an existing installation, without a Docker build."""
+    output = Path(args.output).resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    if any(output.iterdir()):
+        raise ValueError("Use a fresh output directory for each attempt")
+    models = Path(args.models_root).resolve()
+    datasets = Path(args.datasets_root or models / "benchmark_datasets").resolve()
+    client = Path(args.client_root).resolve()
+    roots = {
+        "sglang": EVALUATION.parent,
+        "aiter": Path("/opt/aiter"),
+        "pyhip": Path("/opt/pyhip"),
+        "client": client,
+    }
+    sources = {
+        name: {
+            "repo": "tingqli/pyhip"
+            if name == "pyhip"
+            else f"apinge/{'sglang' if name == 'client' else name}",
+            "sha": command(["git", "-C", str(path), "rev-parse", "HEAD"]),
+        }
+        for name, path in roots.items()
+    }
+    if sources["client"]["sha"] != CLIENT_SHA:
+        raise ValueError(f"Local evaluator must be at {CLIENT_SHA}")
+    module = command(
+        [sys.executable, "-c", "import sglang; print(sglang.__file__)"],
+        env=clean_environment(),
+    )
+    if not Path(module).resolve().is_relative_to(roots["sglang"] / "python"):
+        raise ValueError("Local server imports a different SGLang checkout")
+    plan = {
+        "sources": sources,
+        "smoke": args.smoke,
+        "mode": "existing-container",
+        "base_image": "Existing environment; image build/digest not verified",
+    }
+    runtime = {"host": socket.gethostname(), "errors": [], "containers": {}}
+    write_json(output / "manifest.json", plan)
+    container = f"existing:{socket.gethostname()}"
+    original_id = os.environ.get("QWEN4_CONTAINER_ID")
+    os.environ["QWEN4_CONTAINER_ID"] = container
+    try:
+        with host_lock(args.lock):
+            write_json(
+                output / "assets.json",
+                preflight(models, datasets, 2 if args.smoke else 200),
+            )
+            for group in GROUPS:
+                runtime["containers"][group] = container
+                write_json(output / "runtime.json", runtime)
+                run_group(plan, group, output / group, models, datasets, client)
+    except BaseException as exc:
+        runtime["errors"].append(f"{type(exc).__name__}: {exc}")
+    finally:
+        if original_id is None:
+            os.environ.pop("QWEN4_CONTAINER_ID", None)
+        else:
+            os.environ["QWEN4_CONTAINER_ID"] = original_id
+        write_json(output / "runtime.json", runtime)
+    return report(plan, output)
+
+
 def report(plan, output, job_result="success"):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -1103,22 +1160,33 @@ def report(plan, output, job_result="success"):
     if job_result != "success":
         errors.append(f"GitHub GPU job: {job_result}")
     containers = runtime.get("containers", {})
+    local = plan.get("mode") == "existing-container"
     if not isinstance(containers, dict) or not all(
         isinstance(value, str) and value for value in containers.values()
     ):
         containers = {}
-    if set(containers) != set(GROUPS) or len(set(containers.values())) != 3:
-        errors.append("Expected three distinct target containers")
+    if set(containers) != set(GROUPS) or len(set(containers.values())) != (
+        1 if local else 3
+    ):
+        errors.append("Missing target groups or incorrect container identities")
     try:
-        selection = read_json(output / "assets.json")["gsm8k"]
+        read_json(output / "assets.json")["gsm8k"]
     except (OSError, ValueError, KeyError, TypeError):
-        selection = None
         errors.append("Missing dataset selection evidence")
     examples, prompts = (2, 2) if plan["smoke"] else (200, 128)
     rows = []
     for case in CASES:
         directory = output / case["group"] / case["id"]
-        row = {"case": case["id"], "errors": [], "performance": None, "accuracy": None}
+        reference = GSM8K_BASELINES[case["id"]]
+        minimum = reference * (1 - GSM8K_MAX_RELATIVE_DROP)
+        row = {
+            "case": case["id"],
+            "errors": [],
+            "performance": None,
+            "accuracy": None,
+            "accuracy_reference": reference,
+            "accuracy_minimum": None if plan["smoke"] else minimum,
+        }
         try:
             state = read_json(directory / "execution.json")
             row["errors"].extend(state["errors"])
@@ -1143,9 +1211,7 @@ def report(plan, output, job_result="success"):
                         directory / "performance.jsonl", prompts, case["output_tokens"]
                     )
                     if phase == "performance"
-                    else validate_accuracy(
-                        directory / "gsm8k.json", examples, selection
-                    )
+                    else validate_accuracy(directory / "gsm8k.json", examples)
                 )
                 keys = (
                     ["completed", "mean_ttft_ms", "mean_tpot_ms", "output_throughput"]
@@ -1155,16 +1221,33 @@ def report(plan, output, job_result="success"):
                 row[phase] = {key: data[key] for key in keys}
             except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 row["errors"].append(f"{phase}: {exc}")
+        if not plan["smoke"] and row["accuracy"]:
+            score = row["accuracy"]["score"]
+            if score + 1e-12 < minimum:
+                row["errors"].append(
+                    f"GSM8K regression: {score:.2%} < {minimum:.2%}; "
+                    f"relative drop {(reference - score) / reference:.2%} "
+                    f"exceeds {GSM8K_MAX_RELATIVE_DROP:.0%} from reference {reference:.2%}"
+                )
         rows.append(row)
     failed = bool(errors or any(r["errors"] for r in rows))
-    text = f"## Qwen4 MI308X CI — {'Failed' if failed else 'Passed'}\n\n"
-    text += f"Mode: {'smoke (diagnostic)' if plan['smoke'] else 'full'}; {examples} scored GSM8K examples per case. **Accuracy/performance thresholds: advisory.**\n\n"
+    title = "Qwen4 local model evaluation" if local else "Qwen4 MI308X CI"
+    text = f"## {title} — {'Failed' if failed else 'Passed'}\n\n"
+    if local:
+        text += "Existing target-image container. **Docker build and three-container isolation: not verified.**\n\n"
+    text += f"Mode: {'smoke (diagnostic)' if plan['smoke'] else 'full'}; {examples} scored GSM8K examples per case.\n\n"
+    text += (
+        "**Smoke accuracy is diagnostic; the 200-example threshold is not applied.**\n\n"
+        if plan["smoke"]
+        else f"**GSM8K gate: at most {GSM8K_MAX_RELATIVE_DROP:.0%} relative drop from each recorded reference; improvements pass.**\n\n"
+    )
+    text += "Performance thresholds: advisory.\n\n"
     text += f"Base image: `{plan['base_image']}`\n\nResolved image: `{runtime.get('base_image_digest', 'unavailable')}`\n\n"
     text += (
         " | ".join(f"{name}: `{s['sha']}`" for name, s in plan["sources"].items())
         + "\n\n"
     )
-    text += "| Case | Execution | GSM8K | Performance completed | TTFT (ms) | TPOT (ms) | Output tokens/s |\n|---|---|---:|---:|---:|---:|---:|\n"
+    text += "| Case | Status | GSM8K | Reference / minimum | Performance completed | TTFT (ms) | TPOT (ms) | Output tokens/s |\n|---|---|---:|---:|---:|---:|---:|---:|\n"
     for row in rows:
         a, p = row["accuracy"], row["performance"]
         metrics = [
@@ -1173,8 +1256,14 @@ def report(plan, output, job_result="success"):
         ]
         accuracy = f"{a['score']:.3%} ({a['scored']}/{examples})" if a else "—"
         completed = f"{p['completed']}/{prompts}" if p else "—"
+        threshold = (
+            "Diagnostic"
+            if plan["smoke"]
+            else f"{row['accuracy_reference']:.2%} / {row['accuracy_minimum']:.2%} "
+            f"(≥{math.ceil(row['accuracy_minimum'] * examples - 1e-12)}/{examples})"
+        )
         text += (
-            f"| {row['case']} | {'❌ Failed' if row['errors'] else '✅ Complete'} | {accuracy} | {completed} | "
+            f"| {row['case']} | {'❌ Failed' if row['errors'] else '✅ Pass'} | {accuracy} | {threshold} | {completed} | "
             + " | ".join(metrics)
             + " |\n"
         )
@@ -1182,7 +1271,13 @@ def report(plan, output, job_result="success"):
         text += "\n- " + str(message).replace("\n", " ").replace("|", "\\|")
     text += "\n\nRaw logs, JSON, HTML, build provenance, and container IDs are in the run's result artifact.\n"
     write_json(
-        output / "summary.json", {"failed": failed, "errors": errors, "cases": rows}
+        output / "summary.json",
+        {
+            "failed": failed,
+            "mode": plan.get("mode", "docker"),
+            "errors": errors,
+            "cases": rows,
+        },
     )
     (output / "summary.md").write_text(text)
     return int(failed)
@@ -1191,7 +1286,8 @@ def report(plan, output, job_result="success"):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "command", choices=["prepare", "run", "container", "install", "report", "probe"]
+        "command",
+        choices=["prepare", "run", "local", "container", "install", "report", "probe"],
     )
     parser.add_argument("--plan", help="Prepared JSON file; defaults to QWEN4_PLAN")
     parser.add_argument("--output", default="qwen4-results")
@@ -1215,6 +1311,8 @@ def main():
         return 0
     if args.command == "prepare":
         return prepare(args)
+    if args.command == "local":
+        return run_local(args)
     plan = read_json(args.plan) if args.plan else json.loads(os.environ["QWEN4_PLAN"])
     if args.command == "install":
         install(plan)

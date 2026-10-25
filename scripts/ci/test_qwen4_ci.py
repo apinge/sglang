@@ -13,7 +13,6 @@ import pytest
 import qwen4_ci as ci
 from qwen4_ci import (
     ManagedProcess,
-    gsm8k_selection,
     host_lock,
     port_available,
     read_json,
@@ -23,25 +22,36 @@ from qwen4_ci import (
 
 
 @pytest.mark.parametrize(
-    "http_error,truncate", [(False, False), (True, False), (False, True)]
+    "mode,requested,strict",
+    [
+        ("ok", 2, True),
+        ("error", 2, True),
+        ("mixed", 2, True),
+        ("empty", 2, True),
+        ("ok", 3, True),
+        ("error", 2, False),
+    ],
 )
-def test_audited_sampler_counts_errors_without_changing_scorer(
-    tmp_path, http_error, truncate
+def test_native_counts_and_strict_failures_preserve_original_scoring(
+    tmp_path, mode, requested, strict
 ):
     pytest.importorskip("sglang", reason="Installed-runtime client integration")
     from sglang.test.run_eval import run_eval
 
+    seen = []
+
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            if http_error:
+            index = int(
+                re.findall(r"Question: Q(\d+)", body["messages"][0]["content"])[-1]
+            )
+            seen.append(index)
+            if mode == "error" or (mode == "mixed" and index == 6):
                 self.send_response(400)
                 self.end_headers()
                 self.wfile.write(b'{"error":{"message":"test failure"}}')
                 return
-            index = int(
-                re.findall(r"Question: Q(\d+)", body["messages"][0]["content"])[-1]
-            )
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -57,9 +67,11 @@ def test_audited_sampler_counts_errors_without_changing_scorer(
                                 "index": 0,
                                 "message": {
                                     "role": "assistant",
-                                    "content": "" if truncate else str(index),
+                                    "content": "" if mode == "empty" else str(index),
                                 },
-                                "finish_reason": "length" if truncate else "stop",
+                                "finish_reason": "length"
+                                if mode == "empty"
+                                else "stop",
                             }
                         ],
                         "usage": {
@@ -86,7 +98,7 @@ def test_audited_sampler_counts_errors_without_changing_scorer(
     args = argparse.Namespace(
         eval_name="gsm8k",
         gsm8k_data_path=str(data),
-        num_examples=2,
+        num_examples=requested,
         num_shots=5,
         num_threads=2,
         output_dir=str(tmp_path / "results"),
@@ -97,34 +109,95 @@ def test_audited_sampler_counts_errors_without_changing_scorer(
         max_tokens=32,
         repeat=1,
         api="chat",
-        strict=True,
+        strict=strict,
         temperature=0.0,
         top_p=1.0,
     )
+    errors = {"ok": 0, "empty": 0, "error": 2, "mixed": 1}[mode]
+    incomplete = strict and (errors > 0 or requested > 2)
     try:
-        if http_error:
+        if incomplete:
             with pytest.raises(RuntimeError, match="Incomplete GSM8K"):
                 run_eval(args)
         else:
             run_eval(args)
-        result = read_json(tmp_path / "results/gsm8k.json")
-        assert result["scored"] == 2
-        if http_error:
-            assert result["errors"] == 2 and result["completed"] == 0
-            with pytest.raises(ValueError):
-                validate_accuracy(
-                    tmp_path / "results/gsm8k.json", 2, gsm8k_selection(data, 2)
-                )
+        path = tmp_path / "results/gsm8k.json"
+        result = read_json(path)
+        assert sorted(seen) == [
+            5,
+            6,
+        ]  # Prompt examples remain excluded by the original scorer.
+        assert result["score"] == {"ok": 1, "empty": 0, "error": 0, "mixed": 0.5}[mode]
+        assert path.with_suffix(".html").stat().st_size > 0
+        assert not path.with_name("gsm8k-examples.jsonl").exists()
+        if strict:
+            assert {
+                k: result[k] for k in ["requested", "scored", "completed", "errors"]
+            } == {
+                "requested": requested,
+                "scored": 2,
+                "completed": 2 - errors,
+                "errors": errors,
+            }
+            if incomplete:
+                with pytest.raises(ValueError):
+                    validate_accuracy(path, requested)
+            else:
+                validate_accuracy(path, requested)
         else:
-            assert result["score"] == (0 if truncate else 1)
-            if truncate:
-                assert result["empty_outputs"] == 2 and result["truncated"] == 2
-            validate_accuracy(
-                tmp_path / "results/gsm8k.json", 2, gsm8k_selection(data, 2)
-            )
+            assert not {"requested", "scored", "completed", "errors"} & result.keys()
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_sampler_counts_logical_requests_across_retries_and_threads(monkeypatch):
+    pytest.importorskip("sglang", reason="Installed-runtime client integration")
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    from sglang.test import simple_eval_common as common
+
+    attempts, lock = {}, threading.Lock()
+
+    def create(**kwargs):
+        index = int(kwargs["messages"][-1]["content"])
+        with lock:
+            attempts[index] = attempts.get(index, 0) + 1
+            attempt = attempts[index]
+        if index % 4 == 0 or (index % 4 == 1 and attempt <= 2):
+            raise RuntimeError("fixture transport error")
+        return SimpleNamespace(
+            usage=None,
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=None if index % 4 == 2 else "answer"
+                    )
+                )
+            ],
+        )
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+    monkeypatch.setattr(common, "OpenAI", lambda **kwargs: client)
+    monkeypatch.setattr(common, "LargerHttpxClient", lambda: None)
+    monkeypatch.setattr(common.time, "sleep", lambda _: None)
+    sampler = common.ChatCompletionSampler(model="fixture")
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(
+            pool.map(
+                lambda i: sampler([{"role": "user", "content": str(i)}]), range(200)
+            )
+        )
+    assert sampler.request_counts == {"attempted": 200, "completed": 150}
+    assert (
+        sum(attempts.values()) == 550
+    )  # Retries do not inflate the logical request count.
+    assert (
+        results[0] == results[2] == ""
+    )  # A failed request and a completed empty answer differ only in accounting.
 
 
 def test_dead_server_is_detected_without_waiting_for_timeout(tmp_path):
@@ -244,27 +317,28 @@ def test_stop_waits_for_shell_child_to_release_listener(tmp_path):
 
 
 @pytest.fixture
-def plan():
+def plan(request):
     return {
         "sources": {
             name: {"repo": f"apinge/{name}", "sha": str(i) * 40}
             for i, name in enumerate(["sglang", "aiter", "pyhip", "client"], 1)
         },
         "base_image": ci.BASE_IMAGE,
-        "smoke": True,
+        "smoke": getattr(request, "param", True),
     }
 
 
 @pytest.fixture
 def complete_results(tmp_path, plan):
+    examples, prompts = (2, 2) if plan["smoke"] else (200, 128)
     data = tmp_path / "gsm8k-source.jsonl"
     data.write_text(
         "".join(
             json.dumps({"question": f"Q{i}", "answer": f"#### {i}"}) + "\n"
-            for i in range(7)
+            for i in range(5 + examples)
         )
     )
-    selection = ci.gsm8k_selection(data, 2)
+    selection = ci.gsm8k_selection(data, examples)
     ci.write_json(tmp_path / "assets.json", {"gsm8k": selection})
     ci.write_json(
         tmp_path / "runtime.json",
@@ -289,31 +363,22 @@ def complete_results(tmp_path, plan):
             "gsm8k.html",
         ]:
             (path / name).write_text("{}")
-        records = [
-            {"example_id": i, "status": "completed", "content": "", "correct": False}
-            for i in selection["example_ids"]
-        ]
-        (path / "gsm8k-examples.jsonl").write_text(
-            "".join(json.dumps(r) + "\n" for r in records)
-        )
         ci.write_json(
             path / "gsm8k.json",
             {
-                "requested": 2,
-                "scored": 2,
-                "completed": 2,
+                "requested": examples,
+                "scored": examples,
+                "completed": examples,
                 "errors": 0,
-                "score": 0,
-                "selection": selection,
-                "records_sha256": ci.file_hash(path / "gsm8k-examples.jsonl"),
+                "score": 0 if plan["smoke"] else ci.GSM8K_BASELINES[case["id"]],
             },
         )
         (path / "performance.jsonl").write_text(
             json.dumps(
                 {
-                    "completed": 2,
-                    "errors": ["", ""],
-                    "output_lens": [case["output_tokens"]] * 2,
+                    "completed": prompts,
+                    "errors": [""] * prompts,
+                    "output_lens": [case["output_tokens"]] * prompts,
                     "mean_ttft_ms": 10,
                     "mean_tpot_ms": 2,
                     "output_throughput": 50,
@@ -324,11 +389,91 @@ def complete_results(tmp_path, plan):
     return tmp_path
 
 
-def test_low_accuracy_is_advisory_when_all_six_cases_complete(complete_results, plan):
+def test_smoke_accuracy_is_diagnostic_when_all_six_cases_complete(
+    complete_results, plan
+):
     assert ci.report(plan, complete_results) == 0
     summary = ci.read_json(complete_results / "summary.json")
     assert len(summary["cases"]) == 6
     assert all(row["accuracy"]["score"] == 0 for row in summary["cases"])
+
+
+def test_existing_container_report_does_not_claim_docker_isolation(
+    complete_results, plan
+):
+    runtime = ci.read_json(complete_results / "runtime.json")
+    runtime["containers"] = {group: "existing:fixture" for group in ci.GROUPS}
+    ci.write_json(complete_results / "runtime.json", runtime)
+    for case in ci.CASES:
+        path = complete_results / case["group"] / case["id"] / "execution.json"
+        state = ci.read_json(path)
+        state["container_id"] = "existing:fixture"
+        ci.write_json(path, state)
+    assert (
+        ci.report(plan, complete_results) == 1
+    )  # Docker mode requires three containers.
+    plan["mode"] = "existing-container"
+    assert ci.report(plan, complete_results) == 0
+    text = (complete_results / "summary.md").read_text()
+    assert "Qwen4 local model evaluation" in text and "not verified" in text
+
+
+@pytest.mark.parametrize("group_failure", [False, True])
+def test_local_runner_visits_groups_and_preserves_failure_evidence(
+    tmp_path, monkeypatch, group_failure
+):
+    client = tmp_path / "client"
+
+    def command(argv, **kwargs):
+        if argv[0] == "git":
+            return ci.CLIENT_SHA if str(client) in argv else "a" * 40
+        return str(ci.EVALUATION.parent / "python/sglang/__init__.py")
+
+    groups = []
+
+    def group(*args):
+        groups.append(args[1])
+        if group_failure:
+            raise RuntimeError("fixture group failure")
+
+    monkeypatch.setattr(ci, "command", command)
+    monkeypatch.setattr(ci, "preflight", lambda *args: {"gsm8k": {}})
+    monkeypatch.setattr(ci, "run_group", group)
+    monkeypatch.setenv("QWEN4_CONTAINER_ID", "original")
+    args = argparse.Namespace(
+        output=str(tmp_path / "results"),
+        models_root=str(tmp_path / "models"),
+        datasets_root=None,
+        client_root=str(client),
+        smoke=False,
+        lock=str(tmp_path / "lock"),
+    )
+    assert ci.run_local(args) == 1  # Missing measurements cannot become a pass.
+    assert groups == (list(ci.GROUPS)[:1] if group_failure else list(ci.GROUPS))
+    assert ci.os.environ["QWEN4_CONTAINER_ID"] == "original"
+    assert (
+        ci.read_json(tmp_path / "results/summary.json")["mode"] == "existing-container"
+    )
+
+
+@pytest.mark.parametrize("plan", [False], indirect=True)
+@pytest.mark.parametrize("case", ci.CASES, ids=lambda case: case["id"])
+@pytest.mark.parametrize("lost_answers,failed", [(-1, False), (3, False), (4, True)])
+def test_full_accuracy_gate_uses_relative_drop_for_each_case(
+    complete_results, plan, case, lost_answers, failed
+):
+    path = complete_results / case["group"] / case["id"] / "gsm8k.json"
+    data = ci.read_json(path)
+    reference = ci.GSM8K_BASELINES[case["id"]]
+    data["score"] = (round(reference * 200) - lost_answers) / 200
+    ci.write_json(path, data)
+    assert ci.report(plan, complete_results) == int(failed)
+    summary = ci.read_json(complete_results / "summary.json")
+    row = next(row for row in summary["cases"] if row["case"] == case["id"])
+    assert any("GSM8K regression" in error for error in row["errors"]) == failed
+    assert row["accuracy_reference"] == reference
+    assert row["performance"]["completed"] == 128
+    assert "Reference / minimum" in (complete_results / "summary.md").read_text()
 
 
 @pytest.mark.parametrize(
