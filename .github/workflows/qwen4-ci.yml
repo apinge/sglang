@@ -121,12 +121,15 @@ jobs:
     env:
       QWEN4_PLAN: ${{ needs.prepare.outputs.plan }}
       QWEN4_RUN_KEY: ${{ github.run_id }}-${{ github.run_attempt }}
+      QWEN4_WORK_ROOT: ${{ vars.QWEN4_WORK_ROOT || '/tmp' }}
     steps:
       - name: Set this attempt's paths
         id: paths
         run: |
-          echo "RESULTS=$RUNNER_TEMP/qwen4-$QWEN4_RUN_KEY" >> "$GITHUB_ENV"
-          echo "DOCKER_CONFIG=$RUNNER_TEMP/qwen4-docker-$QWEN4_RUN_KEY" >> "$GITHUB_ENV"
+          mkdir -p "$QWEN4_WORK_ROOT"
+          work_dir=$(mktemp -d "$QWEN4_WORK_ROOT/qwen4-$QWEN4_RUN_KEY.XXXXXX")
+          echo "RESULTS=$work_dir/results" >> "$GITHUB_ENV"
+          echo "DOCKER_CONFIG=$work_dir/docker-config" >> "$GITHUB_ENV"
           echo "artifact_name=qwen4-results-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:

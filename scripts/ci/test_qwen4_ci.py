@@ -2,6 +2,7 @@
 
 import argparse
 import http.server
+import io
 import json
 import os
 import re
@@ -330,6 +331,107 @@ def test_stop_reaps_the_owned_leader(tmp_path):
     )
     process.stop(timeout=1)
     assert not process.alive()
+
+
+def test_progress_streams_before_exit_and_preserves_the_exit_code(
+    tmp_path, monkeypatch
+):
+    release = tmp_path / "release"
+    script = (
+        "import time\nfrom pathlib import Path\n"
+        "print('LIVE OUTPUT', flush=True)\n"
+        f"while not Path({str(release)!r}).exists(): time.sleep(0.01)\n"
+        "print('FINAL OUTPUT', flush=True)\nraise SystemExit(7)\n"
+    )
+    process = ManagedProcess([sys.executable, "-c", script], tmp_path / "process.log")
+    visible = threading.Event()
+
+    class Console(io.StringIO):
+        def write(self, text):
+            result = super().write(text)
+            if "LIVE OUTPUT" in text:
+                visible.set()
+            return result
+
+    console = Console()
+    monkeypatch.setattr(sys, "stdout", console)
+    outcomes = []
+    worker = threading.Thread(
+        target=lambda: outcomes.append(process.wait(10, progress=True))
+    )
+    worker.start()
+    try:
+        assert visible.wait(5), (
+            "Output must be visible while the child is still running"
+        )
+        assert process.alive()
+    finally:
+        release.touch()
+        worker.join(timeout=10)
+        process.stop(timeout=1)
+    assert outcomes == [7]
+    assert "FINAL OUTPUT" in console.getvalue()
+    assert (tmp_path / "process.log").read_text() == "LIVE OUTPUT\nFINAL OUTPUT\n"
+
+
+def test_progress_timeout_retains_output_and_stops_the_child(tmp_path, capsys):
+    ready = tmp_path / "ready"
+    script = (
+        "import time\nfrom pathlib import Path\nprint('BEFORE TIMEOUT', flush=True)\n"
+        f"Path({str(ready)!r}).touch()\ntime.sleep(60)\n"
+    )
+    process = ManagedProcess([sys.executable, "-c", script], tmp_path / "process.log")
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        with pytest.raises(subprocess.TimeoutExpired):
+            process.wait(0.1, progress=True)
+        assert not process.alive()
+        assert "BEFORE TIMEOUT" in capsys.readouterr().out
+        assert "BEFORE TIMEOUT" in (tmp_path / "process.log").read_text()
+    finally:
+        process.stop(timeout=1)
+
+
+@pytest.mark.parametrize("failure", ["lock", "dataset"])
+def test_pre_docker_failures_are_printed_with_the_report(
+    tmp_path, monkeypatch, capsys, plan, failure
+):
+    def lock_error(*args):
+        raise PermissionError(13, "Permission denied", "/var/lock/qwen4-mi308x.lock")
+
+    def dataset_error(*args):
+        raise FileNotFoundError(
+            2,
+            "No such file or directory",
+            "/raid/models/benchmark_datasets/gsm8k/test.jsonl",
+        )
+
+    if failure == "lock":
+        monkeypatch.setattr(ci, "host_lock", lock_error)
+    monkeypatch.setattr(ci, "preflight", dataset_error)
+    monkeypatch.setattr(
+        ci,
+        "command",
+        lambda *a, **k: pytest.fail("Docker must not start after failed preflight"),
+    )
+    monkeypatch.setattr(ci.shutil, "which", lambda _: None)
+    args = argparse.Namespace(
+        output=str(tmp_path / "results"),
+        models_root="/raid/models",
+        datasets_root=None,
+        lock=str(tmp_path / "lock"),
+    )
+    assert ci.run(plan, args) == 1
+    captured = capsys.readouterr()
+    assert "Starting Docker CI" in captured.out and "FAILED" in captured.out
+    assert (
+        "Permission denied" if failure == "lock" else "gsm8k/test.jsonl"
+    ) in captured.err
+    assert not (tmp_path / "results/pull.log").exists()
+    assert (tmp_path / "results/summary.md").is_file()
 
 
 def test_port_probe_detects_listener_and_allows_clean_reuse():
@@ -688,11 +790,26 @@ def test_docker_one_build_three_owned_containers_and_failure_cleanup(
     tmp_path, monkeypatch, plan, failure
 ):
     calls = []
+    build_dirs = []
+    work_root = tmp_path / "work"
+    monkeypatch.setenv("QWEN4_WORK_ROOT", str(work_root))
+    monkeypatch.setenv("DOCKER_CONFIG", "/home/ci-fixture/.docker")
+    monkeypatch.setenv("BUILDX_CONFIG", "/home/ci-fixture/.docker/buildx")
 
     class Process:
         def __init__(self, argv, log_path, **kwargs):
             self.argv = argv
             calls.append(argv)
+            if argv[:2] == ["docker", "build"]:
+                context = ci.Path(argv[-1])
+                buildx = ci.Path(kwargs["env"]["BUILDX_CONFIG"])
+                assert buildx.is_dir() and buildx.is_relative_to(work_root)
+                assert context.is_dir() and context.is_relative_to(work_root)
+                assert not buildx.is_relative_to(context)
+                assert kwargs["env"]["DOCKER_CONFIG"] == "/home/ci-fixture/.docker"
+                assert kwargs["env"]["BUILDKIT_PROGRESS"] == "plain"
+                assert not (context / "buildx").exists()
+                build_dirs.extend([context, buildx])
 
         def wait(self, *args, **kwargs):
             return int(
@@ -702,6 +819,8 @@ def test_docker_one_build_three_owned_containers_and_failure_cleanup(
 
     def command(argv, **kwargs):
         calls.append(argv)
+        if argv[:2] == ["docker", "info"]:
+            return "/raid/docker"
         if argv[:3] == ["docker", "image", "inspect"]:
             return (
                 "sha256:built"
@@ -732,6 +851,11 @@ def test_docker_one_build_three_owned_containers_and_failure_cleanup(
     creates = [c for c in calls if c[:2] == ["docker", "create"]]
     removes = [c for c in calls if c[:3] == ["docker", "rm", "-f"]]
     assert len(builds) == 1
+    assert len(build_dirs) == 2 and all(not path.exists() for path in build_dirs)
+    assert (
+        ci.read_json(tmp_path / "results/runtime.json")["docker_root_dir"]
+        == "/raid/docker"
+    )
     assert len(removes) == (0 if failure in {"build", "create"} else 3)
     if failure not in {"build", "create"}:
         names = [c[c.index("--name") + 1] for c in creates]
@@ -741,6 +865,32 @@ def test_docker_one_build_three_owned_containers_and_failure_cleanup(
             "--network=none" in c and any(v.endswith(":/models:ro") for v in c)
             for c in creates
         )
+
+
+def test_build_failure_marks_cases_not_run_without_missing_file_noise(tmp_path, plan):
+    ci.write_json(
+        tmp_path / "runtime.json",
+        {"errors": ["Candidate build failed; see build.log"], "containers": {}},
+    )
+    ci.write_json(tmp_path / "assets.json", {"gsm8k": {}})
+    assert ci.report(plan, tmp_path) == 1
+    rows = ci.read_json(tmp_path / "summary.json")["cases"]
+    assert len(rows) == 6 and all(row["status"] == "not_run" for row in rows)
+    text = (tmp_path / "summary.md").read_text()
+    assert "Candidate build failed" in text
+    assert text.count("⚪ Not run") == 6
+    assert "No such file" not in text
+
+
+def test_missing_execution_record_preserves_existing_measurements(
+    complete_results, plan
+):
+    case = ci.CASES[0]
+    (complete_results / case["group"] / case["id"] / "execution.json").unlink()
+    assert ci.report(plan, complete_results) == 1
+    row = ci.read_json(complete_results / "summary.json")["cases"][0]
+    assert row["status"] == "failed"
+    assert row["performance"] is not None and row["accuracy"] is not None
 
 
 @pytest.mark.parametrize("in_actions", [False, True])

@@ -164,9 +164,11 @@ def clean_environment(extra=None):
 @contextlib.contextmanager
 def host_lock(path, timeout=3600):
     path = Path(path)
+    print(f"Waiting for shared host lock: {path}", flush=True)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as stream:
         deadline = time.monotonic() + timeout
+        next_notice = time.monotonic() + 30
         while True:
             try:
                 fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -174,8 +176,12 @@ def host_lock(path, timeout=3600):
             except BlockingIOError:
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"Host is reserved: {path}")
+                if time.monotonic() >= next_notice:
+                    print(f"Host is still reserved; waiting for {path}", flush=True)
+                    next_notice = time.monotonic() + 30
                 time.sleep(1)
         try:
+            print("Host lock acquired", flush=True)
             stream.seek(0)
             stream.truncate()
             stream.write(f"pid={os.getpid()}\n")
@@ -276,30 +282,54 @@ class ManagedProcess:
         self._stopped = True
 
     def wait(self, timeout, progress=False):
+        reader = None
         try:
             if not progress:
                 return self.process.wait(timeout=timeout)
+            print(f"Live output follows; full log: {self.log_path}", flush=True)
+            reader = self.log_path.open(encoding="utf-8", errors="replace")
             started = time.monotonic()
             deadline = started + timeout
+            next_notice = started + 30
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise subprocess.TimeoutExpired(self.process.args, timeout)
                 try:
-                    return self.process.wait(timeout=min(30, remaining))
+                    code = self.process.wait(timeout=min(1, remaining))
                 except subprocess.TimeoutExpired:
+                    code = None
+                print(reader.read(65536), end="", flush=True)
+                if code is not None:
+                    return code
+                if time.monotonic() >= next_notice:
                     print(
                         f"Still running {self.log_path} ({time.monotonic() - started:.0f}s)",
                         flush=True,
                     )
+                    next_notice = time.monotonic() + 30
         finally:
-            self.stop()
+            try:
+                self.stop()
+            finally:
+                if reader:
+                    try:
+                        for chunk in iter(lambda: reader.read(65536), ""):
+                            print(chunk, end="", flush=True)
+                    finally:
+                        reader.close()
 
 
 def wait_ready(process, base_url, case, model_path, timeout=3600):
     deadline = time.monotonic() + timeout
+    next_notice = time.monotonic() + 30
     last_error = "no response"
     while time.monotonic() < deadline:
+        if time.monotonic() >= next_notice:
+            print(
+                f"Waiting for {case['id']} server; log: {process.log_path}", flush=True
+            )
+            next_notice = time.monotonic() + 30
         if not process.alive():
             raise RuntimeError(
                 f"Server exited before readiness: {process.process.returncode}"
@@ -470,6 +500,7 @@ def prepare(args):
     repository = os.environ.get("GITHUB_REPOSITORY", "apinge/sglang")
     origin = "aiter" if repository.endswith("/aiter") else "sglang"
     event_name = os.environ.get("GITHUB_EVENT_NAME", "workflow_dispatch")
+    print(f"Preparing Qwen4 CI sources for {repository}", flush=True)
     event = (
         read_json(os.environ["GITHUB_EVENT_PATH"])
         if os.environ.get("GITHUB_EVENT_PATH")
@@ -507,6 +538,7 @@ def prepare(args):
             )["permission"] not in {"admin", "maintain", "write"}:
                 reason = "CI label must be granted by a maintainer"
         if reason:
+            print(f"GPU evaluation skipped: {reason}", flush=True)
             actions_output("enabled", "false")
             actions_summary(f"Qwen4 GPU evaluation skipped: {reason}.\n")
             return 0
@@ -538,6 +570,7 @@ def prepare(args):
         )
         if pr and name == origin:
             repo, ref = pr["head"]["repo"]["full_name"], pr["head"]["sha"]
+        print(f"Resolving {name}: {repo}@{ref}", flush=True)
         sha = github(f"repos/{repo}/commits/{quote(ref, safe='')}")["sha"]
         if not re.fullmatch(r"[0-9a-f]{40}", sha):
             raise ValueError("Expected a full source SHA")
@@ -826,10 +859,15 @@ def run_group(plan, group, output, models, datasets, client_root):
             server = ManagedProcess(
                 argv, directory / "server.log", env=env, cwd=directory
             )
+            print(
+                f"{case['id']}: waiting for server readiness; log: {directory / 'server.log'}",
+                flush=True,
+            )
             info = wait_ready(
                 server, "http://127.0.0.1:7080", case, env["MODEL_PATH"], timeout=3600
             )
             write_json(directory / "server-info.json", info)
+            print(f"{case['id']}: warming up", flush=True)
             write_json(
                 directory / "smoke.json",
                 smoke_generation("http://127.0.0.1:7080", case["served_model_name"]),
@@ -871,6 +909,7 @@ def run_group(plan, group, output, models, datasets, client_root):
                 try:
                     if not server.alive():
                         raise RuntimeError("Server exited before evaluation")
+                    print(f"{case['id']}: running {phase}", flush=True)
                     code = ManagedProcess(
                         ["bash", str(EVALUATION / script)],
                         directory / f"{phase}.log",
@@ -882,8 +921,14 @@ def run_group(plan, group, output, models, datasets, client_root):
                         raise RuntimeError(f"{phase} exited {code}")
                 except Exception as exc:
                     state["errors"].append(f"{phase}: {exc}")
+                    print(
+                        f"{case['id']} {phase} failed: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
         except Exception as exc:
             state["errors"].append(str(exc))
+            print(f"{case['id']} failed: {exc}", file=sys.stderr, flush=True)
         except BaseException:
             state["errors"].append("Evaluation interrupted")
             raise
@@ -895,19 +940,25 @@ def run_group(plan, group, output, models, datasets, client_root):
                 gpu_idle()
             except Exception as exc:
                 state["errors"].append(f"Cleanup failed: {exc}")
+                print(
+                    f"{case['id']} cleanup failed: {exc}", file=sys.stderr, flush=True
+                )
                 raise
             finally:
                 state["elapsed_s"] = time.monotonic() - started
                 write_json(directory / "execution.json", state)
+                print(f"{case['id']}: finished; results: {directory}", flush=True)
 
 
 def preflight(models, datasets, examples):
     for relative, checksum in DATASETS.items():
+        print(f"Checking dataset: {datasets / relative}", flush=True)
         if file_hash(datasets / relative) != checksum:
             raise ValueError(f"Dataset checksum mismatch: {datasets / relative}")
     model_info = {}
     for name in {name for pair in GROUPS.values() for name in pair if name}:
         path = models / name
+        print(f"Checking model files: {path}", flush=True)
         config = read_json(path / "config.json")
         index = path / "model.safetensors.index.json"
         names = (
@@ -949,13 +1000,35 @@ def run(plan, args):
     write_json(output / "manifest.json", plan)
     try:
         with host_lock(args.lock):
+            print("Checking model and dataset assets before Docker starts", flush=True)
             relative = datasets.relative_to(models)
             write_json(
                 output / "assets.json",
                 preflight(models, datasets, 2 if plan["smoke"] else 200),
             )
-            with tempfile.TemporaryDirectory(prefix="qwen4-build-") as temp:
-                context = Path(temp)
+            runtime["docker_root_dir"] = command(
+                ["docker", "info", "--format={{.DockerRootDir}}"]
+            )
+            print(
+                f"Docker image/cache storage: {runtime['docker_root_dir']}", flush=True
+            )
+            work_root = Path(os.environ.get("QWEN4_WORK_ROOT", "/tmp")).resolve()
+            work_root.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(
+                prefix="qwen4-build-", dir=work_root
+            ) as temp:
+                context = Path(temp) / "context"
+                context.mkdir()
+                buildx = Path(temp) / "buildx"
+                buildx.mkdir()
+                # Keep buildx state outside both $HOME and the image build context.
+                # DOCKER_CONFIG is preserved so existing registry credentials work.
+                builder_env = {
+                    **os.environ,
+                    "BUILDX_CONFIG": str(buildx),
+                    "BUILDKIT_PROGRESS": "plain",
+                }
+                print(f"Buildx client state: {buildx}", flush=True)
                 shutil.copyfile(ROOT, context / "qwen4_ci.py")
                 write_json(context / "plan.json", plan)
                 (context / "evaluation").mkdir()
@@ -965,6 +1038,7 @@ def run(plan, args):
                     "run_qwen38_pure_text_bench.sh",
                 }:
                     shutil.copyfile(EVALUATION / name, context / "evaluation" / name)
+                print(f"Pulling base image: {plan['base_image']}", flush=True)
                 code = ManagedProcess(
                     ["docker", "pull", plan["base_image"]], output / "pull.log"
                 ).wait(1800, progress=True)
@@ -979,6 +1053,7 @@ def run(plan, args):
                 (context / "Dockerfile").write_text(
                     'ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\nENV GPU_ARCHS=gfx942 PYTORCH_ROCM_ARCH=gfx942 SGLANG_BUILD_RUST_EXTS=none\nCOPY . /ci/\nRUN python3 /ci/qwen4_ci.py install --plan /ci/plan.json\nWORKDIR /ci\nENTRYPOINT []\nCMD ["sleep", "infinity"]\n'
                 )
+                print(f"Building candidate image: {image}", flush=True)
                 code = ManagedProcess(
                     [
                         "docker",
@@ -993,6 +1068,7 @@ def run(plan, args):
                         str(context),
                     ],
                     output / "build.log",
+                    env=builder_env,
                 ).wait(7200, progress=True)
                 if code:
                     raise RuntimeError("Candidate build failed; see build.log")
@@ -1000,6 +1076,7 @@ def run(plan, args):
                     ["docker", "image", "inspect", "--format={{.Id}}", image]
                 )
             for group in GROUPS:
+                print(f"Starting target container: {group}", flush=True)
                 directory = output / group
                 directory.mkdir()
                 name = f"{image.replace(':', '-')}-{group}"
@@ -1090,6 +1167,7 @@ def run(plan, args):
                         command(["docker", "rm", "-f", cid])
     except BaseException as exc:
         runtime["errors"].append(f"{type(exc).__name__}: {exc}")
+        print(f"Docker CI failed: {runtime['errors'][-1]}", file=sys.stderr, flush=True)
     finally:
         if shutil.which("docker"):
             subprocess.run(
@@ -1205,6 +1283,21 @@ def report(plan, output, job_result="success"):
             "accuracy_reference": reference,
             "accuracy_minimum": None if plan["smoke"] else minimum,
         }
+        if not any(
+            (directory / name).exists()
+            for name in [
+                "execution.json",
+                "launch.json",
+                "performance.jsonl",
+                "gsm8k.json",
+            ]
+        ):
+            row.update(
+                status="not_run",
+                errors=["No case execution artifacts; evaluation did not run"],
+            )
+            rows.append(row)
+            continue
         try:
             state = read_json(directory / "execution.json")
             row["errors"].extend(state["errors"])
@@ -1247,6 +1340,7 @@ def report(plan, output, job_result="success"):
                     f"relative drop {(reference - score) / reference:.2%} "
                     f"exceeds {GSM8K_MAX_RELATIVE_DROP:.0%} from reference {reference:.2%}"
                 )
+        row["status"] = "failed" if row["errors"] else "passed"
         rows.append(row)
     failed = bool(errors or any(r["errors"] for r in rows))
     title = "Qwen4 local model evaluation" if local else "Qwen4 MI308X CI"
@@ -1268,6 +1362,9 @@ def report(plan, output, job_result="success"):
     text += "| Case | Status | GSM8K | Reference / minimum | Performance completed | TTFT (ms) | TPOT (ms) | Output tokens/s |\n|---|---|---:|---:|---:|---:|---:|---:|\n"
     for row in rows:
         a, p = row["accuracy"], row["performance"]
+        status = {"not_run": "⚪ Not run", "failed": "❌ Failed", "passed": "✅ Pass"}[
+            row["status"]
+        ]
         metrics = [
             f"{p[k]:.3f}" if p else "—"
             for k in ["mean_ttft_ms", "mean_tpot_ms", "output_throughput"]
@@ -1281,11 +1378,16 @@ def report(plan, output, job_result="success"):
             f"(≥{math.ceil(row['accuracy_minimum'] * examples - 1e-12)}/{examples})"
         )
         text += (
-            f"| {row['case']} | {'❌ Failed' if row['errors'] else '✅ Pass'} | {accuracy} | {threshold} | {completed} | "
+            f"| {row['case']} | {status} | {accuracy} | {threshold} | {completed} | "
             + " | ".join(metrics)
             + " |\n"
         )
-    for message in errors + [f"{r['case']}: {e}" for r in rows for e in r["errors"]]:
+    for message in errors + [
+        f"{r['case']}: {e}"
+        for r in rows
+        if r["status"] != "not_run" or not errors
+        for e in r["errors"]
+    ]:
         text += "\n- " + str(message).replace("\n", " ").replace("|", "\\|")
     text += "\n\nRaw logs, JSON, HTML, build provenance, and container IDs are in the run's result artifact.\n"
     write_json(
