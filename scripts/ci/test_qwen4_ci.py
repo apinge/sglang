@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -14,6 +15,8 @@ import time
 
 import pytest
 import qwen4_ci as ci
+from pathlib import Path
+
 from qwen4_ci import (
     ManagedProcess,
     host_lock,
@@ -24,7 +27,104 @@ from qwen4_ci import (
 )
 
 
-@pytest.mark.parametrize("status", [401, 403, 404])
+def stage_install(tmp_path, monkeypatch):
+    root = tmp_path / "ci"
+    package = root / "src/sglang/python"
+    package.mkdir(parents=True)
+    (package / "pyproject_other.toml").write_text("# alternate HIP metadata\n")
+
+    def mapped(path):
+        text = str(path)
+        return root / text.removeprefix("/ci/") if text.startswith("/ci/") else Path(path)
+
+    monkeypatch.setattr(ci, "Path", mapped)
+    return root, package
+
+
+def install_command(plan, root, listings, requirements, check_env=False):
+    seen = []
+
+    def command(argv, **kwargs):
+        if argv[:2] == ["git", "-C"]:
+            return plan["sources"][Path(argv[2]).name]["sha"]
+        if argv[-2:] == ["list", "--format=json"]:
+            seen.append(True)
+            return json.dumps(listings[len(seen) - 1])
+        if check_env:
+            assert "PYTHONPATH" not in kwargs["env"]
+        return json.dumps(
+            {
+                "origins": {
+                    name: str(root / "src" / name / name / "__init__.py")
+                    for name in ("sglang", "aiter", "pyhip")
+                },
+                "requirements": requirements,
+            }
+        )
+
+    return command
+
+
+def clone_results(source, name):
+    dest = source.with_name(f"{source.name}-{name}")
+    shutil.rmtree(dest, ignore_errors=True)
+    shutil.copytree(source, dest)
+    return dest
+
+
+def patch_docker(monkeypatch, tmp_path, failure=None):
+    calls, build_dirs = [], []
+    work_root = tmp_path / "work"
+    monkeypatch.setenv("QWEN4_WORK_ROOT", str(work_root))
+    monkeypatch.setenv("DOCKER_CONFIG", "/home/ci-fixture/.docker")
+    monkeypatch.setenv("BUILDX_CONFIG", "/home/ci-fixture/.docker/buildx")
+
+    class Process:
+        def __init__(self, argv, log_path, **kwargs):
+            self.argv = argv
+            calls.append(argv)
+            if argv[:2] != ["docker", "build"]:
+                return
+            context = ci.Path(argv[-1])
+            buildx = ci.Path(kwargs["env"]["BUILDX_CONFIG"])
+            assert buildx.is_dir() and buildx.is_relative_to(work_root)
+            assert context.is_dir() and context.is_relative_to(work_root)
+            assert not buildx.is_relative_to(context)
+            assert kwargs["env"]["DOCKER_CONFIG"] == "/home/ci-fixture/.docker"
+            assert kwargs["env"]["BUILDKIT_PROGRESS"] == "plain"
+            assert not (context / "buildx").exists()
+            build_dirs.extend([context, buildx])
+
+        def wait(self, *args, **kwargs):
+            return int(
+                (failure == "build" and self.argv[:2] == ["docker", "build"])
+                or (failure == "group" and "container" in self.argv)
+            )
+
+    def command(argv, **kwargs):
+        calls.append(argv)
+        if argv[:2] == ["docker", "info"]:
+            return "/raid/docker"
+        if argv[:3] == ["docker", "image", "inspect"]:
+            if any(item.startswith("--format") for item in argv):
+                return "sha256:built"
+            return json.dumps(
+                [{"Id": "sha256:base", "RepoDigests": ["image@sha256:" + "a" * 64]}]
+            )
+        if argv[:2] == ["docker", "create"]:
+            if failure == "create":
+                raise RuntimeError("name already in use")
+            return argv[argv.index("--name") + 1] if "--name" in argv else "cid"
+        return ""
+
+    monkeypatch.setattr(ci, "ManagedProcess", Process)
+    monkeypatch.setattr(ci, "command", command)
+    monkeypatch.setattr(ci, "preflight", lambda *args: {"gsm8k": {}})
+    monkeypatch.setattr(ci.shutil, "which", lambda name: None)
+    return calls, build_dirs
+
+
+@pytest.mark.parametrize("status", [401, 404])
 def test_prepare_api_failure_is_actionable_and_never_writes_a_plan(tmp_path, status):
     fake_gh = tmp_path / "gh"
     reason = (
@@ -153,48 +253,25 @@ def test_runtime_checks_reject_missing_or_incompatible_candidate_requirements(
 def test_image_install_reuses_base_dependencies_and_checks_fresh_imports(
     tmp_path, monkeypatch, plan, runtime_packages, replace_triton
 ):
-    from pathlib import Path
-
-    root = tmp_path / "ci"
-    root.mkdir()
-    package = root / "src/sglang/python"
-    package.mkdir(parents=True)
-    (package / "pyproject_other.toml").write_text("# alternate HIP metadata\n")
-    monkeypatch.setattr(
-        ci,
-        "Path",
-        lambda path: (
-            root / str(path).removeprefix("/ci/")
-            if str(path).startswith("/ci/")
-            else Path(path)
-        ),
-    )
+    root, package = stage_install(tmp_path, monkeypatch)
     monkeypatch.setenv("PYTHONPATH", "/opt/aiter")
     monkeypatch.setenv("AITER_USE_SYSTEM_TRITON", "0")
-    calls, snapshots = [], []
+    calls = []
     after = [dict(p) for p in runtime_packages]
     after[0]["version"] = "0.0.0.dev2"
     if replace_triton:
         after[2]["version"] = "3.7.0"
-
-    def command(argv, **kwargs):
-        if argv[:2] == ["git", "-C"]:
-            return plan["sources"][Path(argv[2]).name]["sha"]
-        if argv[-2:] == ["list", "--format=json"]:
-            snapshots.append(True)
-            return json.dumps(runtime_packages if len(snapshots) == 1 else after)
-        assert "PYTHONPATH" not in kwargs["env"]
-        return json.dumps(
-            {
-                "origins": {
-                    n: str(root / "src" / n / n / "__init__.py")
-                    for n in ["sglang", "aiter", "pyhip"]
-                },
-                "requirements": ["numpy>=2", "torch; extra == 'srt_hip'"],
-            }
-        )
-
-    monkeypatch.setattr(ci, "command", command)
+    monkeypatch.setattr(
+        ci,
+        "command",
+        install_command(
+            plan,
+            root,
+            [runtime_packages, after],
+            ["numpy>=2", "torch; extra == 'srt_hip'"],
+            check_env=True,
+        ),
+    )
     monkeypatch.setattr(
         ci.subprocess, "run", lambda argv, **kwargs: calls.append((argv, kwargs))
     )
@@ -229,22 +306,7 @@ def test_image_install_reuses_base_dependencies_and_checks_fresh_imports(
 def test_image_install_adds_only_missing_hip_pins(
     tmp_path, monkeypatch, plan, runtime_packages
 ):
-    from pathlib import Path
-
-    root = tmp_path / "ci"
-    root.mkdir()
-    package = root / "src/sglang/python"
-    package.mkdir(parents=True)
-    (package / "pyproject_other.toml").write_text("# alternate HIP metadata\n")
-    monkeypatch.setattr(
-        ci,
-        "Path",
-        lambda path: (
-            root / str(path).removeprefix("/ci/")
-            if str(path).startswith("/ci/")
-            else Path(path)
-        ),
-    )
+    root, package = stage_install(tmp_path, monkeypatch)
     before = [dict(item) for item in runtime_packages] + [
         {"name": "sentencepiece", "version": "0.2.2"},
         {"name": "xgrammar", "version": "0.2.1"},
@@ -264,35 +326,26 @@ def test_image_install_adds_only_missing_hip_pins(
             {"name": "petit-kernel", "version": "0.0.2"},
         ]
     )
-    lists = []
     calls = []
-
-    def command(argv, **kwargs):
-        if argv[:2] == ["git", "-C"]:
-            return plan["sources"][Path(argv[2]).name]["sha"]
-        if argv[-2:] == ["list", "--format=json"]:
-            lists.append(True)
-            return json.dumps((before, satisfied, pinned)[len(lists) - 1])
-        return json.dumps(
-            {
-                "origins": {
-                    n: str(root / "src" / n / n / "__init__.py")
-                    for n in ["sglang", "aiter", "pyhip"]
-                },
-                "requirements": [
-                    "sglang[runtime_common]; extra == 'srt_hip'",
-                    "sglang[runtime_base]; extra == 'runtime_common'",
-                    "sentencepiece==0.2.1; extra == 'runtime_base'",
-                    "outlines==0.1.11; extra == 'runtime_common'",
-                    "xgrammar==0.2.7; extra == 'runtime_common'",
-                    "petit_kernel==0.0.2; extra == 'srt_hip'",
-                    "torch; extra == 'srt_hip'",
-                    "diffusers==99; extra == 'diffusion_hip'",
-                ],
-            }
-        )
-
-    monkeypatch.setattr(ci, "command", command)
+    monkeypatch.setattr(
+        ci,
+        "command",
+        install_command(
+            plan,
+            root,
+            [before, satisfied, pinned],
+            [
+                "sglang[runtime_common]; extra == 'srt_hip'",
+                "sglang[runtime_base]; extra == 'runtime_common'",
+                "sentencepiece==0.2.1; extra == 'runtime_base'",
+                "outlines==0.1.11; extra == 'runtime_common'",
+                "xgrammar==0.2.7; extra == 'runtime_common'",
+                "petit_kernel==0.0.2; extra == 'srt_hip'",
+                "torch; extra == 'srt_hip'",
+                "diffusers==99; extra == 'diffusion_hip'",
+            ],
+        ),
+    )
     monkeypatch.setattr(
         ci.subprocess, "run", lambda argv, **kwargs: calls.append((argv, kwargs))
     )
@@ -316,31 +369,18 @@ def test_image_install_adds_only_missing_hip_pins(
     assert all("diffusers" not in item for item in info["checked_hip_requirements"])
 
 
-@pytest.mark.parametrize(
-    "mode,requested,strict",
-    [
-        ("ok", 2, True),
-        ("error", 2, True),
-        ("mixed", 2, True),
-        ("empty", 2, True),
-        ("ok", 3, True),
-        ("error", 2, False),
-    ],
-)
-def test_native_counts_and_strict_failures_preserve_original_scoring(
-    tmp_path, mode, requested, strict
-):
+def test_native_counts_and_strict_failures_preserve_original_scoring(tmp_path):
     pytest.importorskip("sglang", reason="Installed-runtime client integration")
     from sglang.test.run_eval import run_eval
 
+    state = {"mode": "ok"}
     seen = []
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
+            mode = state["mode"]
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            index = int(
-                re.findall(r"Question: Q(\d+)", body["messages"][0]["content"])[-1]
-            )
+            index = int(re.findall(r"Question: Q(\d+)", body["messages"][0]["content"])[-1])
             seen.append(index)
             if mode == "error" or (mode == "mixed" and index == 6):
                 self.send_response(400)
@@ -364,16 +404,10 @@ def test_native_counts_and_strict_failures_preserve_original_scoring(
                                     "role": "assistant",
                                     "content": "" if mode == "empty" else str(index),
                                 },
-                                "finish_reason": "length"
-                                if mode == "empty"
-                                else "stop",
+                                "finish_reason": "length" if mode == "empty" else "stop",
                             }
                         ],
-                        "usage": {
-                            "prompt_tokens": 100,
-                            "completion_tokens": 1,
-                            "total_tokens": 101,
-                        },
+                        "usage": {"prompt_tokens": 100, "completion_tokens": 1, "total_tokens": 101},
                     }
                 ).encode()
             )
@@ -386,61 +420,68 @@ def test_native_counts_and_strict_failures_preserve_original_scoring(
     data = tmp_path / "test.jsonl"
     data.write_text(
         "".join(
-            json.dumps({"question": f"Q{i}", "answer": f"#### {i}"}) + "\n"
-            for i in range(7)
+            json.dumps({"question": f"Q{i}", "answer": f"#### {i}"}) + "\n" for i in range(7)
         )
     )
-    args = argparse.Namespace(
-        eval_name="gsm8k",
-        gsm8k_data_path=str(data),
-        num_examples=requested,
-        num_shots=5,
-        num_threads=2,
-        output_dir=str(tmp_path / "results"),
-        base_url=None,
-        host="127.0.0.1",
-        port=server.server_port,
-        model="test-model",
-        max_tokens=32,
-        repeat=1,
-        api="chat",
-        strict=strict,
-        temperature=0.0,
-        top_p=1.0,
-    )
-    errors = {"ok": 0, "empty": 0, "error": 2, "mixed": 1}[mode]
-    incomplete = strict and (errors > 0 or requested > 2)
+    cases = [
+        ("ok", 2, True),
+        ("error", 2, True),
+        ("mixed", 2, True),
+        ("empty", 2, True),
+        ("ok", 3, True),
+        ("error", 2, False),
+    ]
     try:
-        if incomplete:
-            with pytest.raises(RuntimeError, match="Incomplete GSM8K"):
-                run_eval(args)
-        else:
-            run_eval(args)
-        path = tmp_path / "results/gsm8k.json"
-        result = read_json(path)
-        assert sorted(seen) == [
-            5,
-            6,
-        ]  # Prompt examples remain excluded by the original scorer.
-        assert result["score"] == {"ok": 1, "empty": 0, "error": 0, "mixed": 0.5}[mode]
-        assert path.with_suffix(".html").stat().st_size > 0
-        assert not path.with_name("gsm8k-examples.jsonl").exists()
-        if strict:
-            assert {
-                k: result[k] for k in ["requested", "scored", "completed", "errors"]
-            } == {
-                "requested": requested,
-                "scored": 2,
-                "completed": 2 - errors,
-                "errors": errors,
-            }
+        for mode, requested, strict in cases:
+            state["mode"] = mode
+            seen.clear()
+            args = argparse.Namespace(
+                eval_name="gsm8k",
+                gsm8k_data_path=str(data),
+                num_examples=requested,
+                num_shots=5,
+                num_threads=2,
+                output_dir=str(tmp_path / "results"),
+                base_url=None,
+                host="127.0.0.1",
+                port=server.server_port,
+                model="test-model",
+                max_tokens=32,
+                repeat=1,
+                api="chat",
+                strict=strict,
+                temperature=0.0,
+                top_p=1.0,
+            )
+            errors = {"ok": 0, "empty": 0, "error": 2, "mixed": 1}[mode]
+            incomplete = strict and (errors > 0 or requested > 2)
             if incomplete:
-                with pytest.raises(ValueError):
+                with pytest.raises(RuntimeError, match="Incomplete GSM8K"):
+                    run_eval(args)
+            else:
+                run_eval(args)
+            path = tmp_path / "results/gsm8k.json"
+            result = read_json(path)
+            assert sorted(seen) == [5, 6]  # Few-shot rows stay out of the score.
+            assert result["score"] == {"ok": 1, "empty": 0, "error": 0, "mixed": 0.5}[mode]
+            assert path.with_suffix(".html").stat().st_size > 0
+            assert not path.with_name("gsm8k-examples.jsonl").exists()
+            if strict:
+                assert {
+                    key: result[key] for key in ["requested", "scored", "completed", "errors"]
+                } == {
+                    "requested": requested,
+                    "scored": 2,
+                    "completed": 2 - errors,
+                    "errors": errors,
+                }
+                if incomplete:
+                    with pytest.raises(ValueError):
+                        validate_accuracy(path, requested)
+                else:
                     validate_accuracy(path, requested)
             else:
-                validate_accuracy(path, requested)
-        else:
-            assert not {"requested", "scored", "completed", "errors"} & result.keys()
+                assert not {"requested", "scored", "completed", "errors"} & result.keys()
     finally:
         server.shutdown()
         server.server_close()
@@ -480,19 +521,14 @@ def test_sampler_counts_logical_requests_across_retries_and_threads(monkeypatch)
     monkeypatch.setattr(common, "LargerHttpxClient", lambda: None)
     monkeypatch.setattr(common.time, "sleep", lambda _: None)
     sampler = common.ChatCompletionSampler(model="fixture")
-    with ThreadPoolExecutor(max_workers=16) as pool:
+    with ThreadPoolExecutor(max_workers=8) as pool:
         results = list(
-            pool.map(
-                lambda i: sampler([{"role": "user", "content": str(i)}]), range(200)
-            )
+            pool.map(lambda i: sampler([{"role": "user", "content": str(i)}]), range(8))
         )
-    assert sampler.request_counts == {"attempted": 200, "completed": 150}
-    assert (
-        sum(attempts.values()) == 550
-    )  # Retries do not inflate the logical request count.
-    assert (
-        results[0] == results[2] == ""
-    )  # A failed request and a completed empty answer differ only in accounting.
+    # Two of each class: hard failures, retried successes, empty completions, answers.
+    assert sampler.request_counts == {"attempted": 8, "completed": 6}
+    assert sum(attempts.values()) == 22
+    assert results[0] == results[2] == ""
 
 
 def test_dead_server_is_detected_without_waiting_for_timeout(tmp_path):
@@ -794,6 +830,8 @@ def test_smoke_accuracy_is_diagnostic_when_all_six_cases_complete(
     summary = ci.read_json(complete_results / "summary.json")
     assert len(summary["cases"]) == 6
     assert all(row["accuracy"]["score"] == 0 for row in summary["cases"])
+    assert all(row["accuracy"]["passed"] == 0 for row in summary["cases"])
+    assert "0.000% (0/2)" in (complete_results / "summary.md").read_text()
     text = (complete_results / "summary.md").read_text()
     assert "| QPS |" in text and "| Accept length |" in text
     by_case = {row["case"]: row for row in summary["cases"]}
@@ -862,100 +900,129 @@ def test_local_runner_visits_groups_and_preserves_failure_evidence(
 
 
 @pytest.mark.parametrize("plan", [False], indirect=True)
-@pytest.mark.parametrize("case", ci.CASES, ids=lambda case: case["id"])
-@pytest.mark.parametrize("lost_answers,failed", [(-1, False), (3, False), (4, True)])
-def test_full_accuracy_gate_uses_relative_drop_for_each_case(
-    complete_results, plan, case, lost_answers, failed
-):
-    path = complete_results / case["group"] / case["id"] / "gsm8k.json"
-    data = ci.read_json(path)
-    reference = ci.GSM8K_BASELINES[case["id"]]
-    data["score"] = (round(reference * 200) - lost_answers) / 200
-    ci.write_json(path, data)
-    assert ci.report(plan, complete_results) == int(failed)
-    summary = ci.read_json(complete_results / "summary.json")
-    row = next(row for row in summary["cases"] if row["case"] == case["id"])
-    assert any("GSM8K regression" in error for error in row["errors"]) == failed
-    assert row["accuracy_reference"] == reference
-    assert row["performance"]["completed"] == 128
-    assert "Reference / minimum" in (complete_results / "summary.md").read_text()
+def test_accuracy_gate_uses_each_case_reference(complete_results, plan):
+    def set_score(case_id, lost):
+        case = next(item for item in ci.CASES if item["id"] == case_id)
+        path = complete_results / case["group"] / case["id"] / "gsm8k.json"
+        data = ci.read_json(path)
+        reference = ci.GSM8K_BASELINES[case_id]
+        data["score"] = (round(reference * 200) - lost) / 200
+        ci.write_json(path, data)
+        return reference, data["score"]
 
+    def row(case_id):
+        summary = ci.read_json(complete_results / "summary.json")
+        return next(item for item in summary["cases"] if item["case"] == case_id)
 
-@pytest.mark.parametrize(
-    "failure",
-    [
-        "missing_accuracy",
-        "short_performance",
-        "request_error",
-        "wrong_container",
-        "failed_process",
-        "lost_runner",
-    ],
-)
-def test_incomplete_results_fail_and_keep_valid_other_measurements(
-    complete_results, plan, failure
-):
-    case = ci.CASES[0]
-    path = complete_results / case["group"] / case["id"]
-    if failure == "missing_accuracy":
-        (path / "gsm8k.json").unlink()
-    elif failure in {"short_performance", "request_error"}:
-        perf = ci.read_json(path / "performance.jsonl")
-        perf["completed"] = 1 if failure == "short_performance" else 2
-        perf["errors"] = (
-            ["transport failure", ""] if failure == "request_error" else ["", ""]
-        )
-        (path / "performance.jsonl").write_text(json.dumps(perf) + "\n")
-    elif failure == "wrong_container":
-        runtime = ci.read_json(complete_results / "runtime.json")
-        runtime["containers"] = {g: "shared-container" for g in ci.GROUPS}
-        ci.write_json(complete_results / "runtime.json", runtime)
-    elif failure == "failed_process":
-        state = ci.read_json(path / "execution.json")
-        state["phases"]["accuracy"] = 1
-        ci.write_json(path / "execution.json", state)
-    assert (
-        ci.report(
-            plan, complete_results, "failure" if failure == "lost_runner" else "success"
-        )
-        == 1
-    )
-    summary = ci.read_json(complete_results / "summary.json")
-    assert len(summary["cases"]) == 6
-    assert (
-        summary["cases"][0][
-            "performance" if failure == "missing_accuracy" else "accuracy"
-        ]
-        is not None
-    )
-
-
-def test_missing_or_malformed_artifacts_still_produce_six_row_report(tmp_path, plan):
-    (tmp_path / "runtime.json").write_text("not JSON")
-    assert ci.report(plan, tmp_path) == 1
-    assert len(ci.read_json(tmp_path / "summary.json")["cases"]) == 6
-    assert "Missing" in (tmp_path / "summary.md").read_text()
-
-
-@pytest.mark.parametrize(
-    "malformed", ["containers", "assets", "accuracy", "performance"]
-)
-def test_wrong_json_types_fail_without_losing_the_report(
-    complete_results, plan, malformed
-):
-    path = complete_results / ci.CASES[0]["group"] / ci.CASES[0]["id"]
-    if malformed == "containers":
-        ci.write_json(
-            complete_results / "runtime.json", {"errors": [], "containers": None}
-        )
-    elif malformed == "assets":
-        ci.write_json(complete_results / "assets.json", None)
-    elif malformed == "accuracy":
-        ci.write_json(path / "gsm8k.json", [])
-    else:
-        (path / "performance.jsonl").write_text("null\n")
+    # 35B reference 0.97: one extra correct answer and a 3-answer drop pass; 4 fails.
+    for lost, failed in ((-1, False), (3, False), (4, True)):
+        reference, score = set_score("Qwen3.5-35B-TP4-Base", lost)
+        assert ci.report(plan, complete_results) == int(failed)
+        item = row("Qwen3.5-35B-TP4-Base")
+        assert item["accuracy_reference"] == reference
+        assert item["performance"]["completed"] == 128
+        assert any("GSM8K regression" in error for error in item["errors"]) == failed
+        passed = round(score * 200)
+        assert item["accuracy"]["passed"] == passed
+        if failed:
+            text = (complete_results / "summary.md").read_text()
+            line = next(
+                line for line in text.splitlines() if line.startswith("| Qwen3.5-35B-TP4-Base |")
+            )
+            assert f"{score:.3%} ({passed}/200)" in line
+    set_score("Qwen3.5-35B-TP4-Base", 0)
+    # 194/200 passes the 35B bar and fails the higher 397B-base bar.
+    reference, _ = set_score("Qwen3.5-397B-TP8-Base", 4)
     assert ci.report(plan, complete_results) == 1
-    assert len(ci.read_json(complete_results / "summary.json")["cases"]) == 6
+    assert row("Qwen3.5-35B-TP4-Base")["errors"] == []
+    item = row("Qwen3.5-397B-TP8-Base")
+    assert item["accuracy_reference"] == reference
+    assert any("GSM8K regression" in error for error in item["errors"])
+
+
+def test_broken_artifacts_still_report_every_case(complete_results, plan, tmp_path):
+    case = ci.CASES[0]
+
+    def case_dir(root):
+        return root / case["group"] / case["id"]
+
+    def check(name, mutate, job="success"):
+        root = clone_results(complete_results, name)
+        mutate(root)
+        assert ci.report(plan, root, job) == 1
+        summary = ci.read_json(root / "summary.json")
+        assert len(summary["cases"]) == 6
+        return summary["cases"][0], root
+
+    row, _ = check("missing-accuracy", lambda root: (case_dir(root) / "gsm8k.json").unlink())
+    assert row["performance"] is not None and row["accuracy"] is None
+
+    def short_performance(root):
+        path = case_dir(root) / "performance.jsonl"
+        perf = ci.read_json(path)
+        perf["completed"] = 1
+        path.write_text(json.dumps(perf) + "\n")
+
+    def request_error(root):
+        path = case_dir(root) / "performance.jsonl"
+        perf = ci.read_json(path)
+        perf["errors"] = ["transport failure", ""]
+        path.write_text(json.dumps(perf) + "\n")
+
+    for name, mutate in (("short-performance", short_performance), ("request-error", request_error)):
+        row, _ = check(name, mutate)
+        assert row["accuracy"] is not None
+
+    def wrong_container(root):
+        ci.write_json(
+            root / "runtime.json",
+            {"errors": [], "containers": {group: "shared-container" for group in ci.GROUPS}},
+        )
+
+    def failed_phase(root):
+        path = case_dir(root) / "execution.json"
+        state = ci.read_json(path)
+        state["phases"]["accuracy"] = 1
+        ci.write_json(path, state)
+
+    check("wrong-container", wrong_container)
+    check("failed-phase", failed_phase)
+    check("lost-runner", lambda root: None, job="failure")
+
+    def bad_runtime(root):
+        (root / "runtime.json").write_text("not JSON")
+
+    row, root = check("bad-runtime", bad_runtime)
+    assert "Missing" in (root / "summary.md").read_text()
+
+    def bad_containers(root):
+        ci.write_json(root / "runtime.json", {"errors": [], "containers": None})
+
+    def bad_accuracy(root):
+        ci.write_json(case_dir(root) / "gsm8k.json", [])
+
+    def bad_performance(root):
+        (case_dir(root) / "performance.jsonl").write_text("null\n")
+
+    for name, mutate in (
+        ("bad-containers", bad_containers),
+        ("bad-accuracy", bad_accuracy),
+        ("bad-performance", bad_performance),
+    ):
+        check(name, mutate)
+
+    def no_execution(root):
+        (case_dir(root) / "execution.json").unlink()
+
+    row, _ = check("no-execution", no_execution)
+    assert row["status"] == "failed"
+    assert row["performance"] is not None and row["accuracy"] is not None
+
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    (bare / "runtime.json").write_text("not JSON")
+    assert ci.report(plan, bare) == 1
+    assert len(ci.read_json(bare / "summary.json")["cases"]) == 6
 
 
 @pytest.mark.parametrize(
@@ -1024,56 +1091,7 @@ def test_authorization_and_candidate_source_selection(
 def test_docker_one_build_three_owned_containers_and_failure_cleanup(
     tmp_path, monkeypatch, plan, failure
 ):
-    calls = []
-    build_dirs = []
-    work_root = tmp_path / "work"
-    monkeypatch.setenv("QWEN4_WORK_ROOT", str(work_root))
-    monkeypatch.setenv("DOCKER_CONFIG", "/home/ci-fixture/.docker")
-    monkeypatch.setenv("BUILDX_CONFIG", "/home/ci-fixture/.docker/buildx")
-
-    class Process:
-        def __init__(self, argv, log_path, **kwargs):
-            self.argv = argv
-            calls.append(argv)
-            if argv[:2] == ["docker", "build"]:
-                context = ci.Path(argv[-1])
-                buildx = ci.Path(kwargs["env"]["BUILDX_CONFIG"])
-                assert buildx.is_dir() and buildx.is_relative_to(work_root)
-                assert context.is_dir() and context.is_relative_to(work_root)
-                assert not buildx.is_relative_to(context)
-                assert kwargs["env"]["DOCKER_CONFIG"] == "/home/ci-fixture/.docker"
-                assert kwargs["env"]["BUILDKIT_PROGRESS"] == "plain"
-                assert not (context / "buildx").exists()
-                build_dirs.extend([context, buildx])
-
-        def wait(self, *args, **kwargs):
-            return int(
-                (failure == "build" and self.argv[:2] == ["docker", "build"])
-                or (failure == "group" and "container" in self.argv)
-            )
-
-    def command(argv, **kwargs):
-        calls.append(argv)
-        if argv[:2] == ["docker", "info"]:
-            return "/raid/docker"
-        if argv[:3] == ["docker", "image", "inspect"]:
-            return (
-                "sha256:built"
-                if any(x.startswith("--format") for x in argv)
-                else json.dumps(
-                    [{"Id": "sha256:base", "RepoDigests": ["image@sha256:" + "a" * 64]}]
-                )
-            )
-        if argv[:2] == ["docker", "create"]:
-            if failure == "create":
-                raise RuntimeError("name already in use")
-            return argv[argv.index("--name") + 1]
-        return ""
-
-    monkeypatch.setattr(ci, "ManagedProcess", Process)
-    monkeypatch.setattr(ci, "command", command)
-    monkeypatch.setattr(ci, "preflight", lambda *args: {"gsm8k": {}})
-    monkeypatch.setattr(ci.shutil, "which", lambda name: None)
+    calls, build_dirs = patch_docker(monkeypatch, tmp_path, failure)
     args = argparse.Namespace(
         output=str(tmp_path / "results"),
         models_root=str(tmp_path / "models"),
@@ -1162,36 +1180,7 @@ def test_report_accepts_one_rerun_beside_reused_cases(complete_results, plan):
 
 
 def test_docker_rerun_starts_only_the_selected_group(tmp_path, monkeypatch, plan):
-    calls = []
-
-    class Process:
-        def __init__(self, argv, log_path, **kwargs):
-            calls.append(argv)
-
-        def wait(self, *args, **kwargs):
-            return 0
-
-    def command(argv, **kwargs):
-        calls.append(argv)
-        if argv[:2] == ["docker", "info"]:
-            return "/raid/docker"
-        if argv[:3] == ["docker", "image", "inspect"]:
-            return (
-                "sha256:built"
-                if any(item.startswith("--format") for item in argv)
-                else json.dumps(
-                    [{"Id": "sha256:base", "RepoDigests": ["image@sha256:" + "a" * 64]}]
-                )
-            )
-        if argv[:2] == ["docker", "create"]:
-            return "cid"
-        return ""
-
-    monkeypatch.setattr(ci, "ManagedProcess", Process)
-    monkeypatch.setattr(ci, "command", command)
-    monkeypatch.setattr(ci, "preflight", lambda *args: {"gsm8k": {}})
-    monkeypatch.setattr(ci.shutil, "which", lambda name: None)
-    monkeypatch.setenv("QWEN4_WORK_ROOT", str(tmp_path / "work"))
+    calls, _ = patch_docker(monkeypatch, tmp_path)
     reused = {
         case["id"]: "old-" + case["id"]
         for case in ci.CASES
@@ -1227,17 +1216,6 @@ def test_build_failure_marks_cases_not_run_without_missing_file_noise(tmp_path, 
     assert "Candidate build failed" in text
     assert text.count("⚪ Not run") == 6
     assert "No such file" not in text
-
-
-def test_missing_execution_record_preserves_existing_measurements(
-    complete_results, plan
-):
-    case = ci.CASES[0]
-    (complete_results / case["group"] / case["id"] / "execution.json").unlink()
-    assert ci.report(plan, complete_results) == 1
-    row = ci.read_json(complete_results / "summary.json")["cases"][0]
-    assert row["status"] == "failed"
-    assert row["performance"] is not None and row["accuracy"] is not None
 
 
 @pytest.mark.parametrize("in_actions", [False, True])

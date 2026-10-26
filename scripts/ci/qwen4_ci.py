@@ -452,6 +452,14 @@ def validate_performance(path, prompts, output_tokens, profiling=False, speculat
     return data
 
 
+def gsm8k_passed(score, scored):
+    """Correct answers implied by a mean of per-example 0/1 scores."""
+    passed = int(round(score * scored))
+    if passed < 0 or passed > scored or abs(score * scored - passed) > 1e-6:
+        raise ValueError("GSM8K score does not match a whole number of correct answers")
+    return passed
+
+
 def validate_accuracy(path, examples):
     data = read_json(path)
     for key in ["requested", "scored", "completed"]:
@@ -460,6 +468,7 @@ def validate_accuracy(path, examples):
     if type(data.get("errors")) is not int or data["errors"] != 0:
         raise ValueError("GSM8K has terminal request errors")
     number(data.get("score"), "GSM8K score", maximum=1)
+    data["passed"] = gsm8k_passed(data["score"], data["scored"])
     report = Path(path).with_name("gsm8k.html")
     if not report.is_file() or report.stat().st_size == 0:
         raise ValueError("GSM8K HTML report is missing")
@@ -1650,7 +1659,7 @@ def report(plan, output, job_result="success"):
                         "accept_length",
                     ]
                     if phase == "performance"
-                    else ["score", "scored", "completed"]
+                    else ["score", "passed", "scored", "completed"]
                 )
                 row[phase] = {key: data.get(key) for key in keys}
             except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
@@ -1700,7 +1709,7 @@ def report(plan, output, job_result="success"):
         ]
         accept = p.get("accept_length") if p else None
         metrics.append(f"{accept:.3f}" if isinstance(accept, (int, float)) else "—")
-        accuracy = f"{a['score']:.3%} ({a['scored']}/{examples})" if a else "—"
+        accuracy = f"{a['score']:.3%} ({a['passed']}/{examples})" if a else "—"
         completed = f"{p['completed']}/{prompts}" if p else "—"
         threshold = (
             "Diagnostic"
