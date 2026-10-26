@@ -2749,8 +2749,8 @@ class ServerArgs:
         "at batch >= 64). KDA uses its selected Triton or Helion implementation, "
         "but its per-K gate ring is larger and ReplaySSM is typically slower "
         "than packed KDA decode; benchmark before enabling it. Requires the "
-        "Triton linear-attn decode backend, or Helion for KDA, and "
-        "--mamba-radix-cache-strategy no_buffer (the default).",
+        "Triton linear-attn decode backend, or Helion for KDA. GDN supports "
+        "radix extra_buffer; KDA requires no_buffer. Non-speculative decode only.",
         NS("exec.mamba"),
     ] = False
     linear_replayssm_cache_len: A[
@@ -6834,6 +6834,12 @@ class ServerArgs:
         # with an empty ring. KDA does not yet wire tracking force-flush, so
         # its extra_buffer snapshots would omit pending ring entries.
         if cfg.enable_linear_replayssm:
+            if cfg.speculative_algorithm:
+                raise ValueError(
+                    "--enable-linear-replayssm only supports non-speculative "
+                    "decode. Use --enable-linear-replayssm-spec for speculative "
+                    "target verification instead."
+                )
             if decode not in {"triton", "helion"}:
                 raise ValueError(
                     "--enable-linear-replayssm requires Triton, or Helion for "

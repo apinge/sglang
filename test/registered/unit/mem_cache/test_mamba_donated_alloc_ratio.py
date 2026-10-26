@@ -256,7 +256,7 @@ class TestPPMambaPoolSizing(unittest.TestCase):
     BUDGET_GB = 8.0
 
     @classmethod
-    def _pool_size(cls, pp_rank, pp_size):
+    def _pool_size(cls, pp_rank, pp_size, *, replay=False):
         from sglang.srt import runtime_context as rc
         from sglang.srt.configs.mamba_utils import (
             Mamba2CacheParams,
@@ -302,9 +302,14 @@ class TestPPMambaPoolSizing(unittest.TestCase):
             max_running_requests=None,
             mamba_full_memory_ratio=0.5,
             enable_linear_replayssm_spec=False,
+            enable_linear_replayssm=replay,
+            linear_replayssm_cache_len=64,
         ):
             KVCacheConfigurator._handle_max_mamba_cache(fake, cls.BUDGET_GB)
             return get_schedule().max_mamba_cache_size
+
+    def test_decode_replay_ring_is_charged_to_the_slot_budget(self):
+        self.assertLess(self._pool_size(0, 1, replay=True), self._pool_size(0, 1))
 
     def test_stage_is_not_charged_for_the_whole_model(self):
         solo = self._pool_size(0, 1)

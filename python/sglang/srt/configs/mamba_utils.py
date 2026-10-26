@@ -124,6 +124,23 @@ class BaseLinearStateParams(ABC):
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
 
+    def replayssm_decode_ring_bytes_per_req(self, record_len: int) -> int:
+        """Ordinary decode d/k/g bytes per physical state slot, all layers.
+
+        Decode d/k follow the SSM dtype, unlike the speculative raw-input
+        window. The single per-slot cursor is charged separately by the solver.
+        """
+        hv, v_dim, k_dim = self.shape.temporal
+        h_k = self.shape.num_k_heads_per_tp
+        return (
+            record_len
+            * len(self.layers)
+            * (
+                (hv * v_dim + h_k * k_dim) * self.dtype.temporal.itemsize
+                + hv * (k_dim if self.is_kda else 1) * torch.float32.itemsize
+            )
+        )
+
     def replayssm_ring_bytes_per_req(self, record_len: int) -> int:
         """Per-slot bytes of the ReplaySSM spec-verify fold window (all
         layers). Not part of ``mamba_cache_per_req``, so the memory solver
