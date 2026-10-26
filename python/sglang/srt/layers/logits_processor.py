@@ -27,6 +27,7 @@ from sglang.kernels.ops.activation.softcap import (
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStates,
     pack_aux_hidden_states,
@@ -57,6 +58,8 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.sampling.sampling_observer import DeviceAuxiliaryOutput
 from sglang.srt.utils.common import (
     is_cpu,
+    is_gfx942_supported,
+    is_hip,
     is_npu,
     is_pin_memory_available,
     use_intel_amx_backend,
@@ -66,6 +69,12 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+
+if is_hip():
+    from sglang.kernels.ops.gemm.rocm_bf16_gemv import (
+        rocm_bf16_gemv,
+        use_rocm_bf16_gemv,
+    )
 
 _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedEmbeddingMethod",
@@ -306,6 +315,10 @@ class LogitsProcessor(nn.Module):
             get_parallel().config.enable_tp_lm_head_all_to_all
         )
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head
+        # Kernel configs were tuned on MI308X; other ROCm archs keep hipBLASLt.
+        self.use_rocm_lm_head_gemv = (
+            is_gfx942_supported() and envs.SGLANG_ENABLE_ROCM_LM_HEAD_GEMV.get()
+        )
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size
             self.do_tensor_parallel_all_gather = (
@@ -757,9 +770,13 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
+                hidden_states = hidden_states.to(lm_head.weight.dtype)
+                if self.use_rocm_lm_head_gemv and use_rocm_bf16_gemv(
+                    hidden_states, lm_head.weight
+                ):
+                    logits = rocm_bf16_gemv(hidden_states, lm_head.weight)
+                else:
+                    logits = torch.matmul(hidden_states, lm_head.weight.T)
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models
