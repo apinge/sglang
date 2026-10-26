@@ -125,6 +125,7 @@ command=(
   --max-running-requests "${MAX_RUNNING_REQUESTS}"
   --cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE}"
   --mamba-ssm-dtype "${MAMBA_SSM_DTYPE}"
+  --linear-attn-prefill-backend aiter
   # --speculative-algorithm NEXTN
   # --speculative-num-steps 3
   # --speculative-eagle-topk 1
