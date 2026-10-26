@@ -416,7 +416,9 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "helion",
     "intel_xpu",
 ]
-LINEAR_ATTN_PREFILL_BACKEND_CHOICES = LINEAR_ATTN_KERNEL_BACKEND_CHOICES + ["aiter"]
+LINEAR_ATTN_PREFILL_BACKEND_CHOICES = list(
+    dict.fromkeys([*LINEAR_ATTN_KERNEL_BACKEND_CHOICES, "aiter"])
+)
 
 
 # Allow external code to add more choices
@@ -481,8 +483,11 @@ def add_rl_on_policy_target_choices(choices):
 
 
 def add_linear_attn_kernel_backend_choices(choices):
-    LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
-    LINEAR_ATTN_PREFILL_BACKEND_CHOICES.extend(choices)
+    for choice in choices:
+        if choice not in LINEAR_ATTN_KERNEL_BACKEND_CHOICES:
+            LINEAR_ATTN_KERNEL_BACKEND_CHOICES.append(choice)
+        if choice not in LINEAR_ATTN_PREFILL_BACKEND_CHOICES:
+            LINEAR_ATTN_PREFILL_BACKEND_CHOICES.append(choice)
 
 
 @dataclasses.dataclass
