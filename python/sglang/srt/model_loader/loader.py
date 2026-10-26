@@ -88,6 +88,7 @@ from sglang.srt.layers.moe.utils import (
     install_shared_experts_fusion_decision,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     check_nccl_transfer_manifest,
     get_nccl_transfer_tensors,
@@ -111,7 +112,6 @@ from sglang.srt.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     fastsafetensors_weights_iterator,
-    time_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
     get_gguf_extra_tensor_names,
@@ -125,6 +125,7 @@ from sglang.srt.model_loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
     set_runai_streamer_env,
+    time_weights_iterator,
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
@@ -3339,6 +3340,17 @@ class RemoteInstanceModelLoader(BaseModelLoader):
 
         return model.eval()
 
+    @staticmethod
+    def _restore_derived_state(model: nn.Module) -> None:
+        # Raw copies bypass weight_loader hooks that fill derived buffers (gemma_weight).
+        PreshardedModelLoader._rebind_parameter_aliases(model)
+        for _, module in model.named_modules():
+            if isinstance(getattr(module, "quant_method", None), BaseKVCacheMethod):
+                # The floats were set from the -1 placeholders before receiving; the
+                # received k/v_scale tensors are the seed's final (fnuz-adjusted) values.
+                module.k_scale_float = module.k_scale.item()
+                module.v_scale_float = module.v_scale.item()
+
     def load_model_from_remote_instance_by_nccl(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
     ) -> nn.Module:
@@ -3389,8 +3401,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 )
             current_platform.synchronize()
 
-            # Raw copies bypass weight_loader hooks that fill derived buffers (gemma_weight).
-            PreshardedModelLoader._rebind_parameter_aliases(model)
+            self._restore_derived_state(model)
             _post_load_weights(model)
         end_get_weights_tic = time.time()
         logger.debug(
@@ -3454,7 +3465,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             logger.error(f"batch transfer failed, error: {ret}")
             return False
 
-        PreshardedModelLoader._rebind_parameter_aliases(model)
+        self._restore_derived_state(model)
         _post_load_weights(model)
 
         return True
