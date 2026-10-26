@@ -1,6 +1,7 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
 import math
+import re
 from contextlib import nullcontext
 from typing import Any, Iterable, Optional, Set, Tuple
 
@@ -72,6 +73,8 @@ _QWEN4_EXP_FUSED_SHARED_EXPERT_MAPPING = (
     ("up_proj", "w13", "w3"),
     ("down_proj", "w2", "w2"),
 )
+
+_EXPERT_ID_IN_NAME = re.compile(r"experts\.(\d+)\.")
 
 
 def _qwen4_exp_fused_shared_expert_mapping(
@@ -1842,6 +1845,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if num_experts is not None
             else []
         )
+        # The checkpoint has one tensor per expert; scanning the whole mapping
+        # for each of them dominates load time with hundreds of experts.
+        expert_params_by_id = {}
+        for mapping in expert_params_mapping:
+            expert_params_by_id.setdefault(mapping[2], []).append(mapping)
         fused_expert_params_mapping = [
             ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
@@ -2083,7 +2091,15 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 current_expert_params_mapping = (
                     fused_expert_params_mapping
                     if is_fused_expert
-                    else expert_params_mapping
+                    # Every entry whose weight_name is in name, in list order;
+                    # the loop below still checks weight_name.
+                    else [
+                        mapping
+                        for expert_id in sorted(
+                            {int(i) for i in _EXPERT_ID_IN_NAME.findall(name)}
+                        )
+                        for mapping in expert_params_by_id.get(expert_id, ())
+                    ]
                 )
                 for mapping in current_expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
