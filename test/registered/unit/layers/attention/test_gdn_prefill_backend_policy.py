@@ -232,7 +232,10 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         backend = object.__new__(GDNAttnBackend)
         backend.device = "cpu"
         backend.kernel_dispatcher = SimpleNamespace(
-            extend_uses_state_checkpoints=True, extend_kernel=TritonGDNKernel()
+            extend_uses_state_checkpoints=True,
+            # The test only requires that extend_kernel is *not* an AiterGDNKernel;
+            # avoid constructing a real kernel object in a unit test.
+            extend_kernel=sentinel.extend_kernel,
         )
         metadata = SimpleNamespace(has_mamba_track_mask=True, track_ssm_h_src=None)
         forward_batch = SimpleNamespace(
