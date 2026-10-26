@@ -1154,9 +1154,10 @@ def fastsafetensors_weights_iterator(
         # The broadcasts run on a dedicated group so its NCCL communicator can
         # be destroyed after loading; on the default group it would stay
         # allocated for the life of the process and shrink the KV cache.
+        all_local = envs.SGLANG_FASTSAFETENSORS_ALL_LOCAL.get()
         load_pg = (
             torch.distributed.new_group(backend="nccl")
-            if torch.distributed.is_initialized()
+            if torch.distributed.is_initialized() and not all_local
             else pg
         )
         loader = ParallelLoader(
@@ -1166,6 +1167,7 @@ def fastsafetensors_weights_iterator(
             nogds=not enable_gds,
             max_batch_bytes=int(max_batch_gib * (1 << 30)),
             use_tqdm_on_load=rank == 0,
+            all_local=all_local,
         )
         try:
             yield from loader.iterate_weights()
