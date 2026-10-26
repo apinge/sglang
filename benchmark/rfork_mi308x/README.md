@@ -114,6 +114,30 @@ Cold page cache (only affects phase 3a of disk loading; kernel cache warm): defa
 (+9.9 s); fastsafetensors (nogds) 65.0 s cold (-7.3 s vs default cold); runai_streamer (libaio_direct) 66.9 s cold
 (-5.4 s, but +34 GB GPU memory per rank). R-Fork does not read the disk, so it is unaffected.
 
+## TP2 results (2026-10-26, PR branch `rfork-rocm-mi308x-pr`)
+Seed on GPU4-5, client on GPU6-7. The launch script uses `--mem-fraction-static 0.95` for TP2 (resolved 0.8075).
+Each rank holds about 110 GB of weights. Page cache and kernel cache are warm.
+
+| | Disk | R-Fork `nccl` | R-Fork `transfer_engine` (hip) |
+|---|---|---|---|
+| Checksums vs seed | - | 1503/1503 match on 2 ranks | 1503/1503 match on 2 ranks |
+| gsm8k (1 run) | 0.9802 | 0.9787 | not run |
+| load_weight (2 runs) | 72.7 / 77.3 s | 8.9 / 8.8 s | 7.7 / 7.6 s |
+| Launch -> ready, wall (2 runs) | 131.3 / 136.4 s | 68.2 / 68.2 s | 67.1 / 65.2 s |
+
+Mean per-phase times (s): process start 14.9 / 15.7 / 14.2; init until weight load 25.5 / 25.0 / 25.5 (dist init
+8.8 / 8.1 / 8.4); weight load excl. PyHIP warmup 70.9 / 5.3 / 4.1; PyHIP warmup 4.1 / 3.6 / 3.6; graph capture
+10.6 / 10.4 / 10.4; rest 7.9 / 8.3 / 8.5.
+
+- Disk loading gets slower at lower TP: every rank still walks all 149k tensors and keeps twice the data.
+  R-Fork's transfer barely changes (110 GB per rank in 4-5 s over XGMI), so it saves more at TP2 (about 66 s) than at TP4 (about 50 s).
+- Robustness issue reproduced. On the first TP2 attempt, GPU2-3 were already occupied by another job, and the client OOMed
+  during model init. The client had already triggered the seed's `init_weights_send_group_for_remote_instance`, but
+  never reached its own `build_group`. The seed scheduler then blocked in the TCP rendezvous (`_create_c10d_store`,
+  default 30 min timeout) and its health check failed. A client that dies between triggering the seed and joining the
+  group therefore stalls the seed. Not fixed. Possible fixes: trigger the seed after model init, or use a short
+  rendezvous timeout on the seed side.
+
 ## 1. P2P weight pull: R-Fork over RCCL
 ### Usage
 ```bash
@@ -291,7 +315,7 @@ and the guard was not bypassed.
 - Process-weight post-processing on the client was only exercised on this model's quant/PyHIP path. Other models and
   quant schemes need checking (the checksum switch exposes problems).
 - Derived-buffer recompute relies on `_rebind_parameter_aliases` (gemma_weight and a few linear-attn aliases).
-- If an RCCL client dies after the send group is built, the seed can be left in a bad state (observed once, not fixed).
+- If an RCCL client dies after triggering the seed's send-group init but before joining, the seed scheduler blocks in the rendezvous for up to 30 min (reproduced at TP2, see above; not fixed).
 - Interference of a transfer with the seed's online requests was not measured.
 - The ROCm segment-registration workaround registers some non-weight memory in the seed's allocator segments for remote reads.
 - gsm8k was run once per configuration.
