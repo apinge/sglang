@@ -31,7 +31,7 @@ if [[ -z "${MEM_FRACTION_STATIC:-}" ]]; then
 fi
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
 # Persistent SSM state pool; the AITER per-chunk h snapshots remain BF16.
-# Preserve the current BF16 default; use float32 for the FP32-state control run.
+# Default to float32 for the FP32-state control run; set MAMBA_SSM_DTYPE=bfloat16 to use BF16.
 MAMBA_SSM_DTYPE="${MAMBA_SSM_DTYPE:-float32}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-32}"
 CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-32}"
