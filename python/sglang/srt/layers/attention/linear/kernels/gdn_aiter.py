@@ -108,7 +108,7 @@ def aiter_gdn_prefill_supported(q, k, v, g, beta, states, indices, cu) -> bool:
         or beta.shape != g.shape
         or states.ndim != 4
         or states.shape[1:] != (v.shape[2], 128, 128)
-        or states.dtype != torch.float32
+        or states.dtype not in (torch.float32, torch.bfloat16)
         or not states.is_contiguous()
         or states.stride()[-2:] != (128, 1)
         or indices.ndim != 1

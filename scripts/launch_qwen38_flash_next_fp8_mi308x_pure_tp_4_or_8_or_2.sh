@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Launch Qwen3.8-Flash-Next-FP8 with pure TP4 or TP8 on MI308X (gfx942).
+# Launch Qwen3.8-Flash-Next-FP8 with pure TP2/TP4/TP8 on MI308X (gfx942).
+# Examples (other settings stay the same):
+#   MAMBA_SSM_DTYPE=float32 bash scripts/launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2.sh
+#   MAMBA_SSM_DTYPE=bfloat16 bash scripts/launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,7 +30,9 @@ if [[ -z "${MEM_FRACTION_STATIC:-}" ]]; then
   fi
 fi
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
-#CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-8192}"
+# Persistent SSM state pool; the AITER per-chunk h snapshots remain BF16.
+# Preserve the current BF16 default; use float32 for the FP32-state control run.
+MAMBA_SSM_DTYPE="${MAMBA_SSM_DTYPE:-float32}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-32}"
 CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-32}"
 AITER_MOE_PADDING_SIZE="${AITER_MOE_PADDING_SIZE:-64}"
@@ -50,6 +55,14 @@ if [[ "${PLE_OFFLOAD_EMBEDDING}" != "0" && "${PLE_OFFLOAD_EMBEDDING}" != "1" ]];
   echo "PLE_OFFLOAD_EMBEDDING must be 0 or 1 (got ${PLE_OFFLOAD_EMBEDDING})." >&2
   exit 1
 fi
+
+case "${MAMBA_SSM_DTYPE}" in
+  float32|bfloat16) ;;
+  *)
+    echo "MAMBA_SSM_DTYPE must be float32 or bfloat16 for this AITER GDN setup (got ${MAMBA_SSM_DTYPE})." >&2
+    exit 1
+    ;;
+esac
 
 if (( DISABLE_RADIX_CACHE )); then
   ENABLE_CACHE_REPORT=0
@@ -88,6 +101,7 @@ export AITER_MOE_PADDING_SIZE
 printf 'GR read: installed PyHIP enabled=%s; TP=%s; AITER_MOE_PADDING_SIZE=%s; AITER_GDN_PREFILL=%s\n' \
   "${SGLANG_GR_READ_FLYDSL}" "${TP_SIZE}" "${AITER_MOE_PADDING_SIZE}" \
   "${SGLANG_USE_AITER_GDN_PREFILL}"
+printf 'SSM state dtype: %s (extra CLI arguments may override script defaults)\n' "${MAMBA_SSM_DTYPE}"
 # export CUDA_VISIBLE_DEVICES=4,5,6,7
 # export HIP_VISIBLE_DEVICES=4,5,6,7
 command=(
@@ -105,6 +119,7 @@ command=(
   --mem-fraction-static "${MEM_FRACTION_STATIC}"
   --max-running-requests "${MAX_RUNNING_REQUESTS}"
   --cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE}"
+  --mamba-ssm-dtype "${MAMBA_SSM_DTYPE}"
   # --speculative-algorithm NEXTN
   # --speculative-num-steps 3
   # --speculative-eagle-topk 1
