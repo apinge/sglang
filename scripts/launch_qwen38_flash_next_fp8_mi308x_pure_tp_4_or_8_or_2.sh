@@ -36,7 +36,8 @@ MAMBA_SSM_DTYPE="${MAMBA_SSM_DTYPE:-float32}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-32}"
 CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-32}"
 AITER_MOE_PADDING_SIZE="${AITER_MOE_PADDING_SIZE:-64}"
-export SGLANG_USE_AITER_GDN_PREFILL="${SGLANG_USE_AITER_GDN_PREFILL:-1}"
+# Select the public prefill backend; use triton for the control run.
+LINEAR_ATTN_PREFILL_BACKEND="${LINEAR_ATTN_PREFILL_BACKEND:-aiter}"
 DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-1}"
 # Report cache hits by default when radix caching is enabled.
 ENABLE_CACHE_REPORT="${ENABLE_CACHE_REPORT:-1}"
@@ -98,9 +99,9 @@ export SGLANG_USE_AITER=1
 export SGLANG_GR_READ_FLYDSL="${SGLANG_GR_READ_FLYDSL:-1}"
 export SGLANG_USE_PYHIP_QSA="${SGLANG_USE_PYHIP_QSA:-1}"
 export AITER_MOE_PADDING_SIZE
-printf 'GR read: installed PyHIP enabled=%s; TP=%s; AITER_MOE_PADDING_SIZE=%s; AITER_GDN_PREFILL=%s\n' \
+printf 'GR read: installed PyHIP enabled=%s; TP=%s; AITER_MOE_PADDING_SIZE=%s; LINEAR_ATTN_PREFILL_BACKEND=%s\n' \
   "${SGLANG_GR_READ_FLYDSL}" "${TP_SIZE}" "${AITER_MOE_PADDING_SIZE}" \
-  "${SGLANG_USE_AITER_GDN_PREFILL}"
+  "${LINEAR_ATTN_PREFILL_BACKEND}"
 printf 'SSM state dtype: %s (extra CLI arguments may override script defaults)\n' "${MAMBA_SSM_DTYPE}"
 # export CUDA_VISIBLE_DEVICES=4,5,6,7
 # export HIP_VISIBLE_DEVICES=4,5,6,7
@@ -113,6 +114,10 @@ command=(
   --tp-size "${TP_SIZE}"
   --attention-backend aiter
   --moe-runner-backend aiter
+  --linear-attn-backend triton
+  --linear-attn-decode-backend triton
+  --linear-attn-prefill-backend "${LINEAR_ATTN_PREFILL_BACKEND}"
+  --linear-attn-verify-backend triton
   --kv-cache-dtype auto
   --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}"
   --watchdog-timeout 1200

@@ -8,8 +8,8 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.kernels.gdn_aiter import AiterGDNKernel
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnBackends,
@@ -132,6 +132,13 @@ class GDNKernelDispatcher:
         prefill_backend: LinearAttnKernelBackend,
         verify_backend: Optional[LinearAttnKernelBackend] = None,
     ):
+        if decode_backend.is_aiter() or (
+            verify_backend is not None and verify_backend.is_aiter()
+        ):
+            raise ValueError(
+                "AITER GDN supports prefill only. Use "
+                "--linear-attn-prefill-backend aiter with Triton decode/verify."
+            )
         triton_kernel = TritonGDNKernel()
         self.tree_verify_kernel = triton_kernel
 
@@ -172,6 +179,12 @@ class GDNKernelDispatcher:
 
         if prefill_backend.is_triton():
             self.extend_kernel = triton_kernel
+        elif prefill_backend.is_aiter():
+            if not _is_hip:
+                rank0_log("AITER GDN prefill requires ROCm. Falling back to Triton.")
+                self.extend_kernel = triton_kernel
+            else:
+                self.extend_kernel = AiterGDNKernel(fallback_kernel=triton_kernel)
         elif prefill_backend.is_intel_xpu():
             if not is_xpu():
                 raise ValueError("--linear-attn-backend intel_xpu requires Intel XPU")
@@ -410,18 +423,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.forward_metadata.aiter_gdn_prefill_metadata = None
         if (
             _is_hip
-            and envs.SGLANG_USE_AITER_GDN_PREFILL.get()
-            and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+            and isinstance(self.kernel_dispatcher.extend_kernel, AiterGDNKernel)
             and not self.is_draft_worker
             and not self.enable_unified_memory
             and not get_memory().enable_page_major_kv_layout
         ):
-            from sglang.srt.layers.attention.linear.kernels.gdn_aiter import (
-                maybe_build_aiter_gdn_prefill_metadata,
-            )
-
             self.forward_metadata.aiter_gdn_prefill_metadata = (
-                maybe_build_aiter_gdn_prefill_metadata(
+                self.kernel_dispatcher.extend_kernel.build_prefill_metadata(
                     forward_batch, self.forward_metadata
                 )
             )
