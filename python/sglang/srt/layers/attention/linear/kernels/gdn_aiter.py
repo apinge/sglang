@@ -5,6 +5,9 @@ import logging
 
 import torch
 
+from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
+    LinearAttnKernelBase,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_hip
 
@@ -14,17 +17,18 @@ CHUNK_SIZE = 64
 
 @functools.lru_cache(maxsize=None)
 def _is_gfx942(device: torch.device) -> bool:
-    return (
-        is_hip()
-        and device.type == "cuda"
-        and torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
-        == "gfx942"
-    )
+    if not is_hip() or device.type != "cuda":
+        return False
+    arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+    if arch != "gfx942":
+        logger.warning("AITER GDN prefill requires gfx942; using Triton on %s.", arch)
+        return False
+    return True
 
 
 @functools.lru_cache(maxsize=1)
 def _aiter_ops():
-    # Lazy imports keep AITER/FlyDSL optional, including when the flag is off.
+    # Only the selected AITER backend loads these optional dependencies.
     try:
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
             chunk_gated_delta_rule_fwd_h_flydsl_opt,
@@ -58,7 +62,7 @@ def _aiter_ops():
     )
 
 
-def maybe_build_aiter_gdn_prefill_metadata(forward_batch, forward_metadata):
+def _build_prefill_metadata(forward_batch, forward_metadata, build_metadata):
     """Accept only eager ordinary prefill with real, unpadded request rows.
 
     The scheduler supplies valid physical state indices for these rows. K5
@@ -85,14 +89,11 @@ def maybe_build_aiter_gdn_prefill_metadata(forward_batch, forward_metadata):
         or sum(lengths) != forward_batch.input_ids.numel()
     ):
         return None
-    ops = _aiter_ops()
-    if ops is None:
-        return None
-    return ops[0](lengths, cu_seqlens=cu, chunk_size=CHUNK_SIZE)
+    return build_metadata(lengths, cu_seqlens=cu, chunk_size=CHUNK_SIZE)
 
 
 def aiter_gdn_prefill_supported(q, k, v, g, beta, states, indices, cu) -> bool:
-    """Check tensor metadata and AITER op availability.
+    """Check tensor metadata for the AITER prefill kernels.
 
     The forward metadata certifies real request rows.
     """
@@ -128,7 +129,6 @@ def aiter_gdn_prefill_supported(q, k, v, g, beta, states, indices, cu) -> bool:
         all(t.device == q.device for t in tensors)
         and all(t.dtype == torch.bfloat16 for t in (q, k, v))
         and all(t.is_contiguous() for t in (q, k, v, g, beta, indices, cu))
-        and _aiter_ops() is not None
     )
 
 
@@ -137,22 +137,24 @@ def _log_use():
     logger.info("Using AITER FlyDSL GDN prefill (chunk size 64).")
 
 
-def aiter_gdn_prefill(
-    q, k, v, g, beta, *, ssm_states, cache_indices, query_start_loc, prefill_metadata
+def _run_aiter_gdn_prefill(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    *,
+    ssm_states,
+    cache_indices,
+    query_start_loc,
+    prefill_metadata,
+    ops,
+    l2norm,
 ):
-    from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
-
-    ops = _aiter_ops()
-    if ops is None:
-        raise RuntimeError(
-            "AITER GDN prefill was requested but AITER ops are unavailable "
-            "(import failed or AITER not installed). Install AITER with FlyDSL "
-            "GDN K5 opt support or use the Triton path instead."
-        )
     _, prepare, recurrent, output = ops
     _log_use()
-    q = l2norm_fwd(q)
-    k = l2norm_fwd(k)
+    q = l2norm(q)
+    k = l2norm(k)
     w, u, g_cumsum = prepare(
         k=k,
         v=v,
@@ -198,3 +200,78 @@ def aiter_gdn_prefill(
     # The live pool was updated in place; radix tracking consumes the BF16
     # state before each chunk, in flattened request/chunk order.
     return o, None, h
+
+
+class AiterGDNKernel(LinearAttnKernelBase):
+    """AITER GDN prefill, with Triton for unsupported batches and other modes.
+
+    Per-batch metadata belongs to ForwardMetadata, never to this instance.
+    The full chunk snapshots use the existing tracking protocol, rather than
+    the selective checkpoint protocol (uses_state_checkpoints stays False).
+    """
+
+    def __init__(self, fallback_kernel: LinearAttnKernelBase):
+        self.fallback_kernel = fallback_kernel
+        self._ops = _aiter_ops()
+        if self._ops is not None:
+            from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+
+            self._l2norm = l2norm_fwd
+
+    def build_prefill_metadata(self, forward_batch, forward_metadata):
+        if self._ops is None:
+            return None
+        return _build_prefill_metadata(forward_batch, forward_metadata, self._ops[0])
+
+    def decode(self, *args, **kwargs):
+        return self.fallback_kernel.decode(*args, **kwargs)
+
+    def target_verify(self, *args, **kwargs):
+        return self.fallback_kernel.target_verify(*args, **kwargs)
+
+    def extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        aiter_gdn_prefill_metadata=None,
+        **kwargs,
+    ) -> tuple:
+        if (
+            self._ops is None
+            or aiter_gdn_prefill_metadata is None
+            or not aiter_gdn_prefill_supported(
+                q, k, v, g, beta, ssm_states, cache_indices, query_start_loc
+            )
+        ):
+            return self.fallback_kernel.extend(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                **kwargs,
+            )
+        # Do not retry a failed launch: K5 may already have updated the pool.
+        return _run_aiter_gdn_prefill(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            prefill_metadata=aiter_gdn_prefill_metadata,
+            ops=self._ops,
+            l2norm=self._l2norm,
+        )

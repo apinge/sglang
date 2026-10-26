@@ -1,13 +1,13 @@
 """gfx942 GDN prefill: TP2/TP4 shapes, indexed state, and radix reuse."""
 
 import unittest
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.attention.linear.kernels import gdn_aiter, gdn_triton
@@ -33,8 +33,9 @@ class TestAiterGDNPrefill(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(42)
         self.kernel = TritonGDNKernel()
+        self.aiter_kernel = gdn_aiter.AiterGDNKernel(fallback_kernel=self.kernel)
 
-    def make_case(self, tp, lengths, zero_state=False):
+    def make_case(self, tp, lengths, zero_state=False, state_dtype=torch.float32):
         hg, h, t, n = 16 // tp, 48 // tp, sum(lengths), len(lengths)
         q = torch.randn(1, t, hg, 128, device="cuda", dtype=torch.bfloat16)
         k = torch.randn_like(q)
@@ -55,6 +56,7 @@ class TestAiterGDNPrefill(unittest.TestCase):
         pool += (row[:, None] - row[None, :] * 0.25) * 0.001
         if zero_state:
             pool[indices.long()] = 0
+        pool = pool.to(state_dtype)
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             batch_size=n,
@@ -63,7 +65,7 @@ class TestAiterGDNPrefill(unittest.TestCase):
             extend_seq_lens_cpu=lengths,
         )
         md = ForwardMetadata(query_start_loc=cu, mamba_cache_indices=indices)
-        meta = gdn_aiter.maybe_build_aiter_gdn_prefill_metadata(batch, md)
+        meta = self.aiter_kernel.build_prefill_metadata(batch, md)
         self.assertIsNotNone(meta)
         args = dict(
             q=q,
@@ -79,16 +81,15 @@ class TestAiterGDNPrefill(unittest.TestCase):
 
     def run_pair(self, args, pool):
         results = []
-        for enabled in (False, True):
+        for kernel in (self.kernel, self.aiter_kernel):
             state = pool.clone()
-            with envs.SGLANG_USE_AITER_GDN_PREFILL.override(enabled):
-                with patch.object(
-                    gdn_aiter, "aiter_gdn_prefill", wraps=gdn_aiter.aiter_gdn_prefill
-                ) as fly:
-                    output, final, snapshots = self.kernel.extend(
-                        **args, ssm_states=state
-                    )
-                    self.assertEqual(fly.call_count, int(enabled))
+            with patch.object(
+                gdn_aiter,
+                "_run_aiter_gdn_prefill",
+                wraps=gdn_aiter._run_aiter_gdn_prefill,
+            ) as fly:
+                output, final, snapshots = kernel.extend(**args, ssm_states=state)
+                self.assertEqual(fly.call_count, int(kernel is self.aiter_kernel))
             self.assertIsNone(final)
             self.assertEqual(snapshots.dtype, torch.bfloat16)
             results.append((output, state, snapshots))
@@ -122,20 +123,26 @@ class TestAiterGDNPrefill(unittest.TestCase):
         torch.testing.assert_close(pools[1], pools[0], atol=2e-2, rtol=2e-2)
 
     def test_prefill_and_decode(self):
-        for tp in (2, 4):
+        for tp, state_dtype in product((2, 4), (torch.float32, torch.bfloat16)):
             for lengths, zero in (
                 ([1], True),
                 ([63, 64, 65, 127, 128, 129], False),
                 ([8192], False),
             ):
-                with self.subTest(tp=tp, lengths=lengths, zero=zero):
-                    args, pool, _, _, A_log, dt_bias = self.make_case(tp, lengths, zero)
+                with self.subTest(
+                    tp=tp, lengths=lengths, zero=zero, state_dtype=state_dtype
+                ):
+                    args, pool, _, _, A_log, dt_bias = self.make_case(
+                        tp, lengths, zero, state_dtype
+                    )
                     results = self.run_pair(args, pool)
                     self.compare_decode(args, [r[1] for r in results], A_log, dt_bias)
 
     def test_radix_tracking_and_restore(self):
-        for tp in (2, 4):
-            args, pool, batch, md, A_log, dt_bias = self.make_case(tp, [64, 65, 129])
+        for tp, state_dtype in product((2, 4), (torch.float32, torch.bfloat16)):
+            args, pool, batch, md, A_log, dt_bias = self.make_case(
+                tp, [64, 65, 129], state_dtype=state_dtype
+            )
             batch.extend_seq_lens = torch.tensor([64, 65, 129], device="cuda")
             batch.extend_prefix_lens = torch.tensor([0, 64, 128], device="cuda")
             batch.mamba_track_mask = torch.ones(3, device="cuda", dtype=torch.bool)
@@ -161,30 +168,85 @@ class TestAiterGDNPrefill(unittest.TestCase):
                 state[args["cache_indices"].long()] = state[batch.mamba_track_indices]
             self.compare_decode(args, [r[1] for r in results], A_log, dt_bias)
 
+    def test_prefill_and_triton_verify(self):
+        for state_dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(state_dtype=state_dtype):
+                args, pool, _, _, A_log, dt_bias = self.make_case(
+                    2, [65, 129], state_dtype=state_dtype
+                )
+                results = self.run_pair(args, pool)
+                n, steps, hg, h = 2, 4, 8, 24
+                verify_args = dict(
+                    q=torch.randn(
+                        1, n * steps, hg, 128, device="cuda", dtype=torch.bfloat16
+                    ),
+                    k=torch.randn(
+                        1, n * steps, hg, 128, device="cuda", dtype=torch.bfloat16
+                    ),
+                    v=torch.randn(
+                        1, n * steps, h, 128, device="cuda", dtype=torch.bfloat16
+                    ),
+                    a=torch.randn(n * steps, h, device="cuda", dtype=torch.bfloat16),
+                    b=torch.randn(n * steps, h, device="cuda", dtype=torch.bfloat16),
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    cache_indices=args["cache_indices"],
+                    query_start_loc=torch.arange(
+                        0, (n + 1) * steps, steps, device="cuda", dtype=torch.int32
+                    ),
+                    intermediate_state_indices=torch.arange(
+                        n, device="cuda", dtype=torch.int32
+                    ),
+                    cache_steps=steps,
+                    retrieve_parent_token=None,
+                )
+                outputs, snapshots = [], []
+                for _, state, _ in results:
+                    before = state.clone()
+                    scratch = torch.zeros(
+                        n + 1, steps, h, 128, 128, device="cuda", dtype=state_dtype
+                    )
+                    outputs.append(
+                        self.kernel.target_verify(
+                            **verify_args,
+                            ssm_states=state,
+                            intermediate_states_buffer=scratch,
+                        )
+                    )
+                    snapshots.append(scratch[:n])
+                    self.assertTrue(torch.equal(state, before))
+                    self.assertEqual(torch.count_nonzero(scratch[n]).item(), 0)
+                for actual, expected in (
+                    (outputs[1], outputs[0]),
+                    (snapshots[1], snapshots[0]),
+                ):
+                    torch.testing.assert_close(
+                        actual.float(), expected.float(), atol=2e-2, rtol=2e-2
+                    )
+
     def test_metadata_created_once_for_layers(self):
         args, pool, batch, md, _, _ = self.make_case(2, [65])
         backend = object.__new__(GDNAttnBackend)
-        backend.kernel_dispatcher = SimpleNamespace(extend_kernel=self.kernel)
+        backend.kernel_dispatcher = SimpleNamespace(extend_kernel=self.aiter_kernel)
         backend.is_draft_worker = False
         backend.enable_unified_memory = False
         backend.forward_metadata = md
         with (
-            envs.SGLANG_USE_AITER_GDN_PREFILL.override(True),
             patch.object(MambaAttnBackendBase, "init_forward_metadata"),
             patch(
                 "sglang.srt.layers.attention.linear.gdn_backend.get_memory",
                 return_value=SimpleNamespace(enable_page_major_kv_layout=False),
             ),
             patch.object(
-                gdn_aiter,
-                "maybe_build_aiter_gdn_prefill_metadata",
-                wraps=gdn_aiter.maybe_build_aiter_gdn_prefill_metadata,
+                self.aiter_kernel,
+                "build_prefill_metadata",
+                wraps=self.aiter_kernel.build_prefill_metadata,
             ) as build,
         ):
             backend.init_forward_metadata(batch)
             args["aiter_gdn_prefill_metadata"] = md.aiter_gdn_prefill_metadata
             for _ in range(2):
-                self.kernel.extend(**args, ssm_states=pool.clone())
+                self.aiter_kernel.extend(**args, ssm_states=pool.clone())
             self.assertEqual(build.call_count, 1)
             self.assertIs(
                 md.aiter_gdn_prefill_metadata.layout.cu_seqlens, md.query_start_loc
@@ -195,46 +257,48 @@ class TestAiterGDNPrefill(unittest.TestCase):
         for mode in ForwardMode:
             if mode != ForwardMode.EXTEND:
                 batch.forward_mode = mode
-                self.assertIsNone(
-                    gdn_aiter.maybe_build_aiter_gdn_prefill_metadata(batch, md)
-                )
+                self.assertIsNone(self.aiter_kernel.build_prefill_metadata(batch, md))
         batch.forward_mode = ForwardMode.EXTEND
         batch._original_batch_size = 1
         md.mamba_cache_indices[-1] = -1
-        self.assertIsNone(gdn_aiter.maybe_build_aiter_gdn_prefill_metadata(batch, md))
+        self.assertIsNone(self.aiter_kernel.build_prefill_metadata(batch, md))
         batch._original_batch_size = None
         batch.input_ids = torch.zeros(130, device="cuda", dtype=torch.int64)
-        self.assertIsNone(gdn_aiter.maybe_build_aiter_gdn_prefill_metadata(batch, md))
+        self.assertIsNone(self.aiter_kernel.build_prefill_metadata(batch, md))
+        batch.input_ids = torch.zeros(129, device="cuda", dtype=torch.int64)
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
+            self.assertIsNone(self.aiter_kernel.build_prefill_metadata(batch, md))
+        for lengths in ([129], [129, 0], [130, -1]):
+            batch.extend_seq_lens_cpu = lengths
+            self.assertIsNone(self.aiter_kernel.build_prefill_metadata(batch, md))
 
-    def test_tensor_and_disabled_fallback(self):
+    def test_tensor_and_missing_metadata_fallback(self):
         args, pool, _, _, _, _ = self.make_case(2, [65])
         for change in (
             {"aiter_gdn_prefill_metadata": None},
             {"q": args["q"].to(torch.float16)},
             {"ssm_states": pool.transpose(-1, -2)},
-            {"ssm_states": pool.to(torch.bfloat16)},
+            {"ssm_states": pool.to(torch.float16)},
         ):
             call_args = dict(args, ssm_states=pool)
             call_args.update(change)
             with (
-                envs.SGLANG_USE_AITER_GDN_PREFILL.override(True),
                 patch.object(
                     gdn_triton,
                     "chunk_gated_delta_rule",
                     return_value=(None, None, None),
                 ) as old,
-                patch.object(gdn_aiter, "aiter_gdn_prefill") as fly,
+                patch.object(gdn_aiter, "_run_aiter_gdn_prefill") as fly,
             ):
-                self.kernel.extend(**call_args)
+                self.aiter_kernel.extend(**call_args)
                 old.assert_called_once()
                 fly.assert_not_called()
 
     def test_missing_aiter_falls_back(self):
         _, _, batch, md, _, _ = self.make_case(2, [65])
         with patch.object(gdn_aiter, "_aiter_ops", return_value=None):
-            self.assertIsNone(
-                gdn_aiter.maybe_build_aiter_gdn_prefill_metadata(batch, md)
-            )
+            kernel = gdn_aiter.AiterGDNKernel(fallback_kernel=self.kernel)
+        self.assertIsNone(kernel.build_prefill_metadata(batch, md))
 
     def test_gathered_pool_keeps_triton(self):
         args, pool, batch, md, A_log, dt_bias = self.make_case(2, [65])
@@ -270,10 +334,9 @@ class TestAiterGDNPrefill(unittest.TestCase):
         backend = object.__new__(GDNAttnBackend)
         backend.forward_metadata = md
         backend.req_to_token_pool = SimpleNamespace(mamba2_layer_cache=lambda _: cache)
-        backend.kernel_dispatcher = SimpleNamespace(extend=self.kernel.extend)
+        backend.kernel_dispatcher = SimpleNamespace(extend=self.aiter_kernel.extend)
         module = "sglang.srt.layers.attention.linear.gdn_backend"
         with (
-            envs.SGLANG_USE_AITER_GDN_PREFILL.override(True),
             patch(module + ".causal_conv1d_fn", side_effect=lambda x, *a, **kw: x),
             patch(
                 module + ".fused_qkv_split_gdn_prefill",
@@ -284,7 +347,7 @@ class TestAiterGDNPrefill(unittest.TestCase):
                 "chunk_gated_delta_rule",
                 return_value=(args["v"], None, None),
             ) as old,
-            patch.object(gdn_aiter, "aiter_gdn_prefill") as fly,
+            patch.object(gdn_aiter, "_run_aiter_gdn_prefill") as fly,
         ):
             backend.forward_extend(
                 layer,
