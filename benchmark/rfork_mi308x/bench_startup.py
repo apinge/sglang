@@ -1,19 +1,24 @@
 """Startup-time benchmark: launch the server under each optimization on/off combination
-and report per-phase timings.
+and report per-phase timings (results.csv, summary.md, logs/ under --out).
 
-Every measured instance runs on --gpus (default 4-7). R-Fork configs first start one seed
-on --seed-gpus (default 0-3) and leave it running until they are done.
+The TP size is len(--gpus). R-Fork configs first start one seed on --seed-gpus and keep
+it until they are done; seed and client ranges must be contiguous, same size, disjoint.
 
-    # full matrix, 1 repeat
-    python benchmark/rfork_mi308x/bench_startup.py --out /tmp/startup
-    # pick configs and cache states
-    python benchmark/rfork_mi308x/bench_startup.py --configs disk,rfork_nccl \\
-        --kernel-cache warm --page-cache warm --repeat 2 --out /tmp/startup
+    # TP4, everything, kernel cache warm, page cache warm and cold, 2 repeats
+    python benchmark/rfork_mi308x/bench_startup.py --prime --kernel-cache warm \
+        --repeat 2 --gpus 4,5,6,7 --seed-gpus 0,1,2,3 --out /tmp/startup_tp4
+    # TP2, selected configs
+    python benchmark/rfork_mi308x/bench_startup.py --configs disk,rfork_nccl \
+        --kernel-cache warm --page-cache warm --gpus 6,7 --seed-gpus 4,5 --out /tmp/tp2
+    # rebuild summary.md from existing logs
+    python benchmark/rfork_mi308x/bench_startup.py --reparse --out /tmp/startup_tp4
 
 Kernel cache: "warm" uses $HOME as is (run once beforehand to populate it, or pass
 --prime); "cold" gives each run an empty HOME, so FlyDSL/comgr/triton caches start empty.
-Page cache: "cold" drops only the model files' page cache (posix_fadvise) before the run;
+Page cache: before each run the model files are read in ("warm", >=99% resident) or
+dropped with posix_fadvise ("cold", <=1%); the run aborts if that state is not reached.
 R-Fork configs do not read the checkpoint, so they only run "warm".
+A launch is refused if any of its GPUs has more than 2 GiB in use.
 """
 
 import argparse
@@ -144,9 +149,15 @@ def parse_phases(log_path, start_epoch, ready_epoch):
 
 
 class Server:
-    def __init__(self, *, log_path, gpus, port, args, env, home=None, timeout=1200):
+    def __init__(
+        self, *, log_path, gpus, port, args, env, home=None, all_visible, timeout=1200
+    ):
+        assert_gpus_free(gpus)
         self.log_path = log_path
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        # A stale "fired up" from an earlier run would read as ready immediately.
+        if os.path.exists(log_path):
+            os.remove(log_path)
         run_env = dict(os.environ)
         run_env.pop("HIP_VISIBLE_DEVICES", None)
         run_env.pop("CUDA_VISIBLE_DEVICES", None)
@@ -159,8 +170,13 @@ class Server:
         )
         if home is not None:
             run_env["HOME"] = home
-        # All GPUs stay visible (Mooncake HIP IPC needs the peer device); place by base id.
-        cmd = ["bash", LAUNCH_SCRIPT, "--base-gpu-id", str(gpus[0]), *args]
+        if all_visible:
+            # Mooncake HIP IPC needs the peer device visible; place by base id.
+            cmd = ["bash", LAUNCH_SCRIPT, "--base-gpu-id", str(gpus[0]), *args]
+        else:
+            # fastsafetensors puts rank r on cuda:r, ignoring --base-gpu-id.
+            run_env["HIP_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
+            cmd = ["bash", LAUNCH_SCRIPT, *args]
         self.cmd = cmd
         self.start = time.time()
         self.proc = subprocess.Popen(
@@ -200,17 +216,50 @@ class Server:
         time.sleep(5)
 
 
-def evict_model(model_path):
+def assert_gpus_free(gpus, limit_bytes=2 << 30):
+    # Another job on the same GPUs skews every phase (and can OOM); refuse to measure.
+    info = json.loads(
+        subprocess.check_output(
+            ["rocm-smi", "--showmeminfo", "vram", "--json"], text=True
+        )
+    )
+    busy = {
+        g: int(info[f"card{g}"]["VRAM Total Used Memory (B)"])
+        for g in gpus
+        if int(info[f"card{g}"]["VRAM Total Used Memory (B)"]) > limit_bytes
+    }
+    if busy:
+        raise RuntimeError(f"GPUs in use by another job (bytes used): {busy}")
+
+
+def prepare_page_cache(model_path, state):
+    """Bring the model files' page cache to `state`; return residency before/after."""
     files = [
         os.path.join(model_path, f)
         for f in os.listdir(model_path)
         if os.path.isfile(os.path.join(model_path, f))
     ]
-    for f in files:
-        evict(f)
-    return sum(resident_bytes(f) for f in files) / sum(
-        os.path.getsize(f) for f in files
-    )
+
+    def residency():
+        return sum(resident_bytes(f) for f in files) / sum(
+            os.path.getsize(f) for f in files
+        )
+
+    before = residency()
+    if state == "cold":
+        for f in files:
+            evict(f)
+    elif before < 0.999:
+        # O_DIRECT loaders (fastsafetensors, runai) leave the cache cold; read it back.
+        buf = bytearray(16 << 20)
+        for f in files:
+            with open(f, "rb", buffering=0) as fh:
+                while fh.readinto(buf):
+                    pass
+    after = residency()
+    if (state == "cold" and after > 0.01) or (state == "warm" and after < 0.99):
+        raise RuntimeError(f"page cache not {state}: {after:.2%} resident")
+    return before, after
 
 
 def main():
@@ -259,13 +308,23 @@ def main():
     os.environ["MODEL_PATH"] = a.model_path
     os.makedirs(a.out, exist_ok=True)
 
+    if any(c.startswith("rfork") for c in configs):
+        # R-Fork places by --base-gpu-id with all GPUs visible, so ranges must be
+        # contiguous; ranks pair up one to one.
+        for g in (gpus, seed_gpus):
+            if g != list(range(g[0], g[0] + len(g))):
+                p.error(f"R-Fork needs contiguous GPU ids, got {g}")
+        if len(gpus) != len(seed_gpus) or set(gpus) & set(seed_gpus):
+            p.error("--gpus and --seed-gpus must have the same size and not overlap")
+
     runs = []
-    for name in configs:
+    # Repeats outermost, so repeats of one config are not back to back.
+    for r in range(a.repeat):
         for kc in a.kernel_cache.split(","):
             for pc in a.page_cache.split(","):
-                if name.startswith("rfork") and pc == "cold":
-                    continue
-                for r in range(a.repeat):
+                for name in configs:
+                    if name.startswith("rfork") and pc == "cold":
+                        continue
                     runs.append((name, kc, pc, r))
     # Seed-dependent runs last, so the seed occupies its GPUs only while needed.
     runs.sort(key=lambda x: x[0].startswith("rfork"))
@@ -291,7 +350,12 @@ def main():
     if a.prime:
         print("priming kernel caches ...", flush=True)
         s = Server(
-            log_path=f"{a.out}/logs/prime.log", gpus=gpus, port=a.port, args=[], env={}
+            log_path=f"{a.out}/logs/prime.log",
+            gpus=gpus,
+            port=a.port,
+            args=[],
+            env={},
+            all_visible=False,
         )
         s.stop()
 
@@ -313,6 +377,7 @@ def main():
                 port=a.seed_port,
                 args=seed_args,
                 env={"MOONCAKE_PROTOCOL": "hip"},
+                all_visible=True,
             )
             if seed.ready_epoch is None:
                 print("seed failed to start, see seed.log; skipping R-Fork configs")
@@ -326,8 +391,8 @@ def main():
         ]
         tag = f"{name}_kc-{kc}_pc-{pc}_r{r}"
         resident = None
-        if pc == "cold":
-            resident = evict_model(a.model_path)
+        if not name.startswith("rfork"):
+            resident = prepare_page_cache(a.model_path, pc)
         home = (
             tempfile.mkdtemp(prefix="sglang_home_", dir=a.out) if kc == "cold" else None
         )
@@ -339,6 +404,7 @@ def main():
             args=args,
             env=env,
             home=home,
+            all_visible=name.startswith("rfork"),
         )
         row = {
             "config": name,
@@ -348,7 +414,8 @@ def main():
             "ok": s.ready_epoch is not None,
         }
         if resident is not None:
-            row["resident_after_evict"] = round(resident, 4)
+            row["resident_before_prepare"] = round(resident[0], 4)
+            row["resident_at_launch"] = round(resident[1], 4)
         if row["ok"]:
             row.update(
                 {
