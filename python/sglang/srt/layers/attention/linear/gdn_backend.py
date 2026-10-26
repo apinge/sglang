@@ -407,6 +407,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        self.forward_metadata.aiter_gdn_prefill_metadata = None
         if (
             _is_hip
             and envs.SGLANG_USE_AITER_GDN_PREFILL.get()
