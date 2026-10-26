@@ -55,9 +55,6 @@ if (( DISABLE_RADIX_CACHE )); then
   ENABLE_CACHE_REPORT=0
 fi
 
-# export CUDA_VISIBLE_DEVICES=4,5,6,7
-# export HIP_VISIBLE_DEVICES=4,5,6,7
-
 python - "${TP_SIZE}" <<'PY'
 import sys
 
@@ -91,6 +88,8 @@ export AITER_MOE_PADDING_SIZE
 printf 'GR read: installed PyHIP enabled=%s; TP=%s; AITER_MOE_PADDING_SIZE=%s; AITER_GDN_PREFILL=%s\n' \
   "${SGLANG_GR_READ_FLYDSL}" "${TP_SIZE}" "${AITER_MOE_PADDING_SIZE}" \
   "${SGLANG_USE_AITER_GDN_PREFILL}"
+# export CUDA_VISIBLE_DEVICES=4,5,6,7
+# export HIP_VISIBLE_DEVICES=4,5,6,7
 command=(
   sglang serve
   --model-path "${MODEL_PATH}"
