@@ -92,7 +92,10 @@ def maybe_build_aiter_gdn_prefill_metadata(forward_batch, forward_metadata):
 
 
 def aiter_gdn_prefill_supported(q, k, v, g, beta, states, indices, cu) -> bool:
-    """Check tensor metadata only; the forward metadata certifies real rows."""
+    """Check tensor metadata and AITER op availability.
+
+    The forward metadata certifies real request rows.
+    """
     if q.ndim != 4 or k.shape != q.shape or v.ndim != 4:
         return False
     if (
@@ -125,6 +128,7 @@ def aiter_gdn_prefill_supported(q, k, v, g, beta, states, indices, cu) -> bool:
         all(t.device == q.device for t in tensors)
         and all(t.dtype == torch.bfloat16 for t in (q, k, v))
         and all(t.is_contiguous() for t in (q, k, v, g, beta, indices, cu))
+        and _aiter_ops() is not None
     )
 
 
