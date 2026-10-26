@@ -112,7 +112,7 @@ Where each saving comes from:
 
 Cold page cache (only affects phase 3a of disk loading; kernel cache warm): default loader 72.3 s cold vs 62.4 s warm
 (+9.9 s); fastsafetensors (nogds) 65.0 s cold (-7.3 s vs default cold); runai_streamer (libaio_direct) 66.9 s cold
-(-5.4 s, but +34 GB GPU memory per rank). R-Fork does not read the disk, so it is unaffected.
+(-5.4 s; +34 GB peak GPU memory per rank during load, released before KV allocation). R-Fork does not read the disk, so it is unaffected.
 
 ## TP2 results (2026-10-26, PR branch `rfork-rocm-mi308x-pr`)
 Seed on GPU4-5, client on GPU6-7. The launch script uses `--mem-fraction-static 0.95` for TP2 (resolved 0.8075).
@@ -284,8 +284,10 @@ Findings:
   (GDS on) it loads but is slower (113 s cold).
 - runai-model-streamer 0.17.0 fails on this kernel with `File access error` (its default `io_uring_direct` strategy).
   `libaio_direct` or `sync_buffered` work.
-- `disable-mmap` and `runai_streamer` leave about 34 GB more GPU memory in use per rank after loading (96 vs 62 GB),
-  which reduces KV-cache capacity. Not investigated further.
+- `disable-mmap` and `runai_streamer` leave about 34 GB more GPU memory in use per rank at the end of loading (96 vs 62 GB).
+  It is released before the KV pool is sized: free memory after the pool is the same (52.05 vs 52.00 GB), and so is
+  `max_total_num_tokens` (5,938,880 vs 5,939,200). So KV capacity is unaffected; only the load-time peak is higher,
+  which can OOM when other processes share the GPU.
 
 ## 5. Same-GPU resident weights (`weight_cache`)
 Standalone daemon started via `weight_cache_shim/sglang` (turns the launch script's `sglang serve ARGS` into
