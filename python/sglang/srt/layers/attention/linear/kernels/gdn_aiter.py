@@ -138,7 +138,14 @@ def aiter_gdn_prefill(
 ):
     from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 
-    _, prepare, recurrent, output = _aiter_ops()
+    ops = _aiter_ops()
+    if ops is None:
+        raise RuntimeError(
+            "AITER GDN prefill was requested but AITER ops are unavailable "
+            "(import failed or AITER not installed). Install AITER with FlyDSL "
+            "GDN K5 opt support or use the Triton path instead."
+        )
+    _, prepare, recurrent, output = ops
     _log_use()
     q = l2norm_fwd(q)
     k = l2norm_fwd(k)
