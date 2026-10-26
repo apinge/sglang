@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Launch Qwen3.8-Flash-Next-FP8 with pure TP4 or TP8 on MI308X (gfx942).
+# Launch Qwen3.8-Flash-Next-FP8 with pure TP2, TP4 or TP8 on MI308X (gfx942).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# Run the fork containing this script, including uninstalled development edits.
+export PYTHONPATH="${SCRIPT_DIR}/../python${PYTHONPATH:+:${PYTHONPATH}}"
 PLE_OFFLOAD_EMBEDDING="${PLE_OFFLOAD_EMBEDDING:-0}"
 LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/logs/qwen3.8_flash_next_fp8_mi308x_pure_tp_4_or_8_pleoffload${PLE_OFFLOAD_EMBEDDING}_$(date -u +%Y%m%dT%H%M%SZ).log}"
 mkdir -p "$(dirname -- "${LOG_FILE}")"
@@ -32,6 +34,10 @@ MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-32}"
 CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-32}"
 AITER_MOE_PADDING_SIZE="${AITER_MOE_PADDING_SIZE:-64}"
 DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-1}"
+# Ordinary (non-MTP) ReplaySSM; works with radix off or extra_buffer on.
+# Keep opt-in so ENABLE_LINEAR_REPLAYSSM=0 remains the existing A/B baseline.
+ENABLE_LINEAR_REPLAYSSM="${ENABLE_LINEAR_REPLAYSSM:-0}"
+LINEAR_REPLAYSSM_CACHE_LEN="${LINEAR_REPLAYSSM_CACHE_LEN:-16}"
 # Report cache hits by default when radix caching is enabled.
 ENABLE_CACHE_REPORT="${ENABLE_CACHE_REPORT:-1}"
 
@@ -47,6 +53,11 @@ fi
 
 if [[ "${PLE_OFFLOAD_EMBEDDING}" != "0" && "${PLE_OFFLOAD_EMBEDDING}" != "1" ]]; then
   echo "PLE_OFFLOAD_EMBEDDING must be 0 or 1 (got ${PLE_OFFLOAD_EMBEDDING})." >&2
+  exit 1
+fi
+
+if [[ "${ENABLE_LINEAR_REPLAYSSM}" != "0" && "${ENABLE_LINEAR_REPLAYSSM}" != "1" ]]; then
+  echo "ENABLE_LINEAR_REPLAYSSM must be 0 or 1 (got ${ENABLE_LINEAR_REPLAYSSM})." >&2
   exit 1
 fi
 
@@ -108,6 +119,18 @@ command=(
   # --speculative-eagle-topk 1
   # --speculative-num-draft-tokens 4
 )
+
+if (( ENABLE_LINEAR_REPLAYSSM )); then
+  command+=(
+    --enable-linear-replayssm
+    --linear-replayssm-cache-len "${LINEAR_REPLAYSSM_CACHE_LEN}"
+    --linear-attn-decode-backend triton
+    --mamba-ssm-dtype float32
+  )
+  if ! (( DISABLE_RADIX_CACHE )); then
+    command+=(--mamba-radix-cache-strategy extra_buffer)
+  fi
+fi
 
 if (( DISABLE_RADIX_CACHE )); then
   command+=(--disable-radix-cache)

@@ -45,8 +45,8 @@ import torch
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
+register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-large-amd")
 
 
 def _build_inputs(B, H, HV, K, V, dtype, device, seed=0, is_kda=False):
@@ -93,7 +93,17 @@ class TestLinearReplaySSMDecode(CustomTestCase):
     NUM_STEPS = 40  # > 16 -> multiple flush cycles for L in {4,8,16}
     L_SWEEP = (1, 4, 8, 16)
 
-    def _run_one(self, cfg, L, dtype, force_flush_steps=(), is_kda=False):
+    def _run_one(
+        self,
+        cfg,
+        L,
+        dtype,
+        force_flush_steps=(),
+        is_kda=False,
+        ring_dtype=None,
+        nk=None,
+        token_stride=1,
+    ):
         from sglang.kernels.ops.attention.fla.fused_recurrent import (
             fused_recurrent_gated_delta_rule_packed_decode,
             fused_recurrent_kda_packed_decode,
@@ -132,8 +142,9 @@ class TestLinearReplaySSMDecode(CustomTestCase):
 
         # ReplaySSM ring tensors (caller-owned; this increment's caller == test).
         # g_cache is per-step scalar [HV, L] for GDN, per-K [HV, L, K] for KDA.
-        d_cache = torch.zeros(num_slots, HV, L, V, device=device, dtype=dtype)
-        k_cache = torch.zeros(num_slots, H, L, K, device=device, dtype=dtype)
+        ring_dtype = ring_dtype or dtype
+        d_cache = torch.zeros(num_slots, HV, L, V, device=device, dtype=ring_dtype)
+        k_cache = torch.zeros(num_slots, H, L, K, device=device, dtype=ring_dtype)
         if is_kda:
             g_cache = torch.zeros(
                 num_slots, HV, L, K, device=device, dtype=torch.float32
@@ -147,8 +158,17 @@ class TestLinearReplaySSMDecode(CustomTestCase):
 
         for step in range(self.NUM_STEPS):
             mixed_qkv, a, b = _build_inputs(
-                B, H, HV, K, V, dtype, device, seed=1000 + step, is_kda=is_kda
+                B * token_stride,
+                H,
+                HV,
+                K,
+                V,
+                dtype,
+                device,
+                seed=1000 + step,
+                is_kda=is_kda,
             )
+            mixed_qkv, a, b = [x[::token_stride] for x in (mixed_qkv, a, b)]
 
             # ---- ground truth: packed decode, full-state write every step ----
             ref_out = mixed_qkv.new_empty(B, 1, HV, V)
@@ -210,7 +230,7 @@ class TestLinearReplaySSMDecode(CustomTestCase):
                 # nk=1 at L=1 keeps the K-reduction in a single tile (no
                 # K-tiling), matching the reference's single-pass reduction;
                 # nk=2 for L>1 exercises the K-tiled reconstruction path.
-                nk=1 if L == 1 else 2,
+                nk=nk if nk is not None else (1 if L == 1 else 2),
             )
 
             # Output must match every step.
@@ -295,6 +315,120 @@ class TestLinearReplaySSMDecode(CustomTestCase):
             for L in self.L_SWEEP:
                 with self.subTest(cfg=cfg, L=L, dtype="bf16"):
                     self._run_one(cfg, L, torch.bfloat16)
+
+    def test_qwen38_tp_decode_and_tracking(self):
+        """Qwen3.8 TP2/TP4: HV/H=3, BF16 inputs, FP32 checkpoint AND ring.
+
+        Exercise natural and forced flushes with the actual production pool
+        dtype, which differs from the BF16 ring in the generic BF16 cases.
+        """
+        for H, HV in ((8, 24), (4, 12)):
+            for B in (1, 3, 32):
+                for L in (1, 8, 16):
+                    with self.subTest(H=H, HV=HV, B=B, L=L):
+                        torch.manual_seed(2026)
+                        self._run_one(
+                            dict(B=B, H=H, HV=HV, K=128, V=128),
+                            L=L,
+                            dtype=torch.bfloat16,
+                            ring_dtype=torch.float32,
+                            nk=2,
+                        )
+                with self.subTest(H=H, HV=HV, B=B, force_flush=True):
+                    torch.manual_seed(2026)
+                    self._run_one(
+                        dict(B=B, H=H, HV=HV, K=128, V=128),
+                        L=16,
+                        dtype=torch.bfloat16,
+                        ring_dtype=torch.float32,
+                        force_flush_steps=(3, 5, 23),
+                        nk=2,
+                        token_stride=2,
+                    )
+
+    def test_qwen38_restore_flushed_checkpoint_in_graph(self):
+        """A restored radix snapshot ignores the destination's stale ring.
+
+        Both requests receive identical inputs; after a forced checkpoint and
+        COW into a different physical slot they must continue identically under
+        graph replay, including subsequent natural flushes.
+        """
+        from types import SimpleNamespace
+
+        from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
+            fused_recurrent_gdn_replayssm_decode,
+        )
+        from sglang.srt.mem_cache.memory_pool import MambaPool
+
+        for H, HV in ((8, 24), (4, 12)):
+            with self.subTest(H=H, HV=HV):
+                torch.manual_seed(2026)
+                B, L, K, V = 2, 16, 128, 128
+                state = torch.randn(3, HV, V, K, device="cuda")
+                d = torch.randn(3, HV, L, V, device="cuda")
+                k = torch.randn(3, H, L, K, device="cuda")
+                g = torch.randn(3, HV, L, device="cuda")
+                indices = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
+                cursor = torch.zeros(B, device="cuda", dtype=torch.int32)
+                force = torch.zeros_like(cursor)
+                packed, a, b = _build_inputs(1, H, HV, K, V, torch.bfloat16, "cuda")
+                packed, a, b = [x.repeat(B, 1) for x in (packed, a, b)]
+                A_log = torch.randn(HV, device="cuda") * 0.3
+                dt_bias = torch.randn(HV, device="cuda") * 0.1
+                out = torch.empty(B, 1, HV, V, device="cuda", dtype=torch.bfloat16)
+
+                def forward():
+                    fused_recurrent_gdn_replayssm_decode(
+                        mixed_qkv=packed,
+                        a=a,
+                        b=b,
+                        A_log=A_log,
+                        dt_bias=dt_bias,
+                        scale=K**-0.5,
+                        initial_state=state,
+                        d_cache=d,
+                        k_cache=k,
+                        g_cache=g,
+                        out=out,
+                        ssm_state_indices=indices,
+                        write_pos=cursor,
+                        force_flush=force,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+
+                # Materialize slot 0 at a non-periodic tracking boundary.
+                for step in range(5):
+                    cursor.fill_(step)
+                    force.fill_(int(step == 4))
+                    forward()
+                pool = object.__new__(MambaPool)
+                pool.debug_memory_pool = True
+                pool._conv_fuse_ok = False
+                pool.replayssm_write_pos = torch.tensor([0, 11, 5], device="cuda")
+                pool.replayssm_cache_base = pool.replayssm_is_flush = None
+                pool.mamba_cache = SimpleNamespace(temporal=state.unsqueeze(0), conv=[])
+                pool.copy_from(
+                    torch.tensor([0], device="cuda"), torch.tensor([1], device="cuda")
+                )
+                self.assertEqual(pool.replayssm_write_pos[1].item(), 0)
+                indices.copy_(torch.tensor([0, 1], device="cuda", dtype=torch.int32))
+                cursor.zero_()
+                force.zero_()
+                # Warm/capture only with a flush, then reset to the same state.
+                snapshot = state.clone()
+                force.fill_(1)
+                forward()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    forward()
+                state.copy_(snapshot)
+                force.zero_()
+                for step in range(40):
+                    cursor.fill_(step % L)
+                    graph.replay()
+                    torch.testing.assert_close(out[0], out[1], rtol=0, atol=0)
+                    if step % L == L - 1:
+                        torch.testing.assert_close(state[0], state[1], rtol=0, atol=0)
 
     # ---- KDA (per-K gate) ----
     def test_replayssm_matches_kda_packed_decode_fp32(self):
