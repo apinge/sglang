@@ -38,6 +38,14 @@ CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-32}"
 AITER_MOE_PADDING_SIZE="${AITER_MOE_PADDING_SIZE:-64}"
 # Select the public prefill backend; use triton for the control run.
 LINEAR_ATTN_PREFILL_BACKEND="${LINEAR_ATTN_PREFILL_BACKEND:-aiter}"
+case "${LINEAR_ATTN_PREFILL_BACKEND}" in
+  triton|aiter)
+    ;;
+  *)
+    echo "LINEAR_ATTN_PREFILL_BACKEND must be 'triton' or 'aiter' (got ${LINEAR_ATTN_PREFILL_BACKEND})." >&2
+    exit 1
+    ;;
+esac
 DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-1}"
 # Report cache hits by default when radix caching is enabled.
 ENABLE_CACHE_REPORT="${ENABLE_CACHE_REPORT:-1}"
