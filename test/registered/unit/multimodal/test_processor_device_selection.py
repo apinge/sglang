@@ -139,6 +139,7 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
         for processor, device, expected in cases:
             with (
                 self.subTest(device=device, transport=processor.mm_feature_transport),
+                patch(f"{BASE}._is_hip", False),
                 patch(f"{BASE}.torch.cuda.device", return_value=nullcontext()),
                 patch(f"{BASE}.torch.cuda.MemPool", return_value="pool") as mem_pool,
                 patch(f"{BASE}.torch.cuda.use_mem_pool", return_value=nullcontext()),
@@ -146,6 +147,17 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
                 with processor._temporary_fast_processor_cuda_pool(device):
                     pass
                 self.assertEqual(mem_pool.called, expected)
+
+    def test_pool_is_skipped_on_rocm(self):
+        with (
+            patch(f"{BASE}._is_hip", True),
+            patch(f"{BASE}.torch.cuda.MemPool") as mem_pool,
+            patch(f"{BASE}.torch.cuda.use_mem_pool") as use_mem_pool,
+        ):
+            with self._processor()._temporary_fast_processor_cuda_pool("cuda:0"):
+                pass
+        mem_pool.assert_not_called()
+        use_mem_pool.assert_not_called()
 
     def test_processor_call_uses_private_pool_until_cpu_copy_finishes(self):
         class ImageProcessor:
@@ -187,6 +199,7 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
             patch.multiple(
                 BASE,
                 _is_cpu=False,
+                _is_hip=False,
                 _is_xpu=False,
                 _is_npu=False,
                 platforms=SimpleNamespace(
