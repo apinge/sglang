@@ -137,6 +137,16 @@ def _log_use():
     logger.info("Using AITER FlyDSL GDN prefill (chunk size 64).")
 
 
+@functools.lru_cache(maxsize=None)
+def _log_fallback(reason: str):
+    # Fixed reasons keep this bounded and avoid repeating warnings per layer/batch.
+    logger.warning(
+        "AITER GDN prefill is falling back to Triton: %s. "
+        "This reason is logged once per process.",
+        reason,
+    )
+
+
 def _run_aiter_gdn_prefill(
     q,
     k,
@@ -224,6 +234,7 @@ class AiterGDNKernel(LinearAttnKernelBase):
         return _build_prefill_metadata(forward_batch, forward_metadata, self._ops[0])
 
     def decode(self, *args, **kwargs):
+        # Required by the abstract base; the dispatcher selects Triton for decode.
         return self.fallback_kernel.decode(*args, **kwargs)
 
     def target_verify(self, *args, **kwargs):
@@ -243,13 +254,19 @@ class AiterGDNKernel(LinearAttnKernelBase):
         aiter_gdn_prefill_metadata=None,
         **kwargs,
     ) -> tuple:
-        if (
-            self._ops is None
-            or aiter_gdn_prefill_metadata is None
-            or not aiter_gdn_prefill_supported(
-                q, k, v, g, beta, ssm_states, cache_indices, query_start_loc
+        fallback_reason = None
+        if self._ops is None:
+            fallback_reason = "required AITER/FlyDSL ops are unavailable"
+        elif aiter_gdn_prefill_metadata is None:
+            fallback_reason = (
+                "compatible prefill metadata is unavailable for this batch"
             )
+        elif not aiter_gdn_prefill_supported(
+            q, k, v, g, beta, ssm_states, cache_indices, query_start_loc
         ):
+            fallback_reason = "unsupported tensor shape, dtype, device or layout"
+        if fallback_reason is not None:
+            _log_fallback(fallback_reason)
             return self.fallback_kernel.extend(
                 q=q,
                 k=k,
