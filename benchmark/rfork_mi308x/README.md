@@ -43,8 +43,10 @@ counterparts on MI308X and holds the scripts used. All numbers below come from o
 | + prefetch | 133.7 (+6.8) | 146.2 (+4.0) | 124.9 (-1.0) | 145.4 (+7.5) |
 | fastsafetensors | OOM (0/2) | OOM (0/2) | 126.7 (+0.8) | 126.2 (-11.8) |
 | runai streamer | 117.4 (-9.5) | 123.4 (-18.8) | 139.2 (+13.3) | 132.7 (-5.3) |
-| R-Fork RCCL | 68.1 (-58.8) | no disk read | 79.1 (-46.8) | no disk read |
-| R-Fork Mooncake | 66.3 (-60.6) | no disk read | 77.6 (-48.3) | no disk read |
+| R-Fork RCCL | 68.1 (-58.8) | not run¹ | 79.1 (-46.8) | not run¹ |
+| R-Fork Mooncake | 66.3 (-60.6) | not run¹ | 77.6 (-48.3) | not run¹ |
+
+¹ An R-Fork client copies weights from the live seed over XGMI and does not read the safetensors files (only config/tokenizer), so the page-cache state barely matters; these cells were not measured.
 
 ### Weight load (s, excl. PyHIP warmup; same layout)
 
