@@ -25,7 +25,6 @@ and page cache.
 | Config | TP2 warm page cache | TP2 cold page cache | TP4 warm page cache | TP4 cold page cache |
 |---|---|---|---|---|
 | disk (default) | 126.9 | 142.2 | 125.9 | 137.9 |
-| + prefetch | 133.7 (+6.8) | 146.2 (+4.0) | 124.9 (-1.0) | 145.4 (+7.5) |
 | fastsafetensors | OOM | OOM | 126.7 (+0.8) | 126.2 (-11.8) |
 | runai streamer | 117.4 (-9.5) | 123.4 (-18.8) | 139.2 (+13.3) | 132.7 (-5.3) |
 | R-Fork RCCL | 66.8 (-60.1) | 68.1 (-74.1) | 79.1 (-46.8)² | rerun pending |
@@ -90,7 +89,7 @@ Each option is the baseline command (own port/GPUs) plus the following:
 # Startup time per config and phase. TP = number of --gpus; R-Fork configs start a seed on --seed-gpus first.
 # Writes results.csv, summary.md and logs/ to --out.
 python3 benchmark/rfork_mi308x/bench_startup.py \
-  --configs disk,disk_prefetch,fastsafetensors,runai,rfork_nccl,rfork_mooncake \
+  --configs disk,fastsafetensors,runai,rfork_nccl,rfork_mooncake \
   --kernel-cache warm --page-cache warm,cold --repeat 2 --prime \
   --gpus 4,5,6,7 --seed-gpus 0,1,2,3 --out /tmp/startup_tp4
 #   TP2: --gpus 6,7 --seed-gpus 4,5

@@ -47,11 +47,6 @@ from evict_model_cache import evict, resident_bytes  # noqa: E402
 # "{group_ports}" are filled in at launch time.
 CONFIGS = {
     "disk": ({}, [], "default loader (multi-thread safetensors, mmap)"),
-    "disk_prefetch": (
-        {},
-        ["--weight-loader-prefetch-checkpoints"],
-        "default + prefetch",
-    ),
     "fastsafetensors": (
         {},
         [
