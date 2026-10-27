@@ -356,82 +356,89 @@ def main():
     seed = None
     results = []
     csv_path = os.path.join(a.out, "results.csv")
-    for name, kc, pc, r in runs:
-        env, args, _ = CONFIGS[name]
-        if name.startswith("rfork") and seed is None:
-            seed_args = []
-            if "rfork_mooncake" in configs:
-                seed_args = [
-                    "--remote-instance-weight-loader-start-seed-via-transfer-engine"
-                ]
-            print("starting seed ...", flush=True)
-            seed = Server(
-                log_path=f"{a.out}/logs/seed.log",
-                gpus=seed_gpus,
-                port=a.seed_port,
-                args=seed_args,
-                env={"MOONCAKE_PROTOCOL": "hip"},
-                all_visible=True,
+    try:
+        for name, kc, pc, r in runs:
+            env, args, _ = CONFIGS[name]
+            if name.startswith("rfork") and seed is None:
+                seed_args = []
+                if "rfork_mooncake" in configs:
+                    seed_args = [
+                        "--remote-instance-weight-loader-start-seed-via-transfer-engine"
+                    ]
+                print("starting seed ...", flush=True)
+                seed = Server(
+                    log_path=f"{a.out}/logs/seed.log",
+                    gpus=seed_gpus,
+                    port=a.seed_port,
+                    args=seed_args,
+                    env={"MOONCAKE_PROTOCOL": "hip"},
+                    all_visible=True,
+                )
+                if seed.ready_epoch is None:
+                    print("seed failed to start, see seed.log; skipping R-Fork configs")
+                    seed.stop()
+                    break
+            args = [
+                x.replace("{seed_port}", str(a.seed_port)).replace(
+                    "{group_ports}", group_ports
+                )
+                for x in args
+            ]
+            tag = f"{name}_kc-{kc}_pc-{pc}_r{r}"
+            # For R-Fork this runs after the seed has loaded, so "cold" also drops the
+            # pages the seed's load brought in.
+            resident = prepare_page_cache(a.model_path, pc)
+            home = (
+                tempfile.mkdtemp(prefix="sglang_home_", dir=a.out)
+                if kc == "cold"
+                else None
             )
-            if seed.ready_epoch is None:
-                print("seed failed to start, see seed.log; skipping R-Fork configs")
-                seed.stop()
-                break
-        args = [
-            x.replace("{seed_port}", str(a.seed_port)).replace(
-                "{group_ports}", group_ports
+            print(f"[{len(results) + 1}/{len(runs)}] {tag} ...", end=" ", flush=True)
+            s = Server(
+                log_path=f"{a.out}/logs/{tag}.log",
+                gpus=gpus,
+                port=a.port,
+                args=args,
+                env=env,
+                home=home,
+                all_visible=name.startswith("rfork"),
             )
-            for x in args
-        ]
-        tag = f"{name}_kc-{kc}_pc-{pc}_r{r}"
-        # For R-Fork this runs after the seed has loaded, so "cold" also drops the
-        # pages the seed's load brought in.
-        resident = prepare_page_cache(a.model_path, pc)
-        home = (
-            tempfile.mkdtemp(prefix="sglang_home_", dir=a.out) if kc == "cold" else None
-        )
-        print(f"[{len(results) + 1}/{len(runs)}] {tag} ...", end=" ", flush=True)
-        s = Server(
-            log_path=f"{a.out}/logs/{tag}.log",
-            gpus=gpus,
-            port=a.port,
-            args=args,
-            env=env,
-            home=home,
-            all_visible=name.startswith("rfork"),
-        )
-        row = {
-            "config": name,
-            "kernel_cache": kc,
-            "page_cache": pc,
-            "repeat": r,
-            "ok": s.ready_epoch is not None,
-        }
-        if resident is not None:
-            row["resident_before_prepare"] = round(resident[0], 4)
-            row["resident_at_launch"] = round(resident[1], 4)
-        if row["ok"]:
-            row.update(
-                {
-                    k: round(v, 2)
-                    for k, v in parse_phases(s.log_path, s.start, s.ready_epoch).items()
-                }
-            )
-            print(f"ready in {row['wall']:.1f} s", flush=True)
-        else:
-            print("FAILED, see log", flush=True)
-        s.stop()
-        results.append(row)
-        with open(csv_path, "w", newline="") as f:
-            keys = sorted(
-                {k for x in results for k in x},
-                key=lambda k: list(row).index(k) if k in row else 99,
-            )
-            w = csv.DictWriter(f, fieldnames=keys)
-            w.writeheader()
-            w.writerows(results)
-    if seed is not None:
-        seed.stop()
+            row = {
+                "config": name,
+                "kernel_cache": kc,
+                "page_cache": pc,
+                "repeat": r,
+                "ok": s.ready_epoch is not None,
+            }
+            if resident is not None:
+                row["resident_before_prepare"] = round(resident[0], 4)
+                row["resident_at_launch"] = round(resident[1], 4)
+            if row["ok"]:
+                row.update(
+                    {
+                        k: round(v, 2)
+                        for k, v in parse_phases(
+                            s.log_path, s.start, s.ready_epoch
+                        ).items()
+                    }
+                )
+                print(f"ready in {row['wall']:.1f} s", flush=True)
+            else:
+                print("FAILED, see log", flush=True)
+            s.stop()
+            results.append(row)
+            with open(csv_path, "w", newline="") as f:
+                keys = sorted(
+                    {k for x in results for k in x},
+                    key=lambda k: list(row).index(k) if k in row else 99,
+                )
+                w = csv.DictWriter(f, fieldnames=keys)
+                w.writeheader()
+                w.writerows(results)
+    finally:
+        # Also on an abort (e.g. page cache not reached), so the seed does not leak.
+        if seed is not None:
+            seed.stop()
 
     write_summary(results, os.path.join(a.out, "summary.md"))
     print(open(os.path.join(a.out, "summary.md")).read())
