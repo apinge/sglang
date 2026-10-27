@@ -97,10 +97,11 @@ def aiter_gdn_prefill_supported(q, k, v, g, beta, states, indices, cu) -> bool:
 
     The forward metadata certifies real request rows.
     """
-    if q.ndim != 4 or k.shape != q.shape or v.ndim != 4:
-        return False
     if (
-        q.shape[0] != 1
+        q.ndim != 4
+        or k.shape != q.shape
+        or v.ndim != 4
+        or q.shape[0] != 1
         or q.shape[1] == 0
         or q.shape[-1] != 128
         or v.shape[:2] != q.shape[:2]
