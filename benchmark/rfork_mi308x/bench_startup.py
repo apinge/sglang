@@ -17,7 +17,8 @@ Kernel cache: "warm" uses $HOME as is (run once beforehand to populate it, or pa
 --prime); "cold" gives each run an empty HOME, so FlyDSL/comgr/triton caches start empty.
 Page cache: before each run the model files are read in ("warm", >=99% resident) or
 dropped with posix_fadvise ("cold", <=1%); the run aborts if that state is not reached.
-R-Fork configs do not read the checkpoint, so they only run "warm".
+R-Fork clients copy weights from the seed and read only config/tokenizer files, so
+their page-cache state is expected to matter little; it is measured all the same.
 A launch is refused if any of its GPUs has more than 2 GiB in use.
 """
 
@@ -323,8 +324,6 @@ def main():
         for kc in a.kernel_cache.split(","):
             for pc in a.page_cache.split(","):
                 for name in configs:
-                    if name.startswith("rfork") and pc == "cold":
-                        continue
                     runs.append((name, kc, pc, r))
     # Seed-dependent runs last, so the seed occupies its GPUs only while needed.
     runs.sort(key=lambda x: x[0].startswith("rfork"))
@@ -390,9 +389,9 @@ def main():
             for x in args
         ]
         tag = f"{name}_kc-{kc}_pc-{pc}_r{r}"
-        resident = None
-        if not name.startswith("rfork"):
-            resident = prepare_page_cache(a.model_path, pc)
+        # For R-Fork this runs after the seed has loaded, so "cold" also drops the
+        # pages the seed's load brought in.
+        resident = prepare_page_cache(a.model_path, pc)
         home = (
             tempfile.mkdtemp(prefix="sglang_home_", dir=a.out) if kc == "cold" else None
         )
@@ -486,7 +485,7 @@ def write_summary(results, path):
     ]
     for (c, kc, pc), rows in groups.items():
         means = [statistics.mean(r[k] for r in rows) for k, _ in PHASES]
-        ref = base.get((kc, "warm" if c.startswith("rfork") else pc))
+        ref = base.get((kc, pc))
         delta = f"{means[0] - ref:+.1f} s" if ref is not None and c != BASELINE else "-"
         lines.append(
             f"| {c} | {kc} | {pc} | {len(rows)} | "
