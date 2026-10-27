@@ -56,6 +56,13 @@ Each rank's per-tensor checksums (1449 parameters + 54 buffers) were compared ag
 
 ## How to use
 
+Shortcut: `scripts/launch_qwen38_flash_next_fp8_mi308x_fast_startup.sh` adds the arguments below for
+`MODE=disk|seed|rfork|fastsafetensors|runai` (with `RFORK_BACKEND=nccl|mooncake`) on top of the pure-TP launch script.
+For example:
+`HIP_VISIBLE_DEVICES=0,1,2,3 TP_SIZE=4 PORT=7090 MODE=seed bash scripts/launch_qwen38_flash_next_fp8_mi308x_fast_startup.sh`
+then `HIP_VISIBLE_DEVICES=4,5,6,7 TP_SIZE=4 PORT=7091 MODE=rfork SEED_PORT=7090 bash scripts/...fast_startup.sh`.
+The full commands follow.
+
 ```bash
 export PYTHONPATH=<this repo>/python
 export SGLANG_USE_AITER=1 SGLANG_GR_READ_FLYDSL=1 SGLANG_USE_PYHIP_QSA=1 AITER_MOE_PADDING_SIZE=64
