@@ -96,7 +96,6 @@ def main():
     seed_gpus = [int(x) for x in a.seed_gpus.split(",")]
     gpus = [int(x) for x in a.gpus.split(",")]
     ports = json.dumps(list(range(62100, 62100 + a.tp)))
-    os.environ.pop("SGLANG_DEBUG_WEIGHT_ITER_TIMING", None)
     results, active = {}, []
 
     def save():

@@ -7,10 +7,6 @@ from typing import Any, Callable, Optional
 import torch
 import torch.distributed as dist
 
-from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-    check_nccl_transfer_manifest,
-    get_nccl_transfer_tensors,
-)
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import init_custom_process_group
 from sglang.srt.utils.network import NetworkAddress
@@ -106,24 +102,14 @@ class WeightExporter:
         na = NetworkAddress(master_address, group_port)
         message = ""
         try:
-            named_tensors = get_nccl_transfer_tensors(self.get_model())
-            manifest_ok, manifest_message = check_nccl_transfer_manifest(
-                named_tensors=named_tensors,
-                group=send_group,
-                device=torch.device("cuda", self.gpu_id),
-            )
-            if manifest_ok:
-                for _, weights in named_tensors:
-                    torch.distributed.broadcast(
-                        weights,
-                        src=0,
-                        group=send_group,
-                    )
-                success = True
-                message = f"Succeeded to send weights through {na.to_host_port_str()} {group_name}: {manifest_message}."
-            else:
-                message = manifest_message
-                logger.error(message)
+            for _, weights in self.get_model().named_parameters():
+                torch.distributed.broadcast(
+                    weights,
+                    src=0,
+                    group=send_group,
+                )
+            success = True
+            message = f"Succeeded to send weights through {na.to_host_port_str()} {group_name}."
         except Exception as e:
             message = f"Failed to send weights: {e}."
             logger.error(message)

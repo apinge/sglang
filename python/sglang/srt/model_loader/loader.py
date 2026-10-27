@@ -90,8 +90,6 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-    check_nccl_transfer_manifest,
-    get_nccl_transfer_tensors,
     trigger_transferring_weights_request,
 )
 from sglang.srt.model_loader.utils import (
@@ -125,7 +123,6 @@ from sglang.srt.model_loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
     set_runai_streamer_env,
-    time_weights_iterator,
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
@@ -946,12 +943,7 @@ class DefaultModelLoader(BaseModelLoader):
                 )
 
             self.load_weights_and_postprocess(
-                model,
-                time_weights_iterator(
-                    self._get_all_weights(model_config, model),
-                    self.load_config.load_format,
-                ),
-                target_device,
+                model, self._get_all_weights(model_config, model), target_device
             )
 
         self.counter_after_loading_weights = time.perf_counter()
@@ -3383,17 +3375,8 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             t.start()
 
         start_get_weights_tic = time.time()
-        named_tensors = get_nccl_transfer_tensors(model)
-        manifest_ok, manifest_message = check_nccl_transfer_manifest(
-            named_tensors=named_tensors,
-            group=client._model_update_group,
-            device=torch.device("cuda", device_config.gpu_id),
-        )
-        if not manifest_ok:
-            raise RuntimeError(manifest_message)
-        logger.info(f"Receiving weights from remote instance: {manifest_message}")
         with set_default_torch_dtype(model_config.dtype):
-            for _, tensor in named_tensors:
+            for _, tensor in model.named_parameters():
                 torch.distributed.broadcast(
                     tensor.data,
                     src=0,
@@ -4260,12 +4243,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 )
 
             DefaultModelLoader.load_weights_and_postprocess(
-                model,
-                time_weights_iterator(
-                    self._get_all_weights(model_config, model),
-                    self.load_config.load_format,
-                ),
-                target_device,
+                model, self._get_all_weights(model_config, model), target_device
             )
 
         return model.eval()

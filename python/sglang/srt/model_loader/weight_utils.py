@@ -17,7 +17,6 @@ import re
 import struct
 import tempfile
 import threading
-import time
 from collections import defaultdict
 from pathlib import Path
 from typing import (
@@ -44,7 +43,6 @@ from tqdm.auto import tqdm
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import REQUANTIZATION_METHODS, ModelConfig
 from sglang.srt.distributed import get_world_group
-from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -75,40 +73,6 @@ except ImportError:
     SafeTensorsFileLoader = SingleGroup = None
 
 logger = logging.getLogger(__name__)
-
-
-def time_weights_iterator(
-    weights: Iterable[Tuple[str, torch.Tensor]], label: str
-) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """Pass-through that, under SGLANG_DEBUG_WEIGHT_ITER_TIMING, logs how long the
-    consumer was blocked waiting for the next checkpoint tensor (I/O not hidden by
-    read-ahead) versus time spent outside the iterator (load_weights)."""
-    if not envs.SGLANG_DEBUG_WEIGHT_ITER_TIMING.get():
-        yield from weights
-        return
-    iterator = iter(weights)
-    blocked = 0.0
-    num_tensors = 0
-    num_bytes = 0
-    start = time.perf_counter()
-    while True:
-        tic = time.perf_counter()
-        try:
-            name, tensor = next(iterator)
-        except StopIteration:
-            blocked += time.perf_counter() - tic
-            break
-        blocked += time.perf_counter() - tic
-        num_tensors += 1
-        num_bytes += tensor.numel() * tensor.element_size()
-        yield name, tensor
-    total = time.perf_counter() - start
-    logger.info(
-        f"Weight iterator timing ({label}): blocked on next() {blocked:.2f} s, "
-        f"outside iterator {total - blocked:.2f} s, total {total:.2f} s, "
-        f"{num_tensors} tensors, {num_bytes / 1e9:.2f} GB"
-    )
-
 
 RUNAI_STREAMER_TENSOR_ATTR = "_sglang_runai_streamer_tensor"
 
@@ -1188,9 +1152,6 @@ def fastsafetensors_weights_iterator(
         "{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
     )
 
-    timing = envs.SGLANG_DEBUG_WEIGHT_ITER_TIMING.get()
-    copy_seconds = 0.0
-    get_tensor_seconds = 0.0
     for f_list in tqdm(
         weight_files_sub_lists,
         desc="Loading safetensors using Fastsafetensor loader",
@@ -1201,17 +1162,11 @@ def fastsafetensors_weights_iterator(
         rank_file_map = {i: [f] for i, f in enumerate(f_list)}
         loader.add_filenames(rank_file_map)
         try:
-            tic = time.perf_counter()
             fb = loader.copy_files_to_device()
-            if timing:
-                torch.cuda.synchronize(device)
-                copy_seconds += time.perf_counter() - tic
             try:
                 keys = list(fb.key_to_rank_lidx.keys())
                 for k in keys:
-                    tic = time.perf_counter()
                     t = fb.get_tensor(k)
-                    get_tensor_seconds += time.perf_counter() - tic
                     yield k, t
             finally:
                 pass
@@ -1220,13 +1175,6 @@ def fastsafetensors_weights_iterator(
         if drop_cache_after_load:
             for loaded_file in rank_file_map.get(rank, []):
                 _drop_file_cache_after_load(loaded_file)
-    if timing:
-        # copy_files_to_device is this rank's file read to GPU; get_tensor includes
-        # the per-tensor broadcast of tensors held by other ranks.
-        logger.info(
-            f"fastsafetensors timing: copy_files_to_device {copy_seconds:.2f} s, "
-            f"get_tensor {get_tensor_seconds:.2f} s"
-        )
 
 
 def multi_thread_safetensors_weights_iterator(
