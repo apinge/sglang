@@ -47,7 +47,8 @@ _is_npu = is_npu()
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
 
 
-# Bytes per checksum chunk; widened to int64 on device, so peak extra memory is 8x this.
+# Bytes per checksum chunk. The chunk, its position weights and their product are
+# int64 on device, so peak extra memory is about 24x this (~1.5 GB).
 _WEIGHT_CHECKSUM_CHUNK_BYTES = 64 * 1024 * 1024
 
 
