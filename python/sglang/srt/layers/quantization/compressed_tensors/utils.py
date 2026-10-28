@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import re
+from functools import lru_cache
 from types import MappingProxyType
 from typing import Iterable, List, Mapping, Optional
 
@@ -10,6 +12,8 @@ import torch
 from compressed_tensors import CompressionFormat
 from torch.nn import Module
 
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_forward
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -239,6 +243,15 @@ def _match_fused_layer(
     return unfused_matches[0] if all(unfused_matches) else None
 
 
+@lru_cache(maxsize=1)
+def _decode_solutions():
+    path = envs.SGLANG_ROCM_HIPB_TUNED_SOLUTIONS.get()
+    if not path:
+        return {}
+    with open(path) as source:
+        return json.load(source)["solutions"]
+
+
 class AiterHipblaslt:
     """
     AiterHipblaslt is a class that initializes the hipblaslt extension for aiter.
@@ -289,10 +302,21 @@ class AiterHipblaslt:
 
         from aiter import hipb_mm
 
+        solution_index = -1
+        if (
+            envs.SGLANG_ROCM_HIPB_DECODE_GEMV.get()
+            and get_forward().hipb_linear_decode
+            and inp_view.dtype == torch.bfloat16
+            and bias is None
+            and scale_a is None
+            and scale_b is None
+        ):
+            key = f"{inp_view.shape[0]},{weight.shape[1]},{inp_view.shape[1]}"
+            solution_index = _decode_solutions().get(key, -1)
         output = hipb_mm(
             inp_view,
             weight,
-            solution_index=-1,
+            solution_index=solution_index,
             bias=bias,
             out_dtype=out_dtype,
             scaleA=scale_a,
