@@ -54,6 +54,13 @@ from sglang.srt.utils import (
     load_video,
     logger,
 )
+from sglang.srt.utils.rocjpeg_decoder import (
+    DeferredJpeg,
+    decode_deferred_jpegs,
+    image_input_bytes,
+    rocjpeg_can_decode,
+    rocjpeg_decode_enabled,
+)
 
 _is_cpu = is_cpu()
 _is_hip = is_hip()
@@ -805,7 +812,18 @@ class BaseMultimodalProcessor(ABC):
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, cls.gpu_image_decode)
+                gpu_image_decode = cls.gpu_image_decode
+                if (
+                    discard_alpha_channel
+                    and not isinstance(data, Image.Image)
+                    and rocjpeg_decode_enabled(gpu_image_decode)
+                ):
+                    data = image_input_bytes(data)
+                    if rocjpeg_can_decode(data):
+                        # Decoded with the request's other JPEGs in _decode_deferred_jpegs.
+                        return DeferredJpeg(data)
+                    gpu_image_decode = False
+                img, _ = load_image(data, gpu_image_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
                 # PIL decodes lazily; do it here in the io worker so the decode
@@ -1030,6 +1048,12 @@ class BaseMultimodalProcessor(ABC):
         BaseMultimodalProcessor._validate_one_modality(Modality.VIDEO, video_data)
         BaseMultimodalProcessor._validate_one_modality(Modality.AUDIO, audio_data)
 
+    async def _decode_deferred_jpegs(self, images: List[Any]) -> None:
+        if any(isinstance(image, DeferredJpeg) for image in images):
+            await asyncio.wrap_future(
+                self.io_executor.submit(decode_deferred_jpegs, images)
+            )
+
     def _process_loaded_mm_data(self, modality, raw_data, result):
         images, videos, audios = [], [], []
 
@@ -1212,6 +1236,7 @@ class BaseMultimodalProcessor(ABC):
             elif modality == Modality.AUDIO:
                 audios[idx] = result
 
+        await self._decode_deferred_jpegs(images)
         logger.debug(
             "[load_mm_data(simple)] loaded counts: images=%d, videos=%d, audios=%d",
             len(images),
@@ -1344,6 +1369,7 @@ class BaseMultimodalProcessor(ABC):
                 raise RuntimeError(
                     f"An exception occurred while loading multimodal data: {e}"
                 )
+        await self._decode_deferred_jpegs(images)
         return BaseMultiModalProcessorOutput(
             images=images,
             audios=audios,
