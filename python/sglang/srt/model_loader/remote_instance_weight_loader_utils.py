@@ -180,6 +180,21 @@ def register_memory_region_v2(model, transfer_engine):
         if current_weight_block is not None:
             weight_blocks_for_reg_mr.append(current_weight_block)
 
+    if torch.version.hip is not None:
+        # Workaround: Mooncake's HIP transport (mooncake-transfer-engine-rocm
+        # 0.3.13.post1) resolves remote addresses from the IPC allocation base, not the
+        # registered address, so a region starting mid-segment reads shifted data
+        # (benchmark/rfork_mi308x/mooncake_hip_offset_repro.py). Register whole segments;
+        # drop once that repro passes with --raw-register.
+        weight_blocks_for_reg_mr = [
+            (segment["address"], segment["total_size"])
+            for segment in memory_snapshot
+            if any(
+                block.get("address") in weight_addr_set
+                for block in segment.get("blocks", [])
+            )
+        ]
+
     # Register merged memory blocks that hold weights.
     for weight_block in weight_blocks_for_reg_mr:
         address, size = weight_block

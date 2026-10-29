@@ -88,6 +88,7 @@ from sglang.srt.layers.moe.utils import (
     install_shared_experts_fusion_decision,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
 )
@@ -3251,6 +3252,16 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
                 model = _initialize_model(model_config, self.load_config, quant_config)
+                if (
+                    load_config.remote_instance_weight_loader_backend
+                    != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
+                ):
+                    # The seed sends post-processed tensors (repacked, requantized),
+                    # so match its layout before the raw byte copy, as ShardedStateLoader does.
+                    for _, module in model.named_modules():
+                        quant_method = getattr(module, "quant_method", None)
+                        if quant_method is not None:
+                            quant_method.process_weights_after_loading(module)
 
         if (
             load_config.remote_instance_weight_loader_backend
@@ -3321,17 +3332,30 @@ class RemoteInstanceModelLoader(BaseModelLoader):
 
         return model.eval()
 
+    @staticmethod
+    def _restore_derived_state(model: nn.Module) -> None:
+        # Raw copies bypass weight_loader hooks that fill derived buffers (gemma_weight).
+        PreshardedModelLoader._rebind_parameter_aliases(model)
+        for _, module in model.named_modules():
+            if isinstance(getattr(module, "quant_method", None), BaseKVCacheMethod):
+                # The floats were set from the -1 placeholders before receiving; the
+                # received k/v_scale tensors are the seed's final (fnuz-adjusted) values.
+                module.k_scale_float = module.k_scale.item()
+                module.v_scale_float = module.v_scale.item()
+
     def load_model_from_remote_instance_by_nccl(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
     ) -> nn.Module:
         load_config = self.load_config
         instance_ip = socket.gethostbyname(socket.gethostname())
         start_build_group_tic = time.time()
-        client.build_group(
+        success, message = client.build_group(
             gpu_id=device_config.gpu_id,
             tp_rank=load_config.tp_rank,
             instance_ip=instance_ip,
         )
+        if not success:
+            raise RuntimeError(f"Failed to build weight transfer group: {message}")
         current_platform.synchronize()
         end_build_group_tic = time.time()
         logger.debug(
@@ -3360,6 +3384,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 )
             current_platform.synchronize()
 
+            self._restore_derived_state(model)
             _post_load_weights(model)
         end_get_weights_tic = time.time()
         logger.debug(
@@ -3423,6 +3448,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             logger.error(f"batch transfer failed, error: {ret}")
             return False
 
+        self._restore_derived_state(model)
         _post_load_weights(model)
 
         return True

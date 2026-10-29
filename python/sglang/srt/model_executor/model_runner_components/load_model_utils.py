@@ -19,6 +19,7 @@ from sglang.srt.debug_utils.tensor_dump_forward_hook import (
 )
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.environ import envs
 from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -44,6 +45,52 @@ _is_npu = is_npu()
 
 
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
+
+
+# Bytes per checksum chunk. The chunk, its position weights and their product are
+# int64 on device, so peak extra memory is about 24x this (~1.5 GB).
+_WEIGHT_CHECKSUM_CHUNK_BYTES = 64 * 1024 * 1024
+
+
+def _tensor_byte_checksum(tensor: torch.Tensor) -> str:
+    data = tensor.detach().contiguous().view(-1).view(torch.uint8)
+    byte_sum = 0
+    weighted_sum = 0
+    for start in range(0, data.numel(), _WEIGHT_CHECKSUM_CHUNK_BYTES):
+        chunk = data[start : start + _WEIGHT_CHECKSUM_CHUNK_BYTES].to(torch.int64)
+        # Position weights make the checksum sensitive to byte reordering (e.g. shuffles).
+        weights = (
+            torch.arange(
+                start, start + chunk.numel(), device=chunk.device, dtype=torch.int64
+            )
+            % 65521
+            + 1
+        )
+        byte_sum += int(chunk.sum())
+        weighted_sum += int((chunk * weights).sum())
+    return f"{data.numel()}:{byte_sum}:{weighted_sum}"
+
+
+def maybe_dump_weight_checksums(
+    *, model: torch.nn.Module, is_draft_worker: bool
+) -> None:
+    out_dir = envs.SGLANG_DEBUG_WEIGHT_CHECKSUM_DIR.get()
+    if out_dir is None:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    role = "draft" if is_draft_worker else "target"
+    path = os.path.join(out_dir, f"{role}_rank{rank}.tsv")
+    named_tensors = [("param", n, t) for n, t in model.named_parameters()] + [
+        ("buffer", n, t) for n, t in model.named_buffers()
+    ]
+    with open(path, "w") as f:
+        for kind, name, tensor in named_tensors:
+            f.write(
+                f"{kind}\t{name}\t{tuple(tensor.shape)}\t{tensor.dtype}\t"
+                f"{tensor.device.type}\t{_tensor_byte_checksum(tensor)}\n"
+            )
+    logger.info(f"Dumped {len(named_tensors)} weight checksums to {path}")
 
 
 def maybe_precompile_model_kernels_after_loading(model, device: str) -> None:
@@ -337,6 +384,7 @@ def load_model_with_memory_saver(
             remote_instance_weight_info = (
                 loader.remote_instance_transfer_engine_weight_info
             )
+    maybe_dump_weight_checksums(model=model, is_draft_worker=is_draft_worker)
     if not is_draft_worker and server_args.ple_offload_embedding and device == "cuda":
         current_platform.empty_cache()
     # Cache needs to be cleared after loading model weights (in the loader.load_model function).
