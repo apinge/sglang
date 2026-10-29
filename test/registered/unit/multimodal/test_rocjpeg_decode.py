@@ -1,7 +1,7 @@
 """Unit tests for JPEG decoding with rocJPEG on ROCm.
 
-No GPU: torchvision's decode_jpeg and the rocJPEG self-check are mocked, and the
-color correction matrix is checked against the JFIF (BT.601) and BT.709 formulas.
+No GPU: torchvision's decode_jpeg and the Triton color correction are mocked, and
+the correction matrix is checked against the JFIF (BT.601) and BT.709 formulas.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -56,6 +56,11 @@ def _png(size=(96, 80)) -> bytes:
     return buf.getvalue()
 
 
+def _pil_decode(data: torch.Tensor, device=None) -> torch.Tensor:
+    image = Image.open(io.BytesIO(data.numpy().tobytes())).convert("RGB")
+    return torch.from_numpy(np.array(image)).permute(2, 0, 1)
+
+
 class TestRocJpegCanDecode(CustomTestCase):
     def test_baseline_jpegs_are_accepted(self):
         self.assertTrue(rocjpeg_can_decode(_jpeg()))
@@ -87,20 +92,71 @@ class TestColorCorrection(CustomTestCase):
         np.testing.assert_allclose(BT709_TO_BT601 @ bt709, jfif, atol=1e-3)
 
 
+class TestRocJpegSelfCheck(CustomTestCase):
+    def _check(self):
+        rocjpeg_decoder._rocjpeg_color_correction.cache_clear()
+        self.addCleanup(rocjpeg_decoder._rocjpeg_color_correction.cache_clear)
+        return rocjpeg_decoder._rocjpeg_color_correction()
+
+    def test_output_matching_pil_is_used_without_correction(self):
+        with (
+            patch("torchvision.io.decode_jpeg", side_effect=_pil_decode),
+            patch.object(rocjpeg_decoder, "bt709_to_bt601") as correct,
+        ):
+            self.assertIs(self._check(), False)
+        correct.assert_not_called()
+
+    def test_bt709_output_is_corrected(self):
+        seen = {}
+
+        def decode(data, device):
+            seen["data"] = data
+            return torch.zeros_like(_pil_decode(data))
+
+        with (
+            patch("torchvision.io.decode_jpeg", side_effect=decode),
+            patch.object(
+                rocjpeg_decoder,
+                "bt709_to_bt601",
+                side_effect=lambda image: _pil_decode(seen["data"]),
+            ),
+        ):
+            self.assertIs(self._check(), True)
+
+    def test_output_matching_neither_disables_rocjpeg(self):
+        def decode(data, device):
+            return torch.zeros_like(_pil_decode(data))
+
+        with (
+            patch("torchvision.io.decode_jpeg", side_effect=decode),
+            patch.object(rocjpeg_decoder, "bt709_to_bt601", side_effect=lambda x: x),
+        ):
+            self.assertIsNone(self._check())
+
+    def test_decode_error_disables_rocjpeg(self):
+        with patch(
+            "torchvision.io.decode_jpeg", side_effect=RuntimeError("no rocJPEG")
+        ):
+            self.assertIsNone(self._check())
+
+
 class TestRocJpegGate(CustomTestCase):
-    def _enabled(self, *, env=True, hip=True, usable=True, gpu_image_decode=True):
+    def _enabled(self, *, env=True, hip=True, correction=True, gpu_image_decode=True):
         with (
             envs.SGLANG_ROCM_GPU_JPEG_DECODE.override(env),
             patch.object(rocjpeg_decoder, "is_hip", return_value=hip),
-            patch.object(rocjpeg_decoder, "_rocjpeg_matches_pil", return_value=usable),
+            patch.object(
+                rocjpeg_decoder, "_rocjpeg_color_correction", return_value=correction
+            ),
         ):
             return rocjpeg_decoder.rocjpeg_decode_enabled(gpu_image_decode)
 
     def test_enabled_only_with_env_hip_and_a_usable_decoder(self):
         self.assertTrue(self._enabled())
+        self.assertTrue(self._enabled(correction=False))
         self.assertFalse(self._enabled(env=False))
         self.assertFalse(self._enabled(hip=False))
-        self.assertFalse(self._enabled(usable=False))
+        self.assertFalse(self._enabled(correction=None))
         self.assertFalse(self._enabled(gpu_image_decode=False))
         self.assertFalse(self._enabled(gpu_image_decode="nvjpeg_fancy"))
 
@@ -143,6 +199,9 @@ class TestDecodeDeferredJpegs(CustomTestCase):
         with (
             patch("torchvision.io.decode_jpeg", return_value=decoded) as decode,
             patch.object(
+                rocjpeg_decoder, "_rocjpeg_color_correction", return_value=True
+            ),
+            patch.object(
                 rocjpeg_decoder, "bt709_to_bt601", side_effect=corrected
             ) as correct,
         ):
@@ -157,6 +216,20 @@ class TestDecodeDeferredJpegs(CustomTestCase):
         self.assertIs(images[0], corrected[0])
         self.assertIs(images[1], other)
         self.assertIs(images[2], corrected[1])
+
+    def test_output_is_not_corrected_when_rocjpeg_matches_pil(self):
+        decoded = [torch.zeros((3, 80, 96), dtype=torch.uint8)]
+        images = [DeferredJpeg(_jpeg())]
+        with (
+            patch("torchvision.io.decode_jpeg", return_value=decoded),
+            patch.object(
+                rocjpeg_decoder, "_rocjpeg_color_correction", return_value=False
+            ),
+            patch.object(rocjpeg_decoder, "bt709_to_bt601") as correct,
+        ):
+            decode_deferred_jpegs(images)
+        correct.assert_not_called()
+        self.assertIs(images[0], decoded[0])
 
     def test_batch_failure_falls_back_to_pil(self):
         data = _jpeg()
