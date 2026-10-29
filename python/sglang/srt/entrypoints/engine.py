@@ -1719,8 +1719,11 @@ def _set_envs_and_config(server_args: ServerArgs):
             "the process tree when a child process fails."
         )
 
-    # Set mp start method
-    mp.set_start_method("spawn", force=True)
+    # Set mp start method; the early forkserver is started in sglang/__init__.py.
+    mp.set_start_method(
+        "forkserver" if os.environ.get("SGLANG_EARLY_FORKSERVER") == "1" else "spawn",
+        force=True,
+    )
 
     # Set gc threshold
     if gc_threshold := cfg.gc_threshold:
