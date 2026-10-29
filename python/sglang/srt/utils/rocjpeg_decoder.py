@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from functools import lru_cache
 from io import BytesIO
-from typing import Union
+from typing import Optional, Union
 from urllib.parse import unquote, urlparse
 
 import numpy as np
@@ -26,6 +26,8 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+# Full-range RGB to YCbCr for luma weights kr and kb:
+# https://en.wikipedia.org/wiki/YCbCr#ITU-R_BT.601_conversion
 def _ycbcr_from_rgb(kr: float, kb: float) -> np.ndarray:
     kg = 1 - kr - kb
     return np.array(
@@ -37,8 +39,16 @@ def _ycbcr_from_rgb(kr: float, kb: float) -> np.ndarray:
     )
 
 
-# rocJPEG converts YCbCr to RGB with BT.709 coefficients, while JPEG (JFIF) uses
-# BT.601. Both are full range, so one matrix maps its output to the JFIF result.
+# JPEG (JFIF, ITU-T T.871 section 7) uses the ITU-R BT.601 luma weights
+# kr = 0.299, kb = 0.114. rocJPEG before 1.10.0 converts YCbCr to RGB with the
+# ITU-R BT.709 weights kr = 0.2126, kb = 0.0722 (R = Y + 1.5748 Cr, ...):
+# https://github.com/ROCm/rocJPEG/blob/rocm-7.2.4/src/rocjpeg_hip_kernels.cpp#L76-L78
+# 1.10.0 switched to BT.601 (https://github.com/ROCm/rocm-systems/pull/11520),
+# and BT.709 remains a build option, so the self-check decides whether to correct.
+# Both are full range, so inv(M601) @ M709 maps the BT.709 output to the JFIF result:
+#   [[ 0.9136,  0.0785,  0.0079],
+#    [-0.1050,  1.1722, -0.0671],
+#    [ 0.0096,  0.0322,  0.9582]]
 BT709_TO_BT601 = np.linalg.inv(_ycbcr_from_rgb(0.299, 0.114)) @ _ycbcr_from_rgb(
     0.2126, 0.0722
 )
@@ -109,8 +119,10 @@ def bt709_to_bt601(image: torch.Tensor) -> torch.Tensor:
 
 
 @lru_cache(maxsize=1)
-def _rocjpeg_matches_pil() -> bool:
-    """Decode a color test image with rocJPEG and compare the corrected output with PIL."""
+def _rocjpeg_color_correction() -> Optional[bool]:
+    """Decode a color test image with rocJPEG and compare it with PIL, first as
+    decoded and then after bt709_to_bt601. Returns whether the correction is
+    needed, or None if rocJPEG is unavailable or neither output matches."""
     try:
         from torchvision.io import decode_jpeg  # lazy: ~1 s of torch._dynamo
 
@@ -122,22 +134,36 @@ def _rocjpeg_matches_pil() -> bool:
         )
         data = buf.getvalue()
         expected = torch.from_numpy(np.array(Image.open(BytesIO(data)).convert("RGB")))
+        expected = expected.permute(2, 0, 1).float()
         decoded = decode_jpeg(
             torch.frombuffer(bytearray(data), dtype=torch.uint8), device="cuda"
         )
-        corrected = bt709_to_bt601(decoded).cpu().float()
-        error = (corrected - expected.permute(2, 0, 1).float()).abs().mean().item()
+        error = (decoded.cpu().float() - expected).abs().mean().item()
+        corrected_error = None
+        if error > 1.0:
+            corrected = bt709_to_bt601(decoded).cpu().float()
+            corrected_error = (corrected - expected).abs().mean().item()
     except Exception as e:
         logger.warning("rocJPEG decode is unavailable, decoding JPEG with PIL: %s", e)
+        return None
+    if corrected_error is None:
+        logger.info("Decoding JPEG with rocJPEG (mean abs error vs PIL %.2f)", error)
         return False
-    if error > 1.0:
-        logger.warning(
-            "rocJPEG output differs from PIL (mean abs error %.2f), decoding JPEG with PIL",
+    if corrected_error <= 1.0:
+        logger.info(
+            "Decoding JPEG with rocJPEG and BT.709-to-BT.601 correction "
+            "(mean abs error vs PIL %.2f, %.2f uncorrected)",
+            corrected_error,
             error,
         )
-        return False
-    logger.info("Decoding JPEG with rocJPEG (mean abs error vs PIL %.2f)", error)
-    return True
+        return True
+    logger.warning(
+        "rocJPEG output differs from PIL (mean abs error %.2f, %.2f after "
+        "BT.709-to-BT.601 correction), decoding JPEG with PIL",
+        error,
+        corrected_error,
+    )
+    return None
 
 
 def rocjpeg_decode_enabled(gpu_image_decode) -> bool:
@@ -145,7 +171,7 @@ def rocjpeg_decode_enabled(gpu_image_decode) -> bool:
         gpu_image_decode is True
         and is_hip()
         and envs.SGLANG_ROCM_GPU_JPEG_DECODE.get()
-        and _rocjpeg_matches_pil()
+        and _rocjpeg_color_correction() is not None
     )
 
 
@@ -223,5 +249,6 @@ def decode_deferred_jpegs(images: list) -> None:
                 # Same client error that _load_single_item raises for these.
                 raise ValueError(f"Could not decode image: {e}") from e
         return
+    correct = _rocjpeg_color_correction()
     for i, image in zip(indices, decoded):
-        images[i] = bt709_to_bt601(image)
+        images[i] = bt709_to_bt601(image) if correct else image
