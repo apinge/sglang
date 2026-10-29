@@ -299,6 +299,21 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # Experimental TP2 ROCm prefill path: pipeline the attention output projection
+    # with its all-reduce over row chunks, pulling the peer's partial sums over SDMA.
+    SGLANG_QWEN4_SDMA_PROJ_PIPELINE = EnvBool(False)
+    SGLANG_QWEN4_SDMA_PROJ_PIPELINE_CHUNKS = EnvInt(4)
+    SGLANG_QWEN4_SDMA_PROJ_PIPELINE_MIN_TOKENS = EnvInt(4096)
+    # Consume the pipelined all-reduce chunk by chunk (fused with the
+    # hyper-connection combine) instead of waiting for the whole sum.
+    SGLANG_QWEN4_SDMA_PIPELINE_CONSUMER = EnvBool(False)
+    # Also route the MoE output all-reduce through the SDMA pipeline. CHUNKS > 1
+    # runs the MoE block per token chunk so transfers overlap the experts.
+    SGLANG_QWEN4_SDMA_PIPELINE_MOE = EnvBool(False)
+    SGLANG_QWEN4_SDMA_PIPELINE_MOE_CHUNKS = EnvInt(1)
+    # Wire format of the peer's partial sums: "bf16" (exact), or "int8" / "fp8"
+    # values with one bf16 scale per 32 (lossy, ~half the bytes).
+    SGLANG_QWEN4_SDMA_PIPELINE_TRANSPORT = EnvStr("bf16")
     # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
     # path is ported, so setting this fails loudly instead of degrading.
     SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
