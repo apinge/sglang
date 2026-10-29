@@ -5169,6 +5169,19 @@ class ServerArgs:
         cfg = resolving_view(self)
         if cfg.cuda_graph_config is None:
             return
+        if is_hip() and os.environ.get("AITER_QUICK_REDUCE_QUANTIZATION") == "FP8":
+            if cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
+                raise ValueError(
+                    "AITER FP8 prefill requires --cuda-graph-backend-prefill disabled"
+                )
+            if cfg.enable_mixed_chunk or cfg.speculative_algorithm:
+                raise ValueError(
+                    "AITER FP8 prefill currently requires mixed chunk and speculative decoding disabled"
+                )
+            if cfg.disable_custom_all_reduce:
+                raise ValueError(
+                    "AITER FP8 prefill requires custom all-reduce enabled for decode"
+                )
         for phase in Phase.ALL:
             backend = getattr(cfg.cuda_graph_config, phase).backend
             if backend not in ALLOWED_BACKENDS_PER_PHASE[phase]:

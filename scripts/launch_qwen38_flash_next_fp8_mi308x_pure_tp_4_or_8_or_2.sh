@@ -17,6 +17,19 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF1
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-7080}"
 TP_SIZE="${TP_SIZE:-2}"
+# Apply optional device mapping before Python initializes HIP.
+if [[ -n "${TP_VISIBLE_DEVICES:-}" ]]; then
+  export HIP_VISIBLE_DEVICES="${TP_VISIBLE_DEVICES}"
+  export CUDA_VISIBLE_DEVICES="${TP_VISIBLE_DEVICES}"
+fi
+unset ROCM_QUICK_REDUCE_QUANTIZATION
+export AITER_QUICK_REDUCE_QUANTIZATION="${AITER_QUICK_REDUCE_QUANTIZATION:-FP8}"
+if [[ "${AITER_QUICK_REDUCE_QUANTIZATION:-NONE}" == "FP8" ]]; then
+  export AITER_QUICK_REDUCE_CAST_BF16_TO_FP16="${AITER_QUICK_REDUCE_CAST_BF16_TO_FP16:-0}"
+  export AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB="${AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB:-128}"
+  printf 'AllReduce: prefill=AITER FP8 (cast=%s, capacity=%s MiB); decode=existing AITER CA; HIP_VISIBLE_DEVICES=%s\n' \
+    "$AITER_QUICK_REDUCE_CAST_BF16_TO_FP16" "$AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB" "${HIP_VISIBLE_DEVICES:-all}"
+fi
 # TP2 needs room for HIPBLAS initialization and graph capture after KV sizing;
 # TP4/TP8 have previously been validated with the more conservative 0.85.
 if [[ -z "${MEM_FRACTION_STATIC:-}" ]]; then
@@ -111,6 +124,10 @@ command=(
 
 if (( DISABLE_RADIX_CACHE )); then
   command+=(--disable-radix-cache)
+fi
+
+if [[ "${AITER_QUICK_REDUCE_QUANTIZATION:-NONE}" == "FP8" ]]; then
+  command+=(--cuda-graph-backend-prefill disabled)
 fi
 
 if (( ENABLE_CACHE_REPORT )); then
