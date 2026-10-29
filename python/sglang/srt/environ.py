@@ -307,6 +307,12 @@ class Envs:
     # Numerical acceptance only; never enable for performance measurements.
     SGLANG_TEST_PYHIP_QSA = EnvBool(False)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
+    # Load fastsafetensors shards in sub-file chunks of this many GiB instead of
+    # whole files. None keeps whole-file loading.
+    SGLANG_FASTSAFETENSORS_MAX_BATCH_GIB = EnvFloat(None)
+    # With chunked loading, have every rank read all shards itself instead of
+    # broadcasting them across ranks.
+    SGLANG_FASTSAFETENSORS_ALL_LOCAL = EnvBool(False)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
     # Copy rank-local MoE slices into independent CPU storage before H2D when

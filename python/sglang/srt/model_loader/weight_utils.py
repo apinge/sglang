@@ -1143,6 +1143,43 @@ def fastsafetensors_weights_iterator(
 
     device = torch.device(f"cuda:{rank}")
 
+    from sglang.srt.environ import envs
+
+    max_batch_gib = envs.SGLANG_FASTSAFETENSORS_MAX_BATCH_GIB.get()
+    if max_batch_gib is not None:
+        from fastsafetensors import ParallelLoader
+
+        # Whole-file loading allocates a device buffer as large as each shard,
+        # which does not fit next to the model params for very large shards.
+        # The broadcasts run on a dedicated group so its NCCL communicator can
+        # be destroyed after loading; on the default group it would stay
+        # allocated for the life of the process and shrink the KV cache.
+        all_local = envs.SGLANG_FASTSAFETENSORS_ALL_LOCAL.get()
+        load_pg = (
+            torch.distributed.new_group(backend="nccl")
+            if torch.distributed.is_initialized() and not all_local
+            else pg
+        )
+        loader = ParallelLoader(
+            load_pg,
+            hf_weights_files,
+            device=str(device),
+            nogds=not enable_gds,
+            max_batch_bytes=int(max_batch_gib * (1 << 30)),
+            use_tqdm_on_load=rank == 0,
+            all_local=all_local,
+        )
+        try:
+            yield from loader.iterate_weights()
+        finally:
+            loader.close()
+            if load_pg is not pg:
+                torch.distributed.destroy_process_group(load_pg)
+        if drop_cache_after_load:
+            for loaded_file in hf_weights_files:
+                _drop_file_cache_after_load(loaded_file)
+        return
+
     weight_files_sub_lists = [
         hf_weights_files[i : i + pg.size()]
         for i in range(0, len(hf_weights_files), pg.size())
