@@ -29,6 +29,15 @@ def _driver_modules():
 def stream_wait_value32(
     device_id: int, address: int, value: int, transport_name: str
 ) -> None:
+    if torch.version.hip is not None:
+        from sglang.srt.multimodal.transport.hip_stream_ops import wait_value32
+
+        # HIP stream memory operations cannot safely access peer IPC mappings
+        # on all ROCm runtimes. System-scope atomics also work on those mappings.
+        with torch.cuda.device(device_id):
+            wait_value32(address, value)
+        return
+
     cuda, check_drv = _driver_modules()
     stream = torch.cuda.current_stream(device_id)
     check_drv(
@@ -40,6 +49,13 @@ def stream_wait_value32(
 def stream_write_value32(
     device_id: int, address: int, value: int, transport_name: str
 ) -> None:
+    if torch.version.hip is not None:
+        from sglang.srt.multimodal.transport.hip_stream_ops import write_value32
+
+        with torch.cuda.device(device_id):
+            write_value32(address, value)
+        return
+
     cuda, check_drv = _driver_modules()
     stream = torch.cuda.current_stream(device_id)
     check_drv(
