@@ -1582,6 +1582,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
             "Not enough space for mamba ping pong idx, "
             "try to increase --mamba-full-memory-ratio."
         )
+        # A recycled tracking slot must not retain its previous decode cursor.
+        # Only live decode slots append to the ring; tracking slots hold full
+        # checkpoints after the decode kernel's tracking-boundary force-flush.
+        if self.mamba_pool.replayssm_write_pos is not None:
+            self.mamba_pool.replayssm_write_pos[slots] = 0
         buf = torch.full(
             (self.mamba_ping_pong_track_buffer_size,),
             -1,
@@ -1605,6 +1610,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
         set_mamba_track_indices_from_reqs reads correct slot indices.
         """
         req.mamba_ping_pong_track_buffer[idx] = value
+        # All replacement/donation and lazy allocation paths enter here. Only
+        # clearing an entry passes a host -1; do not test a device id's value
+        # on the host, which would synchronize the scheduler with the GPU.
+        write_pos = self.mamba_pool.replayssm_write_pos
+        if write_pos is not None and (isinstance(value, torch.Tensor) or value >= 0):
+            write_pos[value] = 0
         self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.req_pool_idx] = (
             req.mamba_ping_pong_track_buffer
         )

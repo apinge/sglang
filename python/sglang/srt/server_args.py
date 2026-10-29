@@ -2749,8 +2749,8 @@ class ServerArgs:
         "at batch >= 64). KDA uses its selected Triton or Helion implementation, "
         "but its per-K gate ring is larger and ReplaySSM is typically slower "
         "than packed KDA decode; benchmark before enabling it. Requires the "
-        "Triton linear-attn decode backend, or Helion for KDA, and "
-        "--mamba-radix-cache-strategy no_buffer (the default).",
+        "Triton linear-attn decode backend, or Helion for KDA. GDN supports "
+        "radix extra_buffer; KDA requires no_buffer. Non-speculative decode only.",
         NS("exec.mamba"),
     ] = False
     linear_replayssm_cache_len: A[
@@ -6829,13 +6829,17 @@ class ServerArgs:
         # the COW copy-into-slot path resets the ring cursor) -- so the
         # --disable-radix-cache requirement is dropped.
         #
-        # Slice 2b only wires the no_buffer mamba scheduler strategy (the
-        # default). The extra_buffer strategy donates the track snapshot via
-        # `donate_mamba_ping_pong_slot` with a separate ping-pong slot swap that
-        # does NOT route through MambaPool.copy_from, so the ReplaySSM ring
-        # cursor of the donated/kept slot would not be reset there. Handling
-        # that donation path is a follow-up; for now require no_buffer.
+        # GDN extra_buffer tracks a complete checkpoint: decode force-flushes
+        # at tracking boundaries and every slot enters the ping-pong buffer
+        # with an empty ring. KDA does not yet wire tracking force-flush, so
+        # its extra_buffer snapshots would omit pending ring entries.
         if cfg.enable_linear_replayssm:
+            if cfg.speculative_algorithm:
+                raise ValueError(
+                    "--enable-linear-replayssm only supports non-speculative "
+                    "decode. Use --enable-linear-replayssm-spec for speculative "
+                    "target verification instead."
+                )
             if decode not in {"triton", "helion"}:
                 raise ValueError(
                     "--enable-linear-replayssm requires Triton, or Helion for "
@@ -6845,12 +6849,18 @@ class ServerArgs:
             from sglang.srt.arg_groups.overrides import (
                 mamba_extra_buffer_of,
             )
+            from sglang.srt.configs.hybrid_arch import kimi_linear_config
 
-            if mamba_extra_buffer_of(resolved_view(self)):
+            # Read the architecture predicate rather than building cache params:
+            # their TP shapes require process groups that do not exist yet.
+            if (
+                mamba_extra_buffer_of(resolved_view(self))
+                and kimi_linear_config(self.get_model_config()) is not None
+            ):
                 raise ValueError(
-                    "--enable-linear-replayssm requires --mamba-radix-cache-strategy "
-                    "no_buffer (the default); the extra_buffer ping-pong "
-                    "donation path is not yet supported (follow-up). Got "
+                    "--enable-linear-replayssm on a KDA model requires "
+                    "--mamba-radix-cache-strategy no_buffer; extra_buffer does "
+                    "not force-flush the KDA ring at radix tracking boundaries. Got "
                     f"--mamba-radix-cache-strategy={cfg.mamba_radix_cache_strategy!r}."
                 )
             if cfg.disaggregation_mode != "null":

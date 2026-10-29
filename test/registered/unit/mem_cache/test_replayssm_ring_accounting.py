@@ -62,6 +62,15 @@ def _gdn_params():
 
 
 class TestReplaySSMRingAccounting(CustomTestCase):
+    def test_decode_ring_uses_state_dtype(self):
+        # Two FP32 d/k rings (1024 bytes each), plus scalar/vector FP32 gates.
+        self.assertEqual(
+            _gdn_params().replayssm_decode_ring_bytes_per_req(RL), 2176 * len(LAYERS)
+        )
+        self.assertEqual(
+            _kda_params().replayssm_decode_ring_bytes_per_req(RL), 3072 * len(LAYERS)
+        )
+
     def test_gdn_fold(self):
         # fold window: rawv 512 + rawk 512 + g(scalar, 4*8*4) 128 + beta 128 = 1280
         self.assertEqual(

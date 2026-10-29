@@ -2096,7 +2096,14 @@ class KVCacheConfigurator:
             self.hybrid_gdn_config is not None
             or kimi_linear_config(self.model_config) is not None
         )
-        if replayssm_active:
+        decode_replayssm_active = get_exec().mamba.enable_linear_replayssm
+        if decode_replayssm_active:
+            replayssm_ring_per_req = (
+                config.mamba2_cache_params.replayssm_decode_ring_bytes_per_req(
+                    record_len=get_exec().mamba.linear_replayssm_cache_len
+                )
+            )
+        elif replayssm_active:
             # GDN sizes the fold window to the draft maximum; the KDA ring
             # stays --linear-replayssm-cache-len long (mirrors MambaPool).
             max_draft_tokens = max_speculative_num_draft_tokens()
@@ -2114,6 +2121,9 @@ class KVCacheConfigurator:
         else:
             replayssm_ring_per_req = 0
         replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)
+        if decode_replayssm_active:
+            # One shared int32 cursor per physical slot, not per layer.
+            replayssm_ring_per_req += torch.int32.itemsize
         if has_spec_dec:
             assert get_spec().speculative_num_draft_tokens is not None
             assert get_schedule().max_running_requests is not None

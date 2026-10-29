@@ -13,6 +13,15 @@ ReplaySSM kernel reads S every step but writes it only 1-in-L steps, plus a
 small ring append (d:[HV,V], k:[H,K], g:[HV] per step). The amortized state
 traffic ratio is reported per L.
 
+Default measurement captures a complete 0..L-1 cursor cycle in a CUDA/HIP
+graph and divides latency by L. The baseline runs L packed updates in the
+same way. Cursor tensors are preallocated, so this is kernel-only timing,
+excluding scheduler metadata and radix copies. ``--mode phases`` retains
+the midpoint/non-flush plus flush estimate from upstream #38399.
+
+Inputs default to BF16 and both checkpoint and ring to FP32, matching the
+ordinary decode pool. Speculative ReplaySSM has a different ring protocol.
+
 Run::
 
     python benchmark/kernels/attention/bench_gdn_replayssm_decode.py
@@ -23,6 +32,8 @@ Requires a GPU (Triton).
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 
 import torch
 import triton
@@ -46,30 +57,53 @@ def _make_static(B, H, HV, K, V, dtype, device):
     return mixed_qkv, a, b, A_log, dt_bias
 
 
-def _state_bytes_per_step(B, HV, K, V, L, dtype):
-    """Amortized per-step HBM *state* traffic (bytes), state in fp32.
-
-    packed: read S + write S every step.
-    replay: read S every step; write S once per L steps; append ring records
-            (d:[HV,V] in `dtype`, k:[H,K] in `dtype` shared across HV//H, g:[HV]
-            fp32) every step. We report the dominant fp32-state terms; ring
-            appends are tiny by comparison and shown separately.
-    """
-    fp32 = 4
+def _state_bytes_per_step(B, HV, K, V, L, state_dtype):
+    """Checkpoint-only traffic estimate; excludes ring reads/writes."""
+    state_bytes = state_dtype.itemsize
     state_elems = B * HV * V * K  # one record per active request slot
-    packed = (state_elems * fp32) * 2  # read + write
-    replay = (state_elems * fp32) * (1 + 1.0 / L)  # read every step + write 1/L
+    packed = (state_elems * state_bytes) * 2
+    replay = (state_elems * state_bytes) * (1 + 1.0 / L)
     return packed, replay
 
 
-def _bench_cfg(B, H, HV, K, V, Ls, dtype, device, num_slots=None, warmup=25, rep=100):
+def _amortize(t_nonflush, t_flush, L):
+    """Mean per-step latency over one full L-phase cycle.
+
+    `write_pos` walks 0, 1, ... L-1 and wraps, so a steady-state cycle is L-1
+    non-flush steps and one flush step. The non-flush steps are not identical --
+    each replays one more ring entry than the last -- so the midpoint phase is
+    sampled as their representative rather than phase 0, which replays nothing.
+    Use cycle mode when a measured complete cycle is needed.
+    """
+    if L == 1:
+        return t_flush
+    return ((L - 1) * t_nonflush + t_flush) / L
+
+
+def _bench_cfg(
+    B,
+    H,
+    HV,
+    K,
+    V,
+    Ls,
+    dtype,
+    device,
+    nk=2,
+    num_slots=None,
+    warmup=25,
+    rep=100,
+    state_dtype=torch.float32,
+    ring_dtype=torch.float32,
+    mode="cycle",
+):
     num_slots = num_slots or B
     mixed_qkv, a, b, A_log, dt_bias = _make_static(B, H, HV, K, V, dtype, device)
     scale = K**-0.5
     cache_indices = torch.arange(B, device=device, dtype=torch.int32)
 
     # packed decode
-    state = torch.randn(num_slots, HV, V, K, device=device, dtype=torch.float32)
+    state = torch.randn(num_slots, HV, V, K, device=device, dtype=state_dtype)
     out = mixed_qkv.new_empty(B, 1, HV, V)
 
     def run_packed():
@@ -86,19 +120,22 @@ def _bench_cfg(B, H, HV, K, V, Ls, dtype, device, num_slots=None, warmup=25, rep
             use_qk_l2norm_in_kernel=True,
         )
 
-    t_packed = triton.testing.do_bench(run_packed, warmup=warmup, rep=rep)
+    t_packed = (
+        triton.testing.do_bench(run_packed, warmup=warmup, rep=rep)
+        if mode == "phases"
+        else None
+    )
 
     rows = []
     for L in Ls:
-        rstate = torch.randn(num_slots, HV, V, K, device=device, dtype=torch.float32)
-        d_cache = torch.zeros(num_slots, HV, L, V, device=device, dtype=dtype)
-        k_cache = torch.zeros(num_slots, H, L, K, device=device, dtype=dtype)
+        rstate = state.clone()
+        d_cache = torch.zeros(num_slots, HV, L, V, device=device, dtype=ring_dtype)
+        k_cache = torch.zeros(num_slots, H, L, K, device=device, dtype=ring_dtype)
         g_cache = torch.zeros(num_slots, HV, L, device=device, dtype=torch.float32)
-        write_pos = torch.zeros(B, device=device, dtype=torch.int32)
+        write_pos = torch.empty(B, device=device, dtype=torch.int32)
         rout = mixed_qkv.new_empty(B, 1, HV, V)
-        nk = 1 if L == 1 else 2
 
-        def run_replay():
+        def run_replay(cursor=write_pos):
             fused_recurrent_gdn_replayssm_decode(
                 mixed_qkv=mixed_qkv,
                 a=a,
@@ -112,15 +149,53 @@ def _bench_cfg(B, H, HV, K, V, Ls, dtype, device, num_slots=None, warmup=25, rep
                 g_cache=g_cache,
                 out=rout,
                 ssm_state_indices=cache_indices,
-                write_pos=write_pos,
+                write_pos=cursor,
                 use_qk_l2norm_in_kernel=True,
                 nk=nk,
             )
 
-        t_replay = triton.testing.do_bench(run_replay, warmup=warmup, rep=rep)
-        packed_bytes, replay_bytes = _state_bytes_per_step(B, HV, K, V, L, dtype)
-        rows.append((L, t_replay, t_packed / t_replay, replay_bytes / packed_bytes))
-    return t_packed, rows
+        def time_at(pos):
+            write_pos.fill_(pos)
+            return triton.testing.do_bench(run_replay, warmup=warmup, rep=rep)
+
+        # The kernel branches on write_pos: it appends to the ring on every step
+        # but folds the ring into the checkpoint only when write_pos == L-1. Both
+        # phases have to be timed, or the reported cost is the cheap one repeated
+        # (see `_amortize`). L == 1 is all flush, so it has no non-flush phase.
+        if mode == "phases":
+            t_flush = time_at(L - 1)
+            t_nonflush = time_at((L - 1) // 2) if L > 1 else None
+            t_replay = _amortize(t_nonflush, t_flush, L)
+            t_reference = t_packed
+        else:
+            cursors = [torch.full_like(write_pos, pos) for pos in range(L)]
+
+            def replay_cycle():
+                for cursor in cursors:
+                    run_replay(cursor)
+
+            def packed_cycle():
+                for _ in range(L):
+                    run_packed()
+
+            t_reference = triton.testing.do_bench_cudagraph(packed_cycle, rep=rep) / L
+            t_replay = triton.testing.do_bench_cudagraph(replay_cycle, rep=rep) / L
+            t_nonflush = t_flush = None
+
+        packed_bytes, replay_bytes = _state_bytes_per_step(B, HV, K, V, L, state_dtype)
+        rows.append(
+            dict(
+                batch_size=B,
+                cache_len=L,
+                packed_ms=t_reference,
+                replay_ms=t_replay,
+                nonflush_ms=t_nonflush,
+                flush_ms=t_flush,
+                speedup=t_reference / t_replay,
+                checkpoint_traffic_ratio=replay_bytes / packed_bytes,
+            )
+        )
+    return rows
 
 
 def main():
@@ -132,34 +207,73 @@ def main():
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 16, 64, 256])
     parser.add_argument("--ls", type=int, nargs="+", default=[1, 8, 16])
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
+    parser.add_argument("--state-dtype", choices=["bf16", "fp32"], default="fp32")
+    parser.add_argument(
+        "--ring-dtype",
+        choices=["bf16", "fp32"],
+        default=None,
+        help="Defaults to state dtype, as in the decode pool.",
+    )
+    parser.add_argument("--mode", choices=["cycle", "phases"], default="cycle")
+    parser.add_argument("--json-output", type=Path)
+    parser.add_argument("--rep", type=int, default=100, help="Timing duration in ms")
+    parser.add_argument(
+        "--nk", type=int, default=2, help="K-chunks the reconstruction walks"
+    )
     args = parser.parse_args()
+    if any(L < 1 for L in args.ls):
+        parser.error("all cache lengths must be positive")
+    if args.h < 1 or args.hv % args.h:
+        parser.error("HV must be a positive multiple of H")
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA / Triton required for this microbenchmark.")
     device = "cuda"
-    dtype = {
+    dtypes = {
         "bf16": torch.bfloat16,
         "fp16": torch.float16,
         "fp32": torch.float32,
-    }[args.dtype]
+    }
+    args.ring_dtype = args.ring_dtype or args.state_dtype
 
     print(
         f"GDN ReplaySSM decode microbench  HV={args.hv} H={args.h} "
-        f"K={args.k} V={args.v} dtype={args.dtype}\n"
-        "per-step latency (ms); speedup = packed/replay; "
-        "state-traffic = replay/packed (lower is better)"
+        f"K={args.k} V={args.v} input={args.dtype} state={args.state_dtype} "
+        f"ring={args.ring_dtype} nk={args.nk} mode={args.mode}\n"
+        "Per-step kernel latency in ms; speedup = packed/replay. "
+        "Checkpoint traffic estimate excludes ring traffic."
     )
+    results = []
     for B in args.batch_sizes:
-        t_packed, rows = _bench_cfg(
-            B, args.h, args.hv, args.k, args.v, args.ls, dtype, device
+        rows = _bench_cfg(
+            B,
+            args.h,
+            args.hv,
+            args.k,
+            args.v,
+            args.ls,
+            dtypes[args.dtype],
+            device,
+            nk=args.nk,
+            state_dtype=dtypes[args.state_dtype],
+            ring_dtype=dtypes[args.ring_dtype],
+            mode=args.mode,
+            rep=args.rep,
         )
-        print(f"\nB={B:<4d}  packed={t_packed:.4f} ms")
-        for L, t_replay, speedup, traffic_ratio in rows:
+        results.extend(rows)
+        for row in rows:
             print(
-                f"    L={L:<3d} replay={t_replay:.4f} ms  "
-                f"speedup={speedup:5.2f}x  "
-                f"state-traffic={traffic_ratio:5.2f}x"
+                f"B={B:<4d} L={row['cache_len']:<3d} "
+                f"packed={row['packed_ms']:.4f} replay={row['replay_ms']:.4f} "
+                f"speedup={row['speedup']:.2f}x"
             )
+    if args.json_output:
+        config = {
+            k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
+        }
+        args.json_output.write_text(
+            json.dumps(dict(config=config, results=results), indent=2) + "\n"
+        )
 
 
 if __name__ == "__main__":
