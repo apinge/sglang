@@ -841,6 +841,9 @@ class Envs:
     # Decode JPEG inputs on the GPU with rocJPEG (needs torchvision built with
     # rocJPEG and a working VA-API driver); PIL is used when the self-check fails.
     SGLANG_ROCM_GPU_JPEG_DECODE = EnvBool(False)
+    # Force rocJPEG's BT.709-to-BT.601 color correction on or off (A/B tests);
+    # unset, the self-check decides.
+    SGLANG_ROCM_JPEG_COLOR_CORRECTION = EnvBool(None)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.

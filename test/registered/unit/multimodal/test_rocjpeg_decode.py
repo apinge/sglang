@@ -231,6 +231,32 @@ class TestDecodeDeferredJpegs(CustomTestCase):
         correct.assert_not_called()
         self.assertIs(images[0], decoded[0])
 
+    def test_color_correction_can_be_forced_on_or_off(self):
+        cases = (
+            # (argument, env var, self-check, corrected)
+            (False, None, True, False),
+            (True, None, False, True),
+            (None, False, True, False),
+            (None, True, False, True),
+            (True, False, False, True),
+        )
+        for argument, env, check, expected in cases:
+            decoded = [torch.zeros((3, 80, 96), dtype=torch.uint8)]
+            images = [DeferredJpeg(_jpeg())]
+            with (
+                self.subTest(argument=argument, env=env, check=check),
+                envs.SGLANG_ROCM_JPEG_COLOR_CORRECTION.override(env),
+                patch("torchvision.io.decode_jpeg", return_value=decoded),
+                patch.object(
+                    rocjpeg_decoder, "_rocjpeg_color_correction", return_value=check
+                ),
+                patch.object(
+                    rocjpeg_decoder, "bt709_to_bt601", side_effect=lambda x: x + 1
+                ) as correct,
+            ):
+                decode_deferred_jpegs(images, color_correction=argument)
+                self.assertEqual(correct.called, expected)
+
     def test_batch_failure_falls_back_to_pil(self):
         data = _jpeg()
         images = [DeferredJpeg(data)]
