@@ -367,7 +367,6 @@ def run_case(case, args, directory, row):
         ).resolve()
         env = clean_environment(
             PYTHONPATH=str(Path(args.client_root).resolve() / "python"),
-            CLIENT_PYTHON=sys.executable,
             BENCH_MODEL=str(model_path),
             BENCH_SERVED_MODEL=served_name,
             BENCH_HOST="127.0.0.1",

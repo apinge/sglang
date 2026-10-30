@@ -10,4 +10,4 @@ args=(--eval-name gsm8k
       --gsm8k-data-path "${GSM8K_DATA_PATH:-/models/benchmark_datasets/gsm8k/test.jsonl}"
       --output-dir "${GSM8K_OUTPUT_DIR:-gsm8k-results}" --strict)
 if [[ -n "${BENCH_SERVED_MODEL:-}" ]]; then args+=(--model "$BENCH_SERVED_MODEL"); fi
-exec "${CLIENT_PYTHON:-python}" -m sglang.test.run_eval "${args[@]}" "$@"
+exec python3 -m sglang.test.run_eval "${args[@]}" "$@"

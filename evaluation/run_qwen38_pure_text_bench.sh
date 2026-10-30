@@ -19,7 +19,7 @@ echo "max concurrency: ${max_concurrency}"
 echo "num prompts: ${num_prompts}"
 echo "dataset-name: ${dataset_name}"
 
-"${CLIENT_PYTHON:-python3}" -m sglang.bench_serving \
+python3 -m sglang.bench_serving \
     --backend sglang \
     --model "${model}" \
     --served-model-name "${BENCH_SERVED_MODEL:-$model}" \
