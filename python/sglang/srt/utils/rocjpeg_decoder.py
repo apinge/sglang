@@ -122,7 +122,9 @@ def bt709_to_bt601(image: torch.Tensor) -> torch.Tensor:
 def _rocjpeg_color_correction() -> Optional[bool]:
     """Decode a color test image with rocJPEG and compare it with PIL, first as
     decoded and then after bt709_to_bt601. Returns whether the correction is
-    needed, or None if rocJPEG is unavailable or neither output matches."""
+    needed, or None if rocJPEG is unavailable or neither output matches.
+    Runs once per process on a 128x128 image (48 KiB copied to the host);
+    request images stay on the GPU."""
     try:
         from torchvision.io import decode_jpeg  # lazy: ~1 s of torch._dynamo
 
@@ -226,9 +228,13 @@ class DeferredJpeg:
         self.data = data
 
 
-def decode_deferred_jpegs(images: list) -> None:
+def decode_deferred_jpegs(
+    images: list, color_correction: Optional[bool] = None
+) -> None:
     """Replace the DeferredJpeg entries of `images` in place with RGB images,
-    decoded in one rocJPEG call; if that call fails they are decoded with PIL."""
+    decoded in one rocJPEG call; if that call fails they are decoded with PIL.
+    color_correction forces the BT.709-to-BT.601 correction on or off; by
+    default SGLANG_ROCM_JPEG_COLOR_CORRECTION, then the self-check, decide."""
     indices = [i for i, image in enumerate(images) if isinstance(image, DeferredJpeg)]
     if not indices:
         return
@@ -249,6 +255,9 @@ def decode_deferred_jpegs(images: list) -> None:
                 # Same client error that _load_single_item raises for these.
                 raise ValueError(f"Could not decode image: {e}") from e
         return
-    correct = _rocjpeg_color_correction()
+    if color_correction is None:
+        color_correction = envs.SGLANG_ROCM_JPEG_COLOR_CORRECTION.get()
+    if color_correction is None:
+        color_correction = _rocjpeg_color_correction()
     for i, image in zip(indices, decoded):
-        images[i] = bt709_to_bt601(image) if correct else image
+        images[i] = bt709_to_bt601(image) if color_correction else image
