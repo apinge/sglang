@@ -228,10 +228,7 @@ jobs:
     needs: [validate, gpu]
     if: >-
       always() &&
-      (github.event_name != 'pull_request' ||
-       (!github.event.pull_request.draft &&
-        (github.event.pull_request.head.repo.full_name == github.repository ||
-         contains(github.event.pull_request.labels.*.name, 'run-qwen4-ci'))))
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     runs-on: ubuntu-latest
     steps:
       - name: Require every selected case to pass
@@ -241,4 +238,8 @@ jobs:
         run: |
           echo "CPU validation: $VALIDATION_RESULT; case jobs: $CASES_RESULT"
           test "$VALIDATION_RESULT" = success
+          if [ "$CASES_RESULT" = skipped ]; then
+            echo "::error::Qwen4 GPU cases did not run. Fork PRs require the run-qwen4-ci label."
+            exit 1
+          fi
           test "$CASES_RESULT" = success
