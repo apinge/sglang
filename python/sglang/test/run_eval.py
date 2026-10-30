@@ -285,14 +285,22 @@ def run_eval(args):
     output_dir = getattr(args, "output_dir", None)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
-        file_stem = args.eval_name
+        if strict:
+            file_stem = args.eval_name
     report_filename = os.path.join(output_dir or "/tmp", f"{file_stem}.html")
+    result_filename = os.path.join(output_dir or "/tmp", f"{file_stem}.json")
+    if output_dir:
+        for filename in (report_filename, result_filename):
+            if os.path.lexists(filename):
+                raise FileExistsError(
+                    f"Report already exists: {filename}. Use a fresh --output-dir."
+                )
+    mode = "x" if output_dir else "w"
     print(f"Writing report to {report_filename}")
-    with open(report_filename, "w") as fh:
+    with open(report_filename, mode) as fh:
         fh.write(make_report(result))
     print(metrics)
-    result_filename = os.path.join(output_dir or "/tmp", f"{file_stem}.json")
-    with open(result_filename, "w") as f:
+    with open(result_filename, mode) as f:
         f.write(json.dumps(metrics, indent=2))
     print(f"Writing results to {result_filename}")
 
@@ -342,7 +350,10 @@ if __name__ == "__main__":
         help="API mode: 'chat' for /v1/chat/completions, 'completion' for /v1/completions, 'generate' for SGLang-native /generate",
     )
     parser.add_argument("--num-examples", type=int)
-    parser.add_argument("--output-dir", help="Directory for JSON and HTML reports")
+    parser.add_argument(
+        "--output-dir",
+        help="Directory for new JSON/HTML reports; existing reports are preserved",
+    )
     parser.add_argument(
         "--strict", action="store_true", help="Fail incomplete GSM8K chat evaluations"
     )

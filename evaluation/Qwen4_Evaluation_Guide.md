@@ -214,7 +214,15 @@ Performance uses 10 warmup requests and 128 random requests at concurrency one;
 Qwen3.5 uses 8,000 input / 500 output tokens, and Qwen3.8 uses 12,000 / 350.
 Accuracy scores 200 examples and enforces the recorded gate.
 
-To reuse an already built image on the local host, run this from the checkout:
+Build the local image from the checkout once, or rebuild after local code changes:
+
+```bash
+mkdir -p /tmp/qwen4-buildx
+BUILDX_CONFIG=/tmp/qwen4-buildx docker build --no-cache --network=host --progress=plain \
+  -f evaluation/Dockerfile.ci -t qwen4-ci:local .
+```
+
+Use that image to run the local benchmark and accuracy checks:
 
 ```bash
 (
@@ -228,7 +236,7 @@ To reuse an already built image on the local host, run this from the checkout:
     --security-opt seccomp=unconfined \
     -v /raid/models:/models:ro -v "$qwen4_work:/results" \
     -v /tmp/qwen4-mi308x.lock:/tmp/qwen4-mi308x.lock \
-    qwen4-ci:refactor-20261030 sleep infinity
+    qwen4-ci:local sleep infinity
   cleanup() {
     docker exec "$qwen4_container" chown -R "$(id -u):$(id -g)" /results || true
     docker rm -f "$qwen4_container" >/dev/null || true
@@ -246,16 +254,8 @@ To reuse an already built image on the local host, run this from the checkout:
 Remove `--case Qwen3.5-397B-TP8-DFlash` to run all six cases sequentially, or pass
 comma-separated case IDs from the table below.
 
-To test new local code, rebuild the image and reuse the same run command above:
-
-```bash
-mkdir -p /tmp/qwen4-buildx
-BUILDX_CONFIG=/tmp/qwen4-buildx docker build --no-cache --network=host --progress=plain \
-  -f evaluation/Dockerfile.ci -t qwen4-ci:refactor-20261030 .
-```
-
-The command exits nonzero for launch errors, incomplete requests, invalid results, or an accuracy regression. Logs, native JSON/HTML reports, and `summary.md` are written under the fresh output directory. Build provenance lists the source commits and installed package versions. Keep `QWEN4_WORK_ROOT` outside `/home`
-on hosts with limited home storage; Docker layers remain in the daemon's data root.
+The command exits nonzero for launch errors, incomplete requests, invalid results, or an accuracy regression. Logs, native JSON/HTML reports, and `summary.md` are written under the fresh output directory. Build provenance lists the source commits and installed package versions. Keep `QWEN4_WORK_ROOT` outside `/home` on hosts with limited home storage; Docker layers remain in the daemon's data root.
+Use a fresh `--output-dir` for each direct evaluator run. Ordinary evaluations retain model-specific report filenames; strict GSM8K runs use `gsm8k.json/html`.
 
 Default runs evaluate all six cases with 128 fixed-length performance requests and 200 GSM8K examples each. The accuracy gate is `score >= recorded_reference * 0.98`; performance thresholds are advisory.
 
