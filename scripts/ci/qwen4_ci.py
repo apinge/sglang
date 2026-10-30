@@ -25,8 +25,25 @@ DATASETS = {
     "gsm8k/test.jsonl": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
     "ShareGPT_V3_unfiltered_cleaned_split.json": "35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4",
 }
+# Default order: Qwen3.8 first, then Qwen3.5.
 # Case, model, TP, mode, launch script, approved 200-example full-02 accuracy.
 CASES = [
+    (
+        "Qwen3.8-Flash-TP2-Base",
+        "Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16",
+        2,
+        "base",
+        "launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2.sh",
+        0.980,
+    ),
+    (
+        "Qwen3.8-Flash-TP2-MTP",
+        "Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16",
+        2,
+        "mtp",
+        "launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2.sh",
+        0.985,
+    ),
     (
         "Qwen3.5-35B-TP4-Base",
         "Qwen3.5-35B-A3B-PTPC-FP8",
@@ -57,22 +74,6 @@ CASES = [
         8,
         "dflash",
         "launch_qwen3.5-397B-fp8_tp8_dflash_with_prefix_cache.sh",
-        0.985,
-    ),
-    (
-        "Qwen3.8-Flash-TP2-Base",
-        "Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16",
-        2,
-        "base",
-        "launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2.sh",
-        0.980,
-    ),
-    (
-        "Qwen3.8-Flash-TP2-MTP",
-        "Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16",
-        2,
-        "mtp",
-        "launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2.sh",
         0.985,
     ),
 ]

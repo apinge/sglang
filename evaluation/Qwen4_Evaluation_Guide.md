@@ -198,6 +198,9 @@ Target model: [sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16](https://huggin
 <summary>Qwen 3.5 & Qwen 3.8 CI Overview</summary>
 CI runs each selected case in its own GitHub Actions matrix job using `evaluation/Dockerfile.ci` and the existing launch, benchmark, and `run_gsm8k.sh` scripts.
 Case jobs run serially on the shared host, each with its own image container, console logs, and result artifact. Docker builds reuse cached layers.
+The default case order is Qwen3.8 Flash TP2 base, Qwen3.8 Flash TP2 MTP,
+Qwen3.5 35B TP4 base, Qwen3.5 35B TP1 DFlash, Qwen3.5 397B TP8 base,
+then Qwen3.5 397B TP8 DFlash. Local runs and the Actions matrix use this order.
 Direct local runs can evaluate multiple cases in one container and share its normal kernel cache:
 
 ```bash
@@ -262,12 +265,12 @@ Default runs evaluate all six cases with 128 fixed-length performance requests a
 
 | Case ID                 | Reference | Minimum correct / 200 |
 | ----------------------- | --------- | --------------------- |
+| Qwen3.8-Flash-TP2-Base  | 98.0%     | 193                   |
+| Qwen3.8-Flash-TP2-MTP   | 98.5%     | 194                   |
 | Qwen3.5-35B-TP4-Base    | 97.0%     | 191                   |
 | Qwen3.5-35B-TP1-DFlash  | 97.0%     | 191                   |
 | Qwen3.5-397B-TP8-Base   | 99.0%     | 195                   |
 | Qwen3.5-397B-TP8-DFlash | 98.5%     | 194                   |
-| Qwen3.8-Flash-TP2-Base  | 98.0%     | 193                   |
-| Qwen3.8-Flash-TP2-MTP   | 98.5%     | 194                   |
 
 
 Use `--case Qwen3.5-35B-TP1-DFlash --gpus 2` to run one selected case on a free

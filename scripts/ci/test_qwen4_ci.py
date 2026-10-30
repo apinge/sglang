@@ -28,7 +28,7 @@ def accuracy_result(tmp_path, score=0.97, examples=200):
 
 @pytest.mark.parametrize(
     "case,minimum_count",
-    zip(ci.CASES, (191, 191, 195, 194, 193, 194)),
+    zip(ci.CASES, (193, 194, 191, 191, 195, 194)),
     ids=[case[0] for case in ci.CASES],
 )
 def test_accuracy_gate_preserves_each_baseline_and_rejects_the_next_lower_count(
