@@ -142,7 +142,7 @@ jobs:
        (github.event.pull_request.head.repo.full_name == github.repository ||
         contains(github.event.pull_request.labels.*.name, 'run-qwen4-ci')))
     runs-on: ${{ fromJSON(vars.QWEN4_RUNNER_LABELS || '["self-hosted"]') }}
-    timeout-minutes: 1440
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -195,6 +195,7 @@ jobs:
           CASE_ID: ${{ matrix.case }}
           SMOKE: ${{ inputs.smoke }}
         run: |
+          trap 'docker stop -t 5 "$CONTAINER" >/dev/null 2>&1 || true' INT TERM
           touch /tmp/qwen4-mi308x.lock
           args=(--output /results/evaluation --case "$CASE_ID")
           if [ "$SMOKE" = true ]; then args+=(--smoke); fi
@@ -202,8 +203,9 @@ jobs:
             --ipc=host --network=host --group-add video --ulimit nofile=65536:65536 --security-opt seccomp=unconfined \
             -v "$MODELS_ROOT:/models:ro" -v "$RESULTS:/results" \
             -v /tmp/qwen4-mi308x.lock:/tmp/qwen4-mi308x.lock \
-            "$IMAGE" sleep infinity
-          docker exec "$CONTAINER" python3 scripts/ci/qwen4_ci.py "${args[@]}"
+            "$IMAGE" sleep 3600
+          docker exec "$CONTAINER" python3 scripts/ci/qwen4_ci.py "${args[@]}" &
+          wait "$!"
       - name: Preserve provenance and clean up
         if: always()
         run: |
