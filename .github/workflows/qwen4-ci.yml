@@ -1,0 +1,261 @@
+name: Qwen4 MI308X CI
+
+on:
+  pull_request:
+    branches: [qwen4_v0.5.21]
+    types: [opened, reopened, synchronize, ready_for_review, labeled]
+  schedule:
+    - cron: '0 20 * * *'
+  workflow_dispatch:
+    inputs:
+      sglang_ref:
+        description: 'SGLang ref; empty uses this workflow ref'
+        type: string
+      aiter_ref:
+        description: 'AITER ref; empty uses qwen38-flash-next-dev'
+        type: string
+      smoke:
+        description: 'Diagnostic two-request/two-example run; no accuracy gate'
+        type: boolean
+        default: false
+      case:
+        description: 'Comma-separated case IDs; empty runs all six'
+        type: string
+  workflow_call:
+    inputs:
+      harness_sha:
+        description: 'Optional controller revision for an AITER caller'
+        type: string
+        default: ''
+      sglang_ref:
+        description: 'SGLang ref to test from an AITER caller'
+        type: string
+        default: qwen4_v0.5.21
+      aiter_ref:
+        description: 'AITER ref to test'
+        type: string
+        default: ''
+      smoke:
+        type: boolean
+        default: false
+      case:
+        type: string
+        default: ''
+    secrets:
+      DOCKER_PASSWORD:
+        required: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: qwen4-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  validate:
+    name: Qwen4 CPU validation
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.sources.outputs.matrix }}
+      harness_sha: ${{ steps.sources.outputs.harness_sha }}
+      sglang_repository: ${{ steps.sources.outputs.sglang_repository }}
+      sglang_sha: ${{ steps.sources.outputs.sglang_sha }}
+      aiter_sha: ${{ steps.sources.outputs.aiter_sha }}
+    env:
+      SGLANG_REPOSITORY: ${{ !inputs.sglang_ref && github.repository == 'apinge/sglang' && github.event.pull_request.head.repo.full_name || 'apinge/sglang' }}
+      SGLANG_REF: ${{ inputs.sglang_ref || (github.repository == 'apinge/sglang' && (github.event.pull_request.head.sha || github.sha)) || 'qwen4_v0.5.21' }}
+      AITER_REF: ${{ inputs.aiter_ref || (github.repository == 'apinge/aiter' && (github.event.pull_request.head.sha || github.sha)) || 'qwen38-flash-next-dev' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: apinge/sglang
+          ref: ${{ inputs.harness_sha || (github.repository == 'apinge/sglang' && github.sha) || 'qwen4_v0.5.21' }}
+          persist-credentials: false
+      - name: Validate Qwen4 driver and evaluation shell scripts
+        run: |
+          python3 -m venv "$RUNNER_TEMP/qwen4-tests"
+          "$RUNNER_TEMP/qwen4-tests/bin/pip" install pytest==8.3.5
+          "$RUNNER_TEMP/qwen4-tests/bin/python" -m pytest scripts/ci/test_qwen4_ci.py -q
+          for script in evaluation/*.sh; do bash -n "$script"; done
+          echo "Driver unit tests and evaluation shell syntax checks passed." >> "$GITHUB_STEP_SUMMARY"
+      - name: Checkout candidate to freeze its revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ${{ env.SGLANG_REPOSITORY }}
+          ref: ${{ env.SGLANG_REF }}
+          path: candidate
+          persist-credentials: false
+      - name: Checkout AITER to freeze its revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: apinge/aiter
+          ref: ${{ env.AITER_REF }}
+          path: aiter-source
+          persist-credentials: false
+      - name: Select cases and preserve source revisions for retries
+        id: sources
+        env:
+          SELECTED_CASES: ${{ inputs.case }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "scripts/ci")
+          from qwen4_ci import CASES
+
+          ids = [case[0] for case in CASES]
+          selected = {name.strip() for name in os.environ.get("SELECTED_CASES", "").split(",") if name.strip()}
+          unknown = selected - set(ids)
+          if unknown:
+              raise SystemExit(f"Unknown cases: {', '.join(sorted(unknown))}")
+          revisions = {
+              name: subprocess.check_output(["git", "-C", path, "rev-parse", "HEAD"], text=True).strip()
+              for name, path in (("harness_sha", "."), ("sglang_sha", "candidate"), ("aiter_sha", "aiter-source"))
+          }
+          outputs = {
+              **revisions,
+              "sglang_repository": os.environ["SGLANG_REPOSITORY"],
+              "matrix": json.dumps({"case": [name for name in ids if not selected or name in selected]}),
+          }
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as stream:
+              for name, value in outputs.items():
+                  stream.write(f"{name}={value}\n")
+          print(f"Selected cases: {outputs['matrix']}")
+          print(f"Source revisions: {revisions}")
+          PY
+
+  gpu:
+    name: Qwen4 (${{ matrix.case }})
+    needs: validate
+    if: >-
+      github.event_name != 'pull_request' ||
+      (!github.event.pull_request.draft &&
+       (github.event.pull_request.head.repo.full_name == github.repository ||
+        contains(github.event.pull_request.labels.*.name, 'run-qwen4-ci')))
+    runs-on: ${{ fromJSON(vars.QWEN4_RUNNER_LABELS || '["self-hosted"]') }}
+    timeout-minutes: 1440
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.validate.outputs.matrix) }}
+    env:
+      QWEN4_WORK_ROOT: ${{ vars.QWEN4_WORK_ROOT || '/tmp' }}
+      MODELS_ROOT: ${{ vars.QWEN4_MODELS_ROOT || '/raid/models' }}
+      IMAGE: qwen4-ci:${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.case }}
+      CONTAINER: qwen4-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.case }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: apinge/sglang
+          ref: ${{ needs.validate.outputs.harness_sha }}
+          persist-credentials: false
+      - name: Checkout candidate source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ${{ needs.validate.outputs.sglang_repository }}
+          ref: ${{ needs.validate.outputs.sglang_sha }}
+          path: candidate
+          persist-credentials: false
+      - name: Set temporary paths
+        run: |
+          mkdir -p "$QWEN4_WORK_ROOT"
+          work_dir=$(mktemp -d "$QWEN4_WORK_ROOT/qwen4-ci.XXXXXX")
+          mkdir -p "$work_dir/results" "$work_dir/docker" "$work_dir/buildx"
+          echo "RESULTS=$work_dir/results" >> "$GITHUB_ENV"
+          echo "DOCKER_CONFIG=$work_dir/docker" >> "$GITHUB_ENV"
+          echo "BUILDX_CONFIG=$work_dir/buildx" >> "$GITHUB_ENV"
+      - name: Authenticate image pull
+        env:
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ vars.QWEN4_DOCKER_USERNAME || 'alishared' }}
+        run: |
+          if [ -n "$DOCKER_PASSWORD" ]; then
+            printf '%s' "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+          fi
+      - name: Build case image using the pinned sources and Docker cache
+        env:
+          AITER_REF: ${{ needs.validate.outputs.aiter_sha }}
+          BASE_IMAGE: ${{ vars.QWEN4_BASE_IMAGE || 'rocm/ali-private:ubuntu22.04_rocm7.14.0_cp310_torch2.12.0_sglang_d0a5b96_aiter_b7aed05_20261020' }}
+        run: |
+          docker build --network=host --progress=plain --build-arg "AITER_REF=$AITER_REF" \
+            --build-arg "BASE_IMAGE=$BASE_IMAGE" --build-arg SGLANG_SOURCE=candidate \
+            -f evaluation/Dockerfile.ci -t "$IMAGE" . \
+            2>&1 | tee "$RESULTS/build.log"
+      - name: Run evaluation scripts and accuracy gate
+        env:
+          CASE_ID: ${{ matrix.case }}
+          SMOKE: ${{ inputs.smoke }}
+        run: |
+          touch /tmp/qwen4-mi308x.lock
+          args=(--output /results/evaluation --case "$CASE_ID")
+          if [ "$SMOKE" = true ]; then args+=(--smoke); fi
+          docker run -d --name "$CONTAINER" --device /dev/kfd --device /dev/dri \
+            --ipc=host --network=host --group-add video --ulimit nofile=65536:65536 --security-opt seccomp=unconfined \
+            -v "$MODELS_ROOT:/models:ro" -v "$RESULTS:/results" \
+            -v /tmp/qwen4-mi308x.lock:/tmp/qwen4-mi308x.lock \
+            "$IMAGE" sleep infinity
+          docker exec "$CONTAINER" python3 scripts/ci/qwen4_ci.py "${args[@]}"
+      - name: Preserve provenance and clean up
+        if: always()
+        run: |
+          if docker inspect "$CONTAINER" >/dev/null 2>&1; then
+            docker cp "$CONTAINER:/ci/build.json" "$RESULTS/build.json" || true
+            docker exec "$CONTAINER" chown -R "$(id -u):$(id -g)" /results || true
+            docker rm -f "$CONTAINER"
+          fi
+          docker image rm "$IMAGE" 2>/dev/null || true
+          if [ -n "${DOCKER_CONFIG:-}" ]; then rm -rf -- "$DOCKER_CONFIG"; fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: qwen4-results-${{ matrix.case }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.RESULTS }}/**
+            !${{ env.RESULTS }}/**/cache/**
+          if-no-files-found: warn
+          retention-days: 30
+
+  gate:
+    name: Qwen4 CI
+    needs: [validate, gpu]
+    if: >-
+      always() &&
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    env:
+      VALIDATION_RESULT: ${{ needs.validate.result }}
+      CASES_RESULT: ${{ needs.gpu.result }}
+    steps:
+      - name: Checkout the summary formatter
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: apinge/sglang
+          ref: ${{ needs.validate.outputs.harness_sha || inputs.harness_sha || (github.repository == 'apinge/sglang' && github.sha) || 'qwen4_v0.5.21' }}
+          persist-credentials: false
+      - name: Collect case results from this run, including earlier retry attempts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ github.run_id }}
+          pattern: qwen4-results-*
+          path: ${{ runner.temp }}/qwen4-case-results
+      - name: Summarize results and require every selected case to pass
+        if: always()
+        env:
+          CASE_MATRIX: ${{ needs.validate.outputs.matrix }}
+          CASE_FILTER: ${{ inputs.case }}
+          SMOKE: ${{ inputs.smoke }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/qwen4_ci.py summarize

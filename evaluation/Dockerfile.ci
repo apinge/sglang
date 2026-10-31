@@ -1,0 +1,31 @@
+ARG BASE_IMAGE=rocm/ali-private:ubuntu22.04_rocm7.14.0_cp310_torch2.12.0_sglang_d0a5b96_aiter_b7aed05_20261020
+FROM ${BASE_IMAGE}
+
+ARG AITER_REF=qwen38-flash-next-dev
+ENV AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=gfx942 PYTORCH_ROCM_ARCH=gfx942 SGLANG_BUILD_RUST_EXTS=none PYTHONPATH=""
+
+# Freeze the companion ref once. Evaluator and pyhip pins match the recorded gate.
+RUN git init /ci/aiter && \
+    git -C /ci/aiter remote add origin https://github.com/apinge/aiter.git && \
+    git -C /ci/aiter fetch --depth=1 origin "$AITER_REF" && \
+    git -C /ci/aiter checkout --detach FETCH_HEAD && \
+    git -C /ci/aiter submodule update --init --recursive
+RUN git init /ci/pyhip && \
+    git -C /ci/pyhip remote add origin https://github.com/tingqli/pyhip.git && \
+    git -C /ci/pyhip fetch --depth=1 origin edde17b08ffe0dab0360fe3b1aa042b56ac72e1c && \
+    git -C /ci/pyhip checkout --detach FETCH_HEAD && \
+    git -C /ci/pyhip submodule update --init --recursive
+RUN git init /ci/client && \
+    git -C /ci/client remote add origin https://github.com/apinge/sglang.git && \
+    git -C /ci/client fetch --depth=1 origin fc6ddbbf7aac80167ea04cc00bf200af8adf2b85 && \
+    git -C /ci/client checkout --detach FETCH_HEAD
+
+ARG SGLANG_SOURCE=.
+COPY ${SGLANG_SOURCE} /ci/sglang
+# Keep the current CI recipes when testing an older candidate revision.
+COPY evaluation /ci/sglang/evaluation
+COPY scripts/ci/qwen4_ci.py /ci/sglang/scripts/ci/qwen4_ci.py
+RUN python3 /ci/sglang/scripts/ci/qwen4_ci.py install
+WORKDIR /ci/sglang
+ENTRYPOINT []
+CMD ["python3", "scripts/ci/qwen4_ci.py", "--output", "/results"]

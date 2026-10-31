@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
 export SGLANG_DISABLE_CUDNN_CHECK=1
 export SGLANG_VLM_CACHE_SIZE_MB=8192 #阿里用0
 
@@ -15,10 +17,10 @@ export HIP_GDN_SORT_IDX_BS=32768
 export TVM_FFI_DISABLE_TORCH_C_DLPACK=1 # pip uninstall torch-c-dlpack-ext
 
 # --watchdog-timeout 1200 for profile
-model=/models/Qwen3.5-397B-A17B-PTPC-FP8
-python3 -m sglang.launch_server \
-        --port 7080 \
-        --model-path ${model} \
+model="${MODEL_PATH:-/models/Qwen3.5-397B-A17B-PTPC-FP8}"
+"${SERVER_PYTHON:-python3}" -m sglang.launch_server \
+        --host "${HOST:-0.0.0.0}" --port "${PORT:-7080}" --served-model-name "${SERVED_MODEL_NAME:-$model}" \
+        --model-path "${model}" \
         --tp-size 8 \
         --reasoning-parser qwen3 \
         --tool-call-parser qwen3_coder \
@@ -34,10 +36,10 @@ python3 -m sglang.launch_server \
         --kv-cache-dtype fp8_e4m3 \
         --cuda-graph-max-bs-decode 128 \
         --watchdog-timeout 3600 \
-        --disable-radix-cache  2>&1 | tee launch_qwen3.5-397B-fp8_tp8_disable_prefix_cache.sh.log
+        --disable-radix-cache  2>&1 | tee "${LOG_FILE:-launch_qwen3.5-397B-fp8_tp8_disable_prefix_cache.sh.log}"
         # --linear-attn-backend aiter \
         # --linear-attn-decode-backend aiter \
         # --linear-attn-prefill-backend aiter \
         # --mamba-radix-cache-strategy extra_buffer \
-        # --page-size 64  2>&1 | tee launch_qwen3.5-397B-fp8_tp8_prefix_cache_origin_ali2.sh.log
- 
+        # --page-size 64  2>&1 | tee "${LOG_FILE:-launch_qwen3.5-397B-fp8_tp8_disable_prefix_cache.sh.log}"
+

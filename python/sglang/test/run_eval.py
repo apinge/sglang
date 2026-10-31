@@ -116,6 +116,16 @@ def run_eval(args):
     # Lazy import to avoid circular dependency with test_utils
     from sglang.test.test_utils import dump_metric
 
+    strict = getattr(args, "strict", False)
+    if strict and (
+        args.eval_name != "gsm8k"
+        or getattr(args, "api", "chat") != "chat"
+        or getattr(args, "repeat", 1) != 1
+        or type(args.num_examples) is not int
+        or args.num_examples <= 0
+    ):
+        raise ValueError("--strict requires one GSM8K chat run with --num-examples > 0")
+
     warnings.warn(
         "sglang.test.run_eval is deprecated; its legacy scorers will be removed. "
         "Use sglang.test.sgl_eval_utils.run_sgl_eval or `sgl-eval run` instead.",
@@ -261,17 +271,46 @@ def run_eval(args):
 
     print_accept_length_summary(samplers)
 
+    if strict:
+        metrics.update(
+            requested=args.num_examples,
+            scored=len(result.convos),
+            completed=sampler.request_counts["completed"],
+            errors=sampler.request_counts["attempted"]
+            - sampler.request_counts["completed"],
+        )
+
     # Dump reports
     file_stem = f"{args.eval_name}_{sampler.model.replace('/', '_')}"
-    report_filename = f"/tmp/{file_stem}.html"
+    output_dir = getattr(args, "output_dir", None)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        if strict:
+            file_stem = args.eval_name
+    report_filename = os.path.join(output_dir or "/tmp", f"{file_stem}.html")
+    result_filename = os.path.join(output_dir or "/tmp", f"{file_stem}.json")
+    if output_dir:
+        for filename in (report_filename, result_filename):
+            if os.path.lexists(filename):
+                raise FileExistsError(
+                    f"Report already exists: {filename}. Use a fresh --output-dir."
+                )
+    mode = "x" if output_dir else "w"
     print(f"Writing report to {report_filename}")
-    with open(report_filename, "w") as fh:
+    with open(report_filename, mode) as fh:
         fh.write(make_report(result))
     print(metrics)
-    result_filename = f"/tmp/{file_stem}.json"
-    with open(result_filename, "w") as f:
+    with open(result_filename, mode) as f:
         f.write(json.dumps(metrics, indent=2))
     print(f"Writing results to {result_filename}")
+
+    # Empty/token-limited answers remain completed requests in the score denominator.
+    if strict and (
+        metrics["scored"] != args.num_examples
+        or metrics["completed"] != args.num_examples
+        or metrics["errors"]
+    ):
+        raise RuntimeError("Incomplete GSM8K evaluation; JSON/HTML results were saved")
 
     if getattr(args, "return_latency", False):
         return metrics, latency
@@ -311,6 +350,13 @@ if __name__ == "__main__":
         help="API mode: 'chat' for /v1/chat/completions, 'completion' for /v1/completions, 'generate' for SGLang-native /generate",
     )
     parser.add_argument("--num-examples", type=int)
+    parser.add_argument(
+        "--output-dir",
+        help="Directory for new JSON/HTML reports; existing reports are preserved",
+    )
+    parser.add_argument(
+        "--strict", action="store_true", help="Fail incomplete GSM8K chat evaluations"
+    )
     parser.add_argument("--num-threads", type=int, default=512)
     parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=None)

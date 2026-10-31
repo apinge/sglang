@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -o pipefail
+set -euo pipefail
 
 model="${BENCH_MODEL:-/models/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16}"
 input_tokens="${INPUT_TOKENS:-12000}"
@@ -21,13 +21,18 @@ echo "dataset-name: ${dataset_name}"
 
 python3 -m sglang.bench_serving \
     --backend sglang \
-    --model ${model} \
-    --dataset-name ${dataset_name} \
-    --host ${host} \
-    --port ${port} \
-    --num-prompts ${num_prompts} \
-    --random-input ${input_tokens} \
-    --random-output ${output_tokens} \
+    --model "${model}" \
+    --served-model-name "${BENCH_SERVED_MODEL:-$model}" \
+    --dataset-path "${DATASET_PATH:-/models/benchmark_datasets/ShareGPT_V3_unfiltered_cleaned_split.json}" \
+    --seed "${BENCH_SEED:-42}" \
+    --flush-cache --output-details \
+    --output-file "${BENCH_OUTPUT_FILE:-performance.jsonl}" \
+    --dataset-name "${dataset_name}" \
+    --host "${host}" \
+    --port "${port}" \
+    --num-prompts "${num_prompts}" \
+    --random-input-len "${input_tokens}" \
+    --random-output-len "${output_tokens}" \
     --random-range-ratio 1.0 \
-    --warmup-requests ${warmup_requests} \
-    --max-concurrency ${max_concurrency} 2>&1 | tee "${log_file}"
+    --warmup-requests "${warmup_requests}" \
+    --max-concurrency "${max_concurrency}" 2>&1 | tee "${log_file}"
