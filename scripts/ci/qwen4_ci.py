@@ -412,6 +412,7 @@ def run_case(case, args, directory, row):
 def summary(output, rows, args, errors):
     failed = bool(errors or any(row["status"] != "passed" for row in rows))
     text = f"## Qwen4 evaluation — {'Failed' if failed else 'Passed'}\n\n"
+    text += f"Cases passed: **{sum(row['status'] == 'passed' for row in rows)}/{len(rows)}**. "
     text += f"Coverage: {len(rows)}/6 selected cases. "
     text += (
         "Smoke is diagnostic: two examples; accuracy gate is disabled.\n\n"
@@ -449,6 +450,84 @@ def summary(output, rows, args, errors):
     )
     (output / "summary.md").write_text(text + "\n")
     return int(failed)
+
+
+def summarize_ci():
+    """Combine the latest GitHub case attempts and enforce the final CI gate."""
+    selected = json.loads(os.environ.get("CASE_MATRIX") or "{}").get("case")
+    if selected is None:
+        selected = [
+            name.strip()
+            for name in os.environ.get("CASE_FILTER", "").split(",")
+            if name.strip()
+        ]
+    root = Path(os.environ["RUNNER_TEMP"]) / "qwen4-case-results"
+    pages = json.loads(
+        command(
+            [
+                "gh",
+                "api",
+                "--paginate",
+                "--slurp",
+                f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
+                f"{os.environ['GITHUB_RUN_ID']}/jobs?filter=latest&per_page=100",
+            ]
+        )
+    )
+    jobs = {
+        job["name"].rsplit(" / ", 1)[-1]: job for page in pages for job in page["jobs"]
+    }
+    rows = []
+    for case in CASES:
+        name, baseline = case[0], case[5]
+        if selected and name not in selected:
+            continue
+        row = {"case": name, "baseline": baseline, "status": "not run", "errors": []}
+        job = jobs.get(f"Qwen4 ({name})", {})
+        artifact = root / f"qwen4-results-{name}-{job.get('run_attempt', 0)}"
+        try:
+            report = json.loads((artifact / "evaluation/summary.json").read_text())
+            result = next(row for row in report["cases"] if row["case"] == name)
+            result["baseline"] = baseline
+            result["errors"].extend(report["errors"])
+            if report["failed"]:
+                result["status"] = "failed"
+            row = result
+        except Exception as exc:
+            row["status"] = "failed"
+            row["errors"].append(f"{artifact.name}: {exc}")
+        conclusion = job.get("conclusion")
+        if conclusion != "success":
+            row["status"] = (
+                "failed" if conclusion == "failure" else conclusion or "not run"
+            )
+            row["errors"].append(f"GitHub case job: {conclusion or 'not run'}")
+        rows.append(row)
+    errors = [
+        f"{name}: {os.environ[key]}"
+        for name, key in (
+            ("CPU validation", "VALIDATION_RESULT"),
+            ("GPU jobs", "CASES_RESULT"),
+        )
+        if os.environ[key] != "success"
+    ]
+    if os.environ["CASES_RESULT"] == "skipped":
+        errors.append(
+            "Qwen4 GPU cases did not run. Fork PRs require the run-qwen4-ci label."
+        )
+    output = root.parent / "qwen4-summary"
+    output.mkdir(exist_ok=True)
+    result = summary(
+        output,
+        rows,
+        argparse.Namespace(smoke=os.environ.get("SMOKE") == "true"),
+        errors,
+    )
+    text = (output / "summary.md").read_text()
+    print(text, flush=True)
+    with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as stream:
+        stream.write(text)
+    return result
 
 
 def run(args):
@@ -513,9 +592,6 @@ def run(args):
     finally:
         result = summary(output, rows, args, errors)
         print(f"Report: {output / 'summary.md'}", flush=True)
-        if os.environ.get("GITHUB_STEP_SUMMARY"):
-            with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as stream:
-                stream.write((output / "summary.md").read_text())
     return result
 
 
@@ -668,7 +744,9 @@ def install():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", nargs="?", choices=("run", "install"), default="run")
+    parser.add_argument(
+        "command", nargs="?", choices=("run", "install", "summarize"), default="run"
+    )
     parser.add_argument("--output", default="qwen4-results")
     parser.add_argument(
         "--case", default="", help="Comma-separated case IDs; empty runs all six"
@@ -693,13 +771,15 @@ def main():
         help="Run the GSM8K gate without the performance benchmark",
     )
     args = parser.parse_args()
-    devices = args.gpus.split(",")
-    if any(not device.isdigit() for device in devices) or len(set(devices)) != len(
-        devices
-    ):
-        parser.error("--gpus must contain distinct, comma-separated GPU indices")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit("Terminated"))
     try:
+        if args.command == "summarize":
+            return summarize_ci()
+        devices = args.gpus.split(",")
+        if any(not device.isdigit() for device in devices) or len(set(devices)) != len(
+            devices
+        ):
+            parser.error("--gpus must contain distinct, comma-separated GPU indices")
         if args.command == "install":
             install()
             return 0

@@ -76,11 +76,13 @@ jobs:
           repository: apinge/sglang
           ref: ${{ inputs.harness_sha || (github.repository == 'apinge/sglang' && github.sha) || 'qwen4_v0.5.21' }}
           persist-credentials: false
-      - run: |
+      - name: Validate Qwen4 driver and evaluation shell scripts
+        run: |
           python3 -m venv "$RUNNER_TEMP/qwen4-tests"
           "$RUNNER_TEMP/qwen4-tests/bin/pip" install pytest==8.3.5
           "$RUNNER_TEMP/qwen4-tests/bin/python" -m pytest scripts/ci/test_qwen4_ci.py -q
           for script in evaluation/*.sh; do bash -n "$script"; done
+          echo "Driver unit tests and evaluation shell syntax checks passed." >> "$GITHUB_STEP_SUMMARY"
       - name: Checkout candidate to freeze its revision
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -211,7 +213,6 @@ jobs:
             docker rm -f "$CONTAINER"
           fi
           docker image rm "$IMAGE" 2>/dev/null || true
-          if [ -f "$RESULTS/evaluation/summary.md" ]; then cat "$RESULTS/evaluation/summary.md" >> "$GITHUB_STEP_SUMMARY"; fi
           if [ -n "${DOCKER_CONFIG:-}" ]; then rm -rf -- "$DOCKER_CONFIG"; fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
@@ -230,16 +231,31 @@ jobs:
       always() &&
       (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    env:
+      VALIDATION_RESULT: ${{ needs.validate.result }}
+      CASES_RESULT: ${{ needs.gpu.result }}
     steps:
-      - name: Require every selected case to pass
+      - name: Checkout the summary formatter
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: apinge/sglang
+          ref: ${{ needs.validate.outputs.harness_sha || inputs.harness_sha || (github.repository == 'apinge/sglang' && github.sha) || 'qwen4_v0.5.21' }}
+          persist-credentials: false
+      - name: Collect case results from this run, including earlier retry attempts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ github.run_id }}
+          pattern: qwen4-results-*
+          path: ${{ runner.temp }}/qwen4-case-results
+      - name: Summarize results and require every selected case to pass
+        if: always()
         env:
-          VALIDATION_RESULT: ${{ needs.validate.result }}
-          CASES_RESULT: ${{ needs.gpu.result }}
-        run: |
-          echo "CPU validation: $VALIDATION_RESULT; case jobs: $CASES_RESULT"
-          test "$VALIDATION_RESULT" = success
-          if [ "$CASES_RESULT" = skipped ]; then
-            echo "::error::Qwen4 GPU cases did not run. Fork PRs require the run-qwen4-ci label."
-            exit 1
-          fi
-          test "$CASES_RESULT" = success
+          CASE_MATRIX: ${{ needs.validate.outputs.matrix }}
+          CASE_FILTER: ${{ inputs.case }}
+          SMOKE: ${{ inputs.smoke }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/qwen4_ci.py summarize

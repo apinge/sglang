@@ -199,6 +199,7 @@ Target model: [sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16](https://huggin
 CI runs each selected case in its own GitHub Actions matrix job using `evaluation/Dockerfile.ci` and the existing launch, benchmark, and `run_gsm8k.sh` scripts.
 Non-draft fork PRs require the `run-qwen4-ci` label to run GPU cases. Adding the label triggers a new run through the `labeled` event.
 Case jobs run serially on the shared host, each with its own image container, console logs, and result artifact. Docker builds reuse cached layers.
+The final **Qwen4 CI** job calls `python3 scripts/ci/qwen4_ci.py summarize` to publish one combined table and the number of passing cases (for example, **6/6**).
 The default case order is Qwen3.8 Flash TP2 base, Qwen3.8 Flash TP2 MTP, Qwen3.5 35B TP4 base, Qwen3.5 35B TP1 DFlash, Qwen3.5 397B TP8 base, then Qwen3.5 397B TP8 DFlash. Local runs and the Actions matrix use this order. Direct local runs can evaluate multiple cases in one container and share its normal kernel cache:
 
 ```bash
