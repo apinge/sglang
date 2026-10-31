@@ -36,18 +36,16 @@ Decode, CUDA graph capture, speculative modes, DP attention and EP all-to-all ke
 
 ## Results (8x MI308X, 12000 in / 350 out, `scripts/run_pure_text_bench.sh`)
 
-12k-token prefill step: TP4 534 -> 436 ms, TP2 760 -> 685 ms. Serving req/s, two interleaved rounds:
+12k-token prefill step (mean of 4): TP4 542.0 -> 434.9 ms, TP2 748.7 -> 691.8 ms. Serving req/s, two
+interleaved rounds (TP4 and TP2 run one after the other):
 
 | conc | TP4 base | TP4 SP | TP2 base | TP2 SP |
 |---|---|---|---|---|
-| 1 | 0.334 / 0.339 | 0.346 / 0.349 | 0.297 / 0.302 | 0.307 / 0.306 |
-| 4 | 0.775 / 0.764 | 0.831 / 0.814 | 0.586 / 0.588 | 0.615 / 0.610 |
-| 8 | 1.011 / 1.001 | 1.120 / 1.113 | 0.786 / 0.780 | 0.830 / 0.823 |
-| 16 | 1.216 / 1.209 | 1.387 / 1.370 | 0.925 / 0.926 | 0.987 / 0.992 |
-| 32 | 1.343 / 1.338 * | 1.570 / 1.559 / 1.548 * | 0.999 / 1.000 | 1.070 / 1.078 |
+| 1 | 0.342 / 0.339 | 0.349 / 0.353 | 0.302 / 0.302 | 0.310 / 0.309 |
+| 4 | 0.776 / 0.769 | 0.821 / 0.836 | 0.594 / 0.597 | 0.619 / 0.616 |
+| 8 | 1.003 / 1.012 | 1.087 / 1.122 | 0.798 / 0.792 | 0.834 / 0.826 |
+| 16 | 1.211 / 1.205 | 1.359 / 1.373 | 0.930 / 0.931 | 0.991 / 0.993 |
+| 32 | 1.353 / 1.347 | 1.541 / 1.553 | 1.008 / 1.006 | 1.079 / 1.081 |
 
-\* The first TP4 base round at c32 overlapped with a server start on the same node (1.120 req/s, 35 s max
-ITL) and was discarded; both TP4 arms were rerun alone at c32 (the last value).
-
-Greedy outputs of a long-context probe are bit-identical to the baseline; gsm8k and the probe
-(48/48) are unchanged.
+Greedy outputs of a long-context probe are bit-identical to the baseline; the long-context check is
+48/48 and gsm8k stays within run-to-run noise.
