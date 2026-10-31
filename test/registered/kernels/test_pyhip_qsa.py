@@ -202,6 +202,14 @@ class TestPyHIPQSA(CustomTestCase):
                     ), envs.SGLANG_TEST_PYHIP_QSA.override(True):
                         backend = QwenSparseAttnBackend(runner)
                     self.assertIsNotNone(backend._pyhip_attention)
+                    slot_reads = []
+                    forward = backend._pyhip_attention.forward
+
+                    def record(**kwargs):
+                        slot_reads.append(kwargs.get("kv_slots") is not None)
+                        return forward(**kwargs)
+
+                    backend._pyhip_attention.forward = record
                     locations = torch.cat(
                         [
                             table[request, prefix : prefix + count]
@@ -305,6 +313,20 @@ class TestPyHIPQSA(CustomTestCase):
                     self.assertEqual(output.shape, (rows + 2, heads * 256))
                     self.assertTrue(bool((output[rows:] == 0).all()))
                     self.assertEqual(len(backend._pyhip_attention.checked_layouts), 1)
+                    # Prefixed chunks read the pool in place through the slot table; the
+                    # gather fallback (a pool PyHIP cannot read in place) gives the same output.
+                    self.assertEqual(slot_reads, [any(prefixes)])
+                    if any(prefixes):
+                        with patch.object(
+                            backend._pyhip_attention,
+                            "can_read_kv_slots",
+                            return_value=False,
+                        ):
+                            packed = backend.forward_extend(
+                                query, keys, values, layer, batch, topk_indices=indices
+                            )
+                        self.assertEqual(slot_reads, [True, False])
+                        self.assertTrue(torch.equal(packed, output))
                     self.assertFalse(
                         backend._pyhip_attention.can_use_for_forward(
                             q=query[:rows],
@@ -441,7 +463,24 @@ class TestPyHIPQSA(CustomTestCase):
         self._check_graph_decode(module, pool, table, lengths)
         self._check_graph_verify(module, pool, table, (lengths[0] + 2, lengths[1] + 2))
 
-    def _check_graph_decode(self, module, pool, table, lengths):
+    def test_graph_decode_with_1m_context_page_table(self):
+        """A 1M-token context sizes the graph page table to 16384 pages (262144 keys);
+        graph decode must still run PyHIP instead of silently falling back to native."""
+        with envs.SGLANG_USE_PYHIP_QSA.override(
+            True
+        ), envs.SGLANG_TEST_PYHIP_QSA.override(True):
+            module = _indexer(self.device)
+        table = torch.stack(
+            [
+                64 + torch.arange(4096, dtype=torch.int32, device=self.device),
+                4224 + torch.arange(4096, dtype=torch.int32, device=self.device),
+            ]
+        )
+        self._check_graph_decode(
+            module, _pool(self.device), table, (2055, 15), pages=16384
+        )
+
+    def _check_graph_decode(self, module, pool, table, lengths, pages=None):
         seq = torch.tensor(
             [n + 1 for n in lengths], dtype=torch.int32, device=self.device
         )
@@ -449,6 +488,11 @@ class TestPyHIPQSA(CustomTestCase):
         requests = torch.tensor([1, 2], dtype=torch.int64, device=self.device)
         slots, groups = _ring_slots(requests, logical.long())
         writes = (table[torch.arange(2, device=self.device), logical.long()] // 4).int()
+        page_table = table[:, ::64] // 64
+        if pages is not None:
+            page_table = torch.nn.functional.pad(
+                page_table, (0, pages - page_table.shape[1])
+            )
         metadata = QSAIndexerMetadata(
             sequence_lengths=seq,
             token_to_batch_idx=torch.arange(2, dtype=torch.int32, device=self.device),
@@ -460,7 +504,7 @@ class TestPyHIPQSA(CustomTestCase):
             req_pool_indices=requests,
             is_cuda_graph=True,
             graph_write_locs=writes,
-            graph_compressed_page_table=(table[:, ::64] // 64).contiguous(),
+            graph_compressed_page_table=page_table.contiguous(),
             graph_compressed_lengths=seq // 4,
             decode_logical_positions=logical,
             pending_ring_slots=slots,

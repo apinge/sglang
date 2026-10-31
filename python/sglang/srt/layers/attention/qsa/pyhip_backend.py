@@ -61,7 +61,33 @@ class PyHIPAttention:
             )
         )
 
-    def forward(self, *, q, k, v, indices, query_lens, prefix_lens, scale, layer_id):
+    @staticmethod
+    def can_read_kv_slots(*, key_buffer, value_buffer, slots):
+        """Whether PyHIP can read this layer's K/V pool in place through ``slots``."""
+        return (
+            slots.dtype == torch.int32
+            and slots.ndim == 1
+            and slots.is_contiguous()
+            and slots.device == key_buffer.device
+            and key_buffer.shape == value_buffer.shape
+            and key_buffer.is_contiguous()
+            and value_buffer.is_contiguous()
+        )
+
+    def forward(
+        self,
+        *,
+        q,
+        k,
+        v,
+        indices,
+        query_lens,
+        prefix_lens,
+        scale,
+        layer_id,
+        kv_slots=None,
+    ):
+        # With kv_slots, k/v are the layer's token pool and kv_slots maps packed context tokens to it.
         output = self.attention(
             q,
             k,
@@ -70,11 +96,14 @@ class PyHIPAttention:
             query_lens=query_lens,
             prefix_lens=prefix_lens,
             softmax_scale=scale,
+            kv_slots=kv_slots,
         )
         layout = (layer_id, tuple(query_lens), tuple(prefix_lens), q.shape[1], scale)
         if self.validate and layout not in self.checked_layouts:
             from sglang.test.qsa_validation import check_attention
 
+            if kv_slots is not None:
+                k, v = k.index_select(0, kv_slots), v.index_select(0, kv_slots)
             check_attention(
                 q=q,
                 k=k,
@@ -314,8 +343,7 @@ class PyHIPIndexer:
                 )
             return run()
 
-    @staticmethod
-    def _supports_decode(*, rows, device, cache, table, lengths):
+    def _supports_decode(self, *, rows, device, cache, table, lengths):
         return (
             0 < rows < 65536
             and cache.dtype == torch.bfloat16
@@ -327,8 +355,18 @@ class PyHIPIndexer:
             and table.ndim == 2
             and table.shape[0] == rows
             and table.is_contiguous()
-            and table.shape[1] > 0
-            and table.shape[1] * 16 <= 65536
+            and 0 < table.shape[1] * 16 <= self.runtime.MAX_COMPRESSED_KEYS
+            # PyHIP's FP32 decode logits, padded by 512 values, use 32-bit offsets.
+            # Mirrors decode_indexer's check, which raises instead of falling back.
+            #   rows            query rows (per token in verify and draft extend)
+            #   table.shape[1]  compressed-K pages per row, 16 keys each
+            #   + 512           the top-k reads up to the next 512-value boundary
+            # Graph decode sizes the table by context_len, so PyHIP handles up to:
+            #   context_len  keys/row  bytes/row  max rows
+            #       262,144    65,536    256 KiB     8,191
+            #     1,000,000   250,000    977 KiB     2,147
+            #     1,048,576   262,144      1 MiB     2,047
+            and (rows * table.shape[1] * 16 + 512) * 4 < 2**31
             and lengths.dtype == torch.int32
             and lengths.shape == (rows,)
             and lengths.is_contiguous()
