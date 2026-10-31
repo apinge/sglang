@@ -420,8 +420,8 @@ def summary(output, rows, args, errors):
         else "GSM8K: 200 examples; maximum 2% relative drop from recorded references.\n\n"
     )
     text += "Performance thresholds are advisory.\n\n"
-    text += "| Case | Status | GSM8K | Reference / minimum | Output tokens/s | TTFT (ms) | TPOT (ms) | Accept length |\n"
-    text += "|---|---|---:|---:|---:|---:|---:|---:|\n"
+    text += "| Case | Status | GSM8K | Reference / minimum | Output tokens/s | QPS | TTFT (ms) | TPOT (ms) | Accept length |\n"
+    text += "|---|---|---:|---:|---:|---:|---:|---:|---:|\n"
     for row in rows:
         accuracy, perf = row.get("accuracy", {}), row.get("performance", {})
         score = f"{accuracy['score']:.2%}" if accuracy else "—"
@@ -430,6 +430,7 @@ def summary(output, rows, args, errors):
             f"{perf[key]:.3f}" if perf.get(key) is not None else "—"
             for key in (
                 "output_throughput",
+                "request_throughput",
                 "mean_ttft_ms",
                 "mean_tpot_ms",
                 "accept_length",

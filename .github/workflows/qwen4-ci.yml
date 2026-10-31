@@ -71,7 +71,7 @@ jobs:
       SGLANG_REF: ${{ inputs.sglang_ref || (github.repository == 'apinge/sglang' && (github.event.pull_request.head.sha || github.sha)) || 'qwen4_v0.5.21' }}
       AITER_REF: ${{ inputs.aiter_ref || (github.repository == 'apinge/aiter' && (github.event.pull_request.head.sha || github.sha)) || 'qwen38-flash-next-dev' }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: apinge/sglang
           ref: ${{ inputs.harness_sha || (github.repository == 'apinge/sglang' && github.sha) || 'qwen4_v0.5.21' }}
@@ -84,14 +84,14 @@ jobs:
           for script in evaluation/*.sh; do bash -n "$script"; done
           echo "Driver unit tests and evaluation shell syntax checks passed." >> "$GITHUB_STEP_SUMMARY"
       - name: Checkout candidate to freeze its revision
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.SGLANG_REPOSITORY }}
           ref: ${{ env.SGLANG_REF }}
           path: candidate
           persist-credentials: false
       - name: Checkout AITER to freeze its revision
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: apinge/aiter
           ref: ${{ env.AITER_REF }}
@@ -153,13 +153,13 @@ jobs:
       IMAGE: qwen4-ci:${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.case }}
       CONTAINER: qwen4-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.case }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: apinge/sglang
           ref: ${{ needs.validate.outputs.harness_sha }}
           persist-credentials: false
       - name: Checkout candidate source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ needs.validate.outputs.sglang_repository }}
           ref: ${{ needs.validate.outputs.sglang_sha }}
@@ -216,7 +216,7 @@ jobs:
           fi
           docker image rm "$IMAGE" 2>/dev/null || true
           if [ -n "${DOCKER_CONFIG:-}" ]; then rm -rf -- "$DOCKER_CONFIG"; fi
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: qwen4-results-${{ matrix.case }}-${{ github.run_attempt }}
@@ -241,13 +241,13 @@ jobs:
       CASES_RESULT: ${{ needs.gpu.result }}
     steps:
       - name: Checkout the summary formatter
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: apinge/sglang
           ref: ${{ needs.validate.outputs.harness_sha || inputs.harness_sha || (github.repository == 'apinge/sglang' && github.sha) || 'qwen4_v0.5.21' }}
           persist-credentials: false
       - name: Collect case results from this run, including earlier retry attempts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           github-token: ${{ github.token }}
           run-id: ${{ github.run_id }}
