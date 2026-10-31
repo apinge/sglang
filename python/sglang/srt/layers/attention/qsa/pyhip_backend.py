@@ -13,7 +13,10 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_rope_position_matrix,
 )
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
-from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
+from sglang.srt.layers.rotary_embedding.mrope import (
+    MRotaryEmbedding,
+    YaRNScalingMRotaryEmbedding,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
@@ -147,7 +150,8 @@ class PyHIPIndexer:
         ) != (4, 1, 128, 4, 512, 2048):
             return None
         rotary = indexer.rotary_emb
-        if type(rotary) is MRotaryEmbedding:
+        # YaRN only rescales the cos/sin cache, which the PyHIP prep reads as is.
+        if type(rotary) in (MRotaryEmbedding, YaRNScalingMRotaryEmbedding):
             if rotary.mrope_interleaved_glm or len(rotary.mrope_section or ()) not in (
                 0,
                 3,

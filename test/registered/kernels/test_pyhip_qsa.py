@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
     QwenSparseAttnMetadata,
 )
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -66,17 +67,18 @@ def _pool(device):
     return pool
 
 
-def _indexer(device):
-    rotary = MRotaryEmbedding(
-        head_size=256,
-        rotary_dim=64,
-        max_position_embeddings=8192,
-        base=1000000,
-        is_neox_style=True,
-        dtype=torch.bfloat16,
-        mrope_section=[11, 11, 10],
-        mrope_interleaved=True,
-    )
+def _indexer(device, rotary=None):
+    if rotary is None:
+        rotary = MRotaryEmbedding(
+            head_size=256,
+            rotary_dim=64,
+            max_position_embeddings=8192,
+            base=1000000,
+            is_neox_style=True,
+            dtype=torch.bfloat16,
+            mrope_section=[11, 11, 10],
+            mrope_interleaved=True,
+        )
     previous = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
     try:
@@ -396,12 +398,36 @@ class TestPyHIPQSA(CustomTestCase):
         nonfinite[0, 0] = float("nan")
         self.assertFalse(valid(tokens, nonfinite))
 
-    @torch.no_grad()
     def test_prefill_and_graph_decode(self):
+        self._check_prefill_and_graph_decode(rotary=None)
+
+    def test_prefill_and_graph_decode_with_yarn_rope(self):
+        """The 1M-context launch overrides RoPE to YaRN, which get_rope builds as an
+        MRotaryEmbedding subclass; PyHIP rejected it and silently ran the native indexer.
+        YaRN only rescales the cos/sin cache, so PyHIP must run and match native."""
+        rotary = get_rope(
+            head_size=256,
+            rotary_dim=256,
+            max_position=8192,
+            base=1000000,
+            rope_scaling={
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 8192,
+                "mrope_section": [11, 11, 10],
+                "mrope_interleaved": True,
+            },
+            dtype=torch.bfloat16,
+            partial_rotary_factor=0.25,
+        )
+        self._check_prefill_and_graph_decode(rotary=rotary)
+
+    @torch.no_grad()
+    def _check_prefill_and_graph_decode(self, *, rotary):
         with envs.SGLANG_USE_PYHIP_QSA.override(
             True
         ), envs.SGLANG_TEST_PYHIP_QSA.override(True):
-            module = _indexer(self.device)
+            module = _indexer(self.device, rotary)
         self.assertIsNotNone(module._pyhip_indexer)
         pool = _pool(self.device)
         lengths, extends = (2055, 15), (7, 15)
