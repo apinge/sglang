@@ -1,6 +1,12 @@
 ARG BASE_IMAGE=rocm/ali-private:ubuntu22.04_rocm7.14.0_cp310_torch2.12.0_sglang_d0a5b96_aiter_b7aed05_20261020
 FROM ${BASE_IMAGE}
 
+# Standalone concurrency client; add its missing packages without resolving or
+# upgrading the base image's serving runtime dependencies.
+RUN python3 -m pip install --no-deps --no-cache-dir \
+    aliyun-python-sdk-core==2.16.1 aliyun-python-sdk-kms==2.16.5 \
+    crcmod==1.7 jmespath==1.1.0 oss2==2.19.1 pycryptodome==4.2.0
+
 ARG AITER_REF=qwen38-flash-next-dev
 ENV AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=gfx942 PYTORCH_ROCM_ARCH=gfx942 SGLANG_BUILD_RUST_EXTS=none PYTHONPATH=""
 

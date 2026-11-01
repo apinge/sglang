@@ -21,7 +21,7 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parents[2]
 EVALUATION = ROOT / "evaluation"
 CLIENT_SHA = "fc6ddbbf7aac80167ea04cc00bf200af8adf2b85"
-PRESSURE_BENCHMARK = "benchmark_example-20261013-363695ea/request_rate"
+PRESSURE_BENCHMARK = "benchmark_example-20261013-363695ea/concurrency"
 GSM8K_MAX_RELATIVE_DROP = 0.02
 DATASETS = {
     "gsm8k/test.jsonl": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
@@ -419,20 +419,29 @@ def run_case(case, args, directory, row):
         if args.smoke:
             env.update(NUM_PROMPTS="2", WARMUP_REQUESTS="1", GSM8K_NUM_EXAMPLES="2")
         if pressure:
+            concurrents = [1] if args.smoke else [1, 2, 4, 8, 16, 32]
+            dataset = f"tk_in:{12000 if q38 else 8000},tk_out:{output_tokens}"
+            dataset += ",conc:" + "-".join(map(str, concurrents))
+            if args.smoke:
+                dataset += ",prm:2"
             env.update(
                 LLM_API_MODEL=served_name,
                 LLM_LOCAL_TOKENIZER_PATH=str(model_path),
+                LLM_INFER_FRAMEWORK="sglang",
                 LLM_BENCH_BACKEND="sglang",
-                LLM_NUM_WORKERS="0",
-                LLM_API_URL=f"http://127.0.0.1:{args.port}/v1/completions",
+                LLM_API_URL=f"http://127.0.0.1:{args.port}/generate",
                 LLM_AUTO_SEQ_SIGMA="4",
-                LLM_AUTO_DATASET_CONF=f"tk_in:{12000 if q38 else 8000},tk_out:{output_tokens}",
-                LLM_REQ_RATE="0.1",
-                LLM_REQ_RATE_STEP="0.1",
-                LLM_REQ_RATE_DURATION="20" if args.smoke else "120",
-                LLM_BENCH_MAX_ITERS="1" if args.smoke else "8",
-                LLM_BENCH_SUPPLEMENT_MAX_ITERS="4",
-                LLM_SUPPLEMENT_TOLERANCE="0.01",
+                LLM_AUTO_DATASET_CONF=dataset,
+                LLM_AUTO_PROMPT_FACTOR="2",
+                LLM_REPOST_PROMPT_CNT_PER_THREAD="0",
+                LLM_LOOP_FOREVER="False",
+                LLM_WAIT_IF_TIMEOUT="False",
+                LLM_TIMEOUT="120",
+                LLM_DISABLE_REPORT="True",
+                LLM_ENABLE_REPORT="False",
+                LLM_ENABLE_UPLOAD_PROMPT="False",
+                LLM_AVG_FIRST_TOKEN_TIMEOUT="20000",
+                LLM_AVG_STEP_LATENCY_TIMEOUT="100",
             )
         if pressure:
             phases = [("pressure", str(pressure_source / "run.sh"), 3300)]
@@ -454,21 +463,29 @@ def run_case(case, args, directory, row):
                     row[phase] = validate_accuracy(directory / "gsm8k.json", args.smoke)
                     check_accuracy_gate(row[phase]["score"], baseline, args.smoke)
                 elif phase == "pressure":
-                    reports = sorted((pressure_source / "results").glob("*.json"))
-                    if not reports:
-                        raise ValueError("Pressure benchmark produced no results")
-                    for path in reports:
-                        data = json.loads(path.read_text())
-                        count = data.get("num_prompts")
-                        if (
-                            type(count) is not int
-                            or count <= 0
-                            or data.get("completed") != count
-                            or data.get("errors") != [""] * count
-                        ):
-                            raise ValueError(
-                                f"{path.name}: incomplete pressure requests or request errors"
-                            )
+                    log = (directory / "run.sh.log").read_text(errors="replace")
+                    failures = [
+                        line
+                        for line in log.splitlines()
+                        if re.search(r"\bError:|Traceback", line)
+                    ]
+                    if failures:
+                        raise ValueError(
+                            "Concurrency request errors:\n" + "\n".join(failures[:10])
+                        )
+                    completed = [
+                        int(value)
+                        for value in re.findall(r"Concurrent Nums: (\d+)", log)
+                    ]
+                    error_rates = re.findall(r"Error Requests: ([0-9.]+)%", log)
+                    if (
+                        completed != concurrents
+                        or len(error_rates) != len(concurrents)
+                        or any(float(rate) != 0 for rate in error_rates)
+                    ):
+                        raise ValueError(
+                            f"Incomplete concurrency pressure run: completed levels {completed}"
+                        )
                 else:
                     row[phase] = validate_performance(
                         directory / "performance.jsonl",
@@ -880,7 +897,7 @@ def main():
     mode.add_argument(
         "--pressure",
         action="store_true",
-        help="Run only the daily V4 pressure sweep and check the final server log",
+        help="Run only the daily concurrency pressure test and check the final server log",
     )
     args = parser.parse_args()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit("Terminated"))

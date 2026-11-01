@@ -284,7 +284,7 @@ and two examples and reports diagnostic results with the accuracy gate disabled.
 
 ### Daily Pressure Test
 - The daily run starts at **04:00 China time** and runs only pressure tests for all six cases.
-- Pressure uses `LLM_AUTO_SEQ_SIGMA=4` and `LLM_AUTO_DATASET_CONF=tk_in:12000,tk_out:350` for Qwen3.8 or `tk_in:8000,tk_out:500` for Qwen3.5. CI selects the standalone async client with `LLM_NUM_WORKERS=0`. QPS starts at 0.1 and increases by 0.1, using 120 seconds to compute each round's request count, at most eight sweep rounds and four supplement iterations per threshold.
+- Pressure uses `benchmark_example-20261013-363695ea/concurrency/run.sh` with `LLM_AUTO_SEQ_SIGMA=4`. Qwen3.8 uses `tk_in:12000,tk_out:350,conc:1-2-4-8-16-32`; Qwen3.5 uses `tk_in:8000,tk_out:500,conc:1-2-4-8-16-32`. Fixed concurrency levels use 8, 8, 8, 16, 32, and 64 main requests respectively, with repost warmups disabled.
 - CI checks the complete server log for error, core-dump, segmentation-fault, and GPU memory-access-fault markers. Matches fail the case; The daily summary shows only each case's pass/fail status and any failure messages. The original `server.log` and pressure console log are retained for debugging.
-- To run one pressure case locally, add `--pressure` to the driver command.
+- To run one pressure case locally, add `--pressure` to the driver command. `--smoke --pressure` runs two requests at concurrency one. The CI image adds the pinned concurrency-client packages without upgrading the serving runtime;
 </details>
