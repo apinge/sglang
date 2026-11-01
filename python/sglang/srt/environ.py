@@ -306,6 +306,9 @@ class Envs:
     SGLANG_USE_PYHIP_QSA = EnvBool(False)
     # Numerical acceptance only; never enable for performance measurements.
     SGLANG_TEST_PYHIP_QSA = EnvBool(False)
+    # Split long PyHIP QSA prefill indexer rows across attention-TP ranks,
+    # then all-gather the selections.
+    SGLANG_OPT_PYHIP_QSA_SPLIT_INDEXER = EnvBool(False)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)

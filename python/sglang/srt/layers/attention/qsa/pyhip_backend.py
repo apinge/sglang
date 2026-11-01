@@ -7,6 +7,7 @@ import logging
 
 import torch
 
+from sglang.srt.distributed import get_attn_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.metadata import (
     build_group_ring_slots,
@@ -24,6 +25,31 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
 logger = logging.getLogger(__name__)
+
+# MI308X: indexer ~1.06e-5 us per row and key, TP2 all-gather ~0.087 us per row,
+# so TP2 breaks even near 16k keys per row; these keep a 2x margin.
+_SPLIT_MIN_ROWS = 2048
+_SPLIT_MIN_KEYS_PER_ROW = 32768
+
+
+def _worth_splitting(*, lengths, extends):
+    rows = sum(extends)
+    # Row i of a request sees (prefix + i + 1) // 4 compressed keys.
+    keys = sum(e * (2 * s - e + 1) for s, e in zip(lengths, extends)) // 8
+    return rows >= _SPLIT_MIN_ROWS and keys >= _SPLIT_MIN_KEYS_PER_ROW * rows
+
+
+def _split_prefill(run, *, group, rows, device, q_out=None):
+    """Select this rank's equal share of the rows, then all-gather all shares."""
+    share = -(-rows // group.world_size)
+    first = share * group.rank_in_group
+    out = torch.empty(
+        (share * group.world_size, 2051), dtype=torch.int32, device=device
+    )
+    run(row_range=(min(first, rows), min(first + share, rows)), out=out, q_out=q_out)
+    # In place: this rank's rows already sit at its share of out.
+    group.all_gather_into_tensor(out, out[first : first + share])
+    return out[:rows]
 
 
 class PyHIPAttention:
@@ -137,6 +163,11 @@ class PyHIPIndexer:
             from sglang.test.qsa_validation import IndexerValidation
 
             self.validation = IndexerValidation()
+        self.split_group = None
+        if envs.SGLANG_OPT_PYHIP_QSA_SPLIT_INDEXER.get():
+            group = get_attn_tp_group()
+            if group.world_size > 1:
+                self.split_group = group
 
     @classmethod
     def create(cls, *, indexer):
@@ -329,6 +360,16 @@ class PyHIPIndexer:
             seq_lens=lengths,
             extend_lens=extends,
         )
+        if self.split_group is not None and _worth_splitting(
+            lengths=lengths, extends=extends
+        ):
+            run = functools.partial(
+                _split_prefill,
+                run,
+                group=self.split_group,
+                rows=len(hidden),
+                device=hidden.device,
+            )
         with torch.profiler.record_function("pyhip_qsa.indexer.prefill"):
             if (
                 self.validation is not None
