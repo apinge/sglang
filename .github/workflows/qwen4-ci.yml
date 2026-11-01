@@ -5,7 +5,7 @@ on:
     branches: [qwen4_v0.5.21]
     types: [opened, reopened, synchronize, ready_for_review, labeled]
   schedule:
-    - cron: '0 20 * * *'
+    - cron: '0 20 * * *' # 04:00 China time (UTC+8)
   workflow_dispatch:
     inputs:
       sglang_ref:
@@ -194,11 +194,13 @@ jobs:
         env:
           CASE_ID: ${{ matrix.case }}
           SMOKE: ${{ inputs.smoke }}
+          DAILY_PRESSURE: ${{ github.event_name == 'schedule' && github.event.schedule == '0 20 * * *' }}
         run: |
           trap 'docker stop -t 5 "$CONTAINER" >/dev/null 2>&1 || true' INT TERM
           touch /tmp/qwen4-mi308x.lock
           args=(--output /results/evaluation --case "$CASE_ID")
           if [ "$SMOKE" = true ]; then args+=(--smoke); fi
+          if [ "$DAILY_PRESSURE" = true ]; then args+=(--pressure); fi
           docker run -d --name "$CONTAINER" --device /dev/kfd --device /dev/dri \
             --ipc=host --network=host --group-add video --ulimit nofile=65536:65536 --security-opt seccomp=unconfined \
             -v "$MODELS_ROOT:/models:ro" -v "$RESULTS:/results" \
@@ -223,6 +225,8 @@ jobs:
           path: |
             ${{ env.RESULTS }}/**
             !${{ env.RESULTS }}/**/cache/**
+            !${{ env.RESULTS }}/**/core
+            !${{ env.RESULTS }}/**/core.*
           if-no-files-found: warn
           retention-days: 30
 
@@ -259,5 +263,6 @@ jobs:
           CASE_MATRIX: ${{ needs.validate.outputs.matrix }}
           CASE_FILTER: ${{ inputs.case }}
           SMOKE: ${{ inputs.smoke }}
+          DAILY_PRESSURE: ${{ github.event_name == 'schedule' && github.event.schedule == '0 20 * * *' }}
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/ci/qwen4_ci.py summarize

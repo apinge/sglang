@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import socket
@@ -20,6 +21,7 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parents[2]
 EVALUATION = ROOT / "evaluation"
 CLIENT_SHA = "fc6ddbbf7aac80167ea04cc00bf200af8adf2b85"
+PRESSURE_BENCHMARK = "benchmark_example-20261013-363695ea/request_rate"
 GSM8K_MAX_RELATIVE_DROP = 0.02
 DATASETS = {
     "gsm8k/test.jsonl": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
@@ -263,11 +265,38 @@ def validate_performance(path, prompts, output_tokens, speculative=False):
     }
 
 
+def check_server_log(path):
+    ignored_imports = (
+        "ignore import error when loading sglang.srt.models.",
+        "ignore import error when loading sglang.srt.multimodal.processors.",
+    )
+    fault = re.compile(
+        r"\b(?:[a-z]*error|traceback|"
+        r"core[ _-]dump(?:ed)?|segmentation[ _-]fault|segfault|sigsegv|sigabrt|aborted|"
+        r"illegal[ _-]memory[ _-]access|memory[ _-]access[ _-]fault|"
+        r"misaligned[ _-]address|device[ _-]side[ _-]assert|gpu[ _-]fault|"
+        r"hipError\w*|HSA_STATUS_ERROR\w*)\b",
+        re.IGNORECASE,
+    )
+    errors = [
+        line
+        for line in Path(path).read_text(errors="replace").splitlines()
+        if not any(prefix in line.lower() for prefix in ignored_imports)
+        and fault.search(line)
+    ]
+    if errors:
+        raise RuntimeError(
+            "Server log contains errors or GPU faults:\n" + "\n".join(errors[:10])
+        )
+
+
 def run_phase(script, directory, env, server, timeout):
-    print(f"Running {script}; log: {directory / (script + '.log')}", flush=True)
+    script = Path(script)
+    log = directory / (script.name + ".log")
+    print(f"Running {script}; log: {log}", flush=True)
     with managed_process(
         ["bash", str(EVALUATION / script)],
-        directory / (script + ".log"),
+        log,
         env,
         directory,
     ) as process:
@@ -320,6 +349,15 @@ def run_case(case, args, directory, row):
     devices = args.gpus.split(",")
     if len(devices) < tp:
         raise ValueError(f"{name} requires {tp} GPUs; --gpus supplies {len(devices)}")
+    pressure = getattr(args, "pressure", False)
+    pressure_dir = directory / "pressure"
+    pressure_source = pressure_dir / ".benchmark"
+    if pressure:
+        shutil.copytree(
+            Path(args.models_root).resolve() / PRESSURE_BENCHMARK,
+            pressure_source,
+            ignore=shutil.ignore_patterns("__pycache__", "results", "*.log"),
+        )
     served_name = f"qwen4-{os.getpid()}-{name}"
     env = clean_environment(
         SERVER_PYTHON=sys.executable,
@@ -380,74 +418,128 @@ def run_case(case, args, directory, row):
         )
         if args.smoke:
             env.update(NUM_PROMPTS="2", WARMUP_REQUESTS="1", GSM8K_NUM_EXAMPLES="2")
-        phases = []
-        if not args.accuracy_only:
-            phases.append(
-                (
-                    "performance",
-                    f"run_qwen{'38' if q38 else '35'}_pure_text_bench.sh",
-                    3600,
-                )
+        if pressure:
+            env.update(
+                LLM_API_MODEL=served_name,
+                LLM_LOCAL_TOKENIZER_PATH=str(model_path),
+                LLM_BENCH_BACKEND="sglang",
+                LLM_NUM_WORKERS="0",
+                LLM_API_URL=f"http://127.0.0.1:{args.port}/v1/completions",
+                LLM_AUTO_SEQ_SIGMA="4",
+                LLM_AUTO_DATASET_CONF=f"tk_in:{12000 if q38 else 8000},tk_out:{output_tokens}",
+                LLM_REQ_RATE="0.1",
+                LLM_REQ_RATE_STEP="0.1",
+                LLM_REQ_RATE_DURATION="20" if args.smoke else "120",
+                LLM_BENCH_MAX_ITERS="1" if args.smoke else "8",
+                LLM_BENCH_SUPPLEMENT_MAX_ITERS="4",
+                LLM_SUPPLEMENT_TOLERANCE="0.01",
             )
-        phases.append(("accuracy", "run_gsm8k.sh", 7200))
+        if pressure:
+            phases = [("pressure", str(pressure_source / "run.sh"), 3300)]
+        else:
+            phases = []
+            if not args.accuracy_only:
+                phases.append(
+                    (
+                        "performance",
+                        f"run_qwen{'38' if q38 else '35'}_pure_text_bench.sh",
+                        3600,
+                    )
+                )
+            phases.append(("accuracy", "run_gsm8k.sh", 7200))
         for phase, script, timeout in phases:
             try:
                 run_phase(script, directory, env, server, timeout)
-                row[phase] = (
-                    validate_accuracy(directory / "gsm8k.json", args.smoke)
-                    if phase == "accuracy"
-                    else validate_performance(
+                if phase == "accuracy":
+                    row[phase] = validate_accuracy(directory / "gsm8k.json", args.smoke)
+                    check_accuracy_gate(row[phase]["score"], baseline, args.smoke)
+                elif phase == "pressure":
+                    reports = sorted((pressure_source / "results").glob("*.json"))
+                    if not reports:
+                        raise ValueError("Pressure benchmark produced no results")
+                    for path in reports:
+                        data = json.loads(path.read_text())
+                        count = data.get("num_prompts")
+                        if (
+                            type(count) is not int
+                            or count <= 0
+                            or data.get("completed") != count
+                            or data.get("errors") != [""] * count
+                        ):
+                            raise ValueError(
+                                f"{path.name}: incomplete pressure requests or request errors"
+                            )
+                else:
+                    row[phase] = validate_performance(
                         directory / "performance.jsonl",
                         2 if args.smoke else 128,
                         output_tokens,
                         speculative=mode != "base",
                     )
-                )
-                if phase == "accuracy":
-                    check_accuracy_gate(row[phase]["score"], baseline, args.smoke)
             except Exception as exc:
                 row["errors"].append(f"{phase}: {exc}")
+    if pressure:
+        # Inspect the complete log after shutdown, including teardown failures.
+        check_server_log(directory / "server.log")
 
 
 def summary(output, rows, args, errors):
+    pressure_only = getattr(args, "pressure", False)
     failed = bool(errors or any(row["status"] != "passed" for row in rows))
-    text = f"## Qwen4 evaluation — {'Failed' if failed else 'Passed'}\n\n"
+    title = "Qwen4 daily pressure" if pressure_only else "Qwen4 evaluation"
+    text = f"## {title} — {'Failed' if failed else 'Passed'}\n\n"
     text += f"Cases passed: **{sum(row['status'] == 'passed' for row in rows)}/{len(rows)}**. "
     text += f"Coverage: {len(rows)}/6 selected cases. "
-    text += (
-        "Smoke is diagnostic: two examples; accuracy gate is disabled.\n\n"
-        if args.smoke
-        else "GSM8K: 200 examples; maximum 2% relative drop from recorded references.\n\n"
-    )
-    text += "Performance thresholds are advisory.\n\n"
-    text += "| Case | Status | GSM8K | Reference / minimum | Output tokens/s | QPS | TTFT (ms) | TPOT (ms) | Accept length |\n"
-    text += "|---|---|---:|---:|---:|---:|---:|---:|---:|\n"
-    for row in rows:
-        accuracy, perf = row.get("accuracy", {}), row.get("performance", {})
-        score = f"{accuracy['score']:.2%}" if accuracy else "—"
-        minimum = row["baseline"] * (1 - GSM8K_MAX_RELATIVE_DROP)
-        metrics = [
-            f"{perf[key]:.3f}" if perf.get(key) is not None else "—"
-            for key in (
-                "output_throughput",
-                "request_throughput",
-                "mean_ttft_ms",
-                "mean_tpot_ms",
-                "accept_length",
-            )
-        ]
+    if pressure_only:
+        text += "Pressure only: request completion and final server-log checks are required.\n\n"
+        if args.smoke:
+            text += "Smoke is diagnostic: one two-request pressure round.\n\n"
+        text += "| Case | Status |\n|---|---|\n"
+        for row in rows:
+            status = "passed" if row["status"] == "passed" else "failed"
+            text += f"| {row['case']} | {status} |\n"
+    else:
         text += (
-            f"| {row['case']} | {row['status']} | {score} | {row['baseline']:.2%} / {minimum:.2%} | "
-            + " | ".join(metrics)
-            + " |\n"
+            "Smoke is diagnostic: two examples; accuracy gate is disabled.\n\n"
+            if args.smoke
+            else "GSM8K: 200 examples; maximum 2% relative drop from recorded references.\n\n"
         )
+    if not pressure_only:
+        text += "Performance thresholds are advisory.\n\n"
+        text += "| Case | Status | GSM8K | Reference / minimum | Output tokens/s | QPS | TTFT (ms) | TPOT (ms) | Accept length |\n"
+        text += "|---|---|---:|---:|---:|---:|---:|---:|---:|\n"
+        for row in rows:
+            accuracy, perf = row.get("accuracy", {}), row.get("performance", {})
+            score = f"{accuracy['score']:.2%}" if accuracy else "—"
+            minimum = row["baseline"] * (1 - GSM8K_MAX_RELATIVE_DROP)
+            metrics = [
+                f"{perf[key]:.3f}" if perf.get(key) is not None else "—"
+                for key in (
+                    "output_throughput",
+                    "request_throughput",
+                    "mean_ttft_ms",
+                    "mean_tpot_ms",
+                    "accept_length",
+                )
+            ]
+            text += (
+                f"| {row['case']} | {row['status']} | {score} | {row['baseline']:.2%} / {minimum:.2%} | "
+                + " | ".join(metrics)
+                + " |\n"
+            )
     for error in errors + [
         f"{row['case']}: {e}" for row in rows for e in row["errors"]
     ]:
         text += "\n- " + str(error).replace("\n", " ").replace("|", "\\|")
     write_json(
         output / "summary.json",
-        {"failed": failed, "smoke": args.smoke, "errors": errors, "cases": rows},
+        {
+            "failed": failed,
+            "smoke": args.smoke,
+            "pressure_only": pressure_only,
+            "errors": errors,
+            "cases": rows,
+        },
     )
     (output / "summary.md").write_text(text + "\n")
     return int(failed)
@@ -521,7 +613,10 @@ def summarize_ci():
     result = summary(
         output,
         rows,
-        argparse.Namespace(smoke=os.environ.get("SMOKE") == "true"),
+        argparse.Namespace(
+            smoke=os.environ.get("SMOKE") == "true",
+            pressure=os.environ.get("DAILY_PRESSURE") == "true",
+        ),
         errors,
     )
     text = (output / "summary.md").read_text()
@@ -532,6 +627,7 @@ def summarize_ci():
 
 
 def run(args):
+    pressure = getattr(args, "pressure", False)
     selected = {name.strip() for name in args.case.split(",") if name.strip()}
     unknown = selected - {case[0] for case in CASES}
     if unknown:
@@ -548,17 +644,26 @@ def run(args):
     errors = []
     try:
         client = Path(args.client_root).resolve()
-        if command(
-            ["git", "-C", str(client), "rev-parse", "HEAD"]
-        ) != CLIENT_SHA or command(
-            ["git", "-C", str(client), "status", "--porcelain", "--", "python/sglang"]
+        if not pressure and (
+            command(["git", "-C", str(client), "rev-parse", "HEAD"]) != CLIENT_SHA
+            or command(
+                [
+                    "git",
+                    "-C",
+                    str(client),
+                    "status",
+                    "--porcelain",
+                    "--",
+                    "python/sglang",
+                ]
+            )
         ):
             raise ValueError(f"Evaluator must be a clean checkout at {CLIENT_SHA}")
         datasets = Path(
             args.datasets_root or Path(args.models_root) / "benchmark_datasets"
         )
         for relative, expected in DATASETS.items():
-            if args.accuracy_only and relative != "gsm8k/test.jsonl":
+            if pressure or (args.accuracy_only and relative != "gsm8k/test.jsonl"):
                 continue
             with (datasets / relative).open("rb") as stream:
                 checksum = hashlib.sha256()
@@ -766,10 +871,16 @@ def main():
         action="store_true",
         help="Diagnostic two-request/two-example run; no accuracy gate",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--accuracy-only",
         action="store_true",
         help="Run the GSM8K gate without the performance benchmark",
+    )
+    mode.add_argument(
+        "--pressure",
+        action="store_true",
+        help="Run only the daily V4 pressure sweep and check the final server log",
     )
     args = parser.parse_args()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit("Terminated"))
