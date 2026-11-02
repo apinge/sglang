@@ -64,9 +64,12 @@ def _aiter_reduce_scatter(ca_comm, partial: torch.Tensor, out: torch.Tensor) -> 
     """
     if not is_hip() or ca_comm is None or ca_comm.disabled:
         return False
-    from aiter.dist.device_communicators.custom_all_reduce import (
-        CustomAllreduce as AiterCustomAllreduce,
-    )
+    try:
+        from aiter.dist.device_communicators.custom_all_reduce import (
+            CustomAllreduce as AiterCustomAllreduce,
+        )
+    except ImportError:
+        return False
 
     if not isinstance(ca_comm, AiterCustomAllreduce) or not ca_comm.should_custom_ar(
         partial
