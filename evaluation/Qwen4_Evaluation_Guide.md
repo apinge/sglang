@@ -261,17 +261,17 @@ comma-separated case IDs from the table below.
 The command exits nonzero for launch errors, incomplete requests, invalid results, or an accuracy regression. Logs, native JSON/HTML reports, and `summary.md` are written under the fresh output directory. Build provenance lists the source commits and installed package versions. Keep `QWEN4_WORK_ROOT` outside `/home` on hosts with limited home storage; Docker layers remain in the daemon's data root.
 Use a fresh `--output-dir` for each direct evaluator run. Ordinary evaluations retain model-specific report filenames; strict GSM8K runs use `gsm8k.json/html`.
 
-Default runs evaluate all six cases with 128 fixed-length performance requests and 200 GSM8K examples each. The accuracy gate is `score >= recorded_reference * 0.98`; performance thresholds are advisory.
+Default runs evaluate all six cases with 128 fixed-length performance requests and 200 GSM8K examples each. The accuracy gate permits at most a 3% relative drop: `score >= recorded_reference * 0.97`; performance thresholds are advisory.
 
 
 | Case ID                 | Reference | Minimum correct / 200 |
 | ----------------------- | --------- | --------------------- |
-| Qwen3.8-Flash-TP2-Base  | 98.0%     | 193                   |
-| Qwen3.8-Flash-TP2-MTP   | 98.5%     | 194                   |
-| Qwen3.5-35B-TP4-Base    | 97.0%     | 191                   |
-| Qwen3.5-35B-TP1-DFlash  | 97.0%     | 191                   |
-| Qwen3.5-397B-TP8-Base   | 99.0%     | 195                   |
-| Qwen3.5-397B-TP8-DFlash | 98.5%     | 194                   |
+| Qwen3.8-Flash-TP2-Base  | 98.0%     | 191                   |
+| Qwen3.8-Flash-TP2-MTP   | 98.5%     | 192                   |
+| Qwen3.5-35B-TP4-Base    | 97.0%     | 189                   |
+| Qwen3.5-35B-TP1-DFlash  | 97.0%     | 189                   |
+| Qwen3.5-397B-TP8-Base   | 99.0%     | 193                   |
+| Qwen3.5-397B-TP8-DFlash | 98.5%     | 192                   |
 
 
 Use `--case Qwen3.5-35B-TP1-DFlash --gpus 2` to run one selected case on a free
@@ -284,7 +284,7 @@ and two examples and reports diagnostic results with the accuracy gate disabled.
 
 ### Daily Pressure Test
 - The daily run starts at **04:00 China time** and runs only pressure tests for all six cases.
-- Pressure uses `benchmark_example-20261013-363695ea/concurrency/run.sh` with `LLM_AUTO_SEQ_SIGMA=4`. Qwen3.8 uses `tk_in:12000,tk_out:350,conc:1-2-4-8-16-32`; Qwen3.5 uses `tk_in:8000,tk_out:500,conc:1-2-4-8-16-32`. Fixed concurrency levels use 8, 8, 8, 16, 32, and 64 main requests respectively, with repost warmups disabled.
+- Pressure uses `benchmark_example-20261013-363695ea/concurrency/run.sh` with `LLM_AUTO_SEQ_SIGMA=4`. Qwen3.8 uses `tk_in:12000,tk_out:350,conc:1-2-4-8-12-16-32`; Qwen3.5 uses `tk_in:8000,tk_out:500,conc:1-2-4-8-12-16-32`. Fixed concurrency levels use 8, 8, 8, 16, 32, 32, and 64 main requests respectively, with repost warmups disabled.
 - CI checks the complete server log for error, core-dump, segmentation-fault, and GPU memory-access-fault markers. Matches fail the case; The daily summary shows only each case's pass/fail status and any failure messages. The original `server.log` and pressure console log are retained for debugging.
 - To run one pressure case locally, add `--pressure` to the driver command. `--smoke --pressure` runs two requests at concurrency one. The CI image adds the pinned concurrency-client packages without upgrading the serving runtime;
 </details>

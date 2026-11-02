@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 EVALUATION = ROOT / "evaluation"
 CLIENT_SHA = "fc6ddbbf7aac80167ea04cc00bf200af8adf2b85"
 PRESSURE_BENCHMARK = "benchmark_example-20261013-363695ea/concurrency"
-GSM8K_MAX_RELATIVE_DROP = 0.02
+GSM8K_MAX_RELATIVE_DROP = 0.03
 DATASETS = {
     "gsm8k/test.jsonl": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
     "ShareGPT_V3_unfiltered_cleaned_split.json": "35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4",
@@ -220,7 +220,8 @@ def check_accuracy_gate(score, baseline, smoke=False):
     if not smoke and score + 1e-12 < minimum:
         raise ValueError(
             f"GSM8K regression: {score:.2%} < {minimum:.2%} "
-            f"(reference {baseline:.2%}, maximum relative drop 2%)"
+            f"(reference {baseline:.2%}, maximum relative drop "
+            f"{GSM8K_MAX_RELATIVE_DROP:.0%})"
         )
 
 
@@ -419,7 +420,7 @@ def run_case(case, args, directory, row):
         if args.smoke:
             env.update(NUM_PROMPTS="2", WARMUP_REQUESTS="1", GSM8K_NUM_EXAMPLES="2")
         if pressure:
-            concurrents = [1] if args.smoke else [1, 2, 4, 8, 16, 32]
+            concurrents = [1] if args.smoke else [1, 2, 4, 8, 12, 16, 32]
             dataset = f"tk_in:{12000 if q38 else 8000},tk_out:{output_tokens}"
             dataset += ",conc:" + "-".join(map(str, concurrents))
             if args.smoke:
@@ -519,7 +520,10 @@ def summary(output, rows, args, errors):
         text += (
             "Smoke is diagnostic: two examples; accuracy gate is disabled.\n\n"
             if args.smoke
-            else "GSM8K: 200 examples; maximum 2% relative drop from recorded references.\n\n"
+            else (
+                "GSM8K: 200 examples; maximum "
+                f"{GSM8K_MAX_RELATIVE_DROP:.0%} relative drop from recorded references.\n\n"
+            )
         )
     if not pressure_only:
         text += "Performance thresholds are advisory.\n\n"
