@@ -161,6 +161,40 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         yield module
 
 
+def _can_repack_resident_fp8_aiter_moe(
+    module: torch.nn.Module, quant_method, target_device: torch.device
+) -> bool:
+    """Skip old-storage snapshots only for the known same-GPU AITER FP8 hook."""
+    if target_device.type != "cuda" or torch.version.hip is None:
+        return False
+    scheme = getattr(module, "scheme", None)
+    if scheme is None:
+        return False
+    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsFusedMoEMethod,
+    )
+    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+        compressed_tensors_w8a8_fp8_moe as fp8_moe,
+    )
+
+    # Subclasses may have extra residency/restore requirements.
+    if (
+        type(quant_method) is not CompressedTensorsFusedMoEMethod
+        or type(scheme) is not fp8_moe.CompressedTensorsW8A8Fp8MoE
+        or scheme.weight_quant.strategy != fp8_moe.QuantizationStrategy.CHANNEL
+        or not fp8_moe.will_use_aiter_moe()
+    ):
+        return False
+    if target_device.index is None:
+        target_device = torch.device("cuda", torch.cuda.current_device())
+    # Do not build a tensor list: that would itself retain replaced Parameters.
+    return all(
+        tensor.device == target_device
+        for tensors in (module.parameters(), module.buffers())
+        for tensor in tensors
+    )
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -1005,9 +1039,22 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{memory_start - memory_end:.3f}",
             )
 
-        for _, module in model.named_modules():
+        for module_name, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
+                if _can_repack_resident_fp8_aiter_moe(
+                    module, quant_method, target_device
+                ):
+                    # This hook keeps all state on the same GPU. Staging it
+                    # would retain original_data for the unshuffled weights
+                    # until both replacement weights have been allocated.
+                    logger.info(
+                        "FP8 MoE early-release workaround: direct GPU repack "
+                        "without old-weight snapshots (%s)",
+                        module_name,
+                    )
+                    quant_method.process_weights_after_loading(module)
+                    continue
                 # When quant methods need to process weights after loading
                 # (for repacking, quantizing, etc), they expect parameters
                 # to be on the global target device. This scope is for the

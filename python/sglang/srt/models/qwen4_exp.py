@@ -2174,7 +2174,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         for module in self.modules():
             if isinstance(module, Qwen3_5GatedDeltaNet):
                 module.finalize_fused_in_proj()
-
+        params_dict.clear()
         return loaded_params
 
     @classmethod

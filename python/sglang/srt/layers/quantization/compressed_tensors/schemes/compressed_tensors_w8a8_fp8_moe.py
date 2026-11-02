@@ -293,6 +293,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 layer.w2_input_scale = torch.nn.Parameter(
                     w2_input_scale, requires_grad=False
                 )
+            # The Parameters now own these tensors. Keeping the normalization
+            # views here would pin unshuffled storage after AITER replaces it.
+            del w13_weight, w2_weight
+            del w13_weight_scale, w2_weight_scale
+            del w13_input_scale, w2_input_scale
         if self.weight_quant.strategy == QuantizationStrategy.TENSOR:
             # Fp8 moe kernel needs single weight scale for w13 per expert.
             # We take the max then dequant and requant each expert.
@@ -349,6 +354,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                         torch.cat([part1_sp, part2_sp], dim=1),
                         requires_grad=False,
                     )
+                    del part1_s, part2_s, part1_sp, part2_sp
                     torch.cuda.empty_cache()
 
                     part1_w = layer.w13_weight.data[:, :N, :]
@@ -364,6 +370,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                         shuffle_weight(padded_w13, (16, 16)),
                         requires_grad=False,
                     )
+                    del part1_w, part2_w, part1_wp, part2_wp, padded_w13
                     torch.cuda.empty_cache()
 
                     padded_w2 = F.pad(
@@ -376,6 +383,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                         shuffle_weight(padded_w2, (16, 16)),
                         requires_grad=False,
                     )
+                    del padded_w2
                     torch.cuda.empty_cache()
                 else:
                     layer.w13_weight = torch.nn.Parameter(

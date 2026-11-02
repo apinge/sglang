@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+import weakref
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from torch import nn
 
-from sglang.srt.model_loader.loader import device_loading_context
+from sglang.srt.model_loader.loader import DefaultModelLoader, device_loading_context
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -152,6 +155,82 @@ class TestModulePostLoadValidation(unittest.TestCase):
 
         self.assertEqual(module.scale.device.type, "cpu")
         self.assertEqual(module.scale.data_ptr(), scale_ptr)
+
+
+@unittest.skipUnless(PROCESS_DEVICE is not None, "requires CUDA")
+class TestResidentFp8MoEEarlyRelease(unittest.TestCase):
+    def _run_post_load(self, weight_device):
+        from compressed_tensors.quantization import QuantizationStrategy
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsFusedMoEMethod,
+        )
+        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+            compressed_tensors_w8a8_fp8_moe as fp8_moe,
+        )
+
+        model = nn.Module()
+        model.w13_weight = nn.Parameter(torch.ones(2, 2, device=weight_device))
+        model.w2_weight = nn.Parameter(torch.ones(2, 2, device=PROCESS_DEVICE))
+        model.load_weights = lambda weights: None
+        model.scheme = object.__new__(fp8_moe.CompressedTensorsW8A8Fp8MoE)
+        model.scheme.weight_quant = SimpleNamespace(
+            strategy=QuantizationStrategy.CHANNEL
+        )
+        model.quant_method = object.__new__(CompressedTensorsFusedMoEMethod)
+        refs = [weakref.ref(model.w13_weight), weakref.ref(model.w2_weight)]
+        observed = {}
+
+        def replace_weights(scheme, layer):
+            observed["devices_in_hook"] = (
+                layer.w13_weight.device, layer.w2_weight.device
+            )
+            layer.w13_weight = nn.Parameter(layer.w13_weight.detach().clone() * 2)
+            layer.w2_weight = nn.Parameter(layer.w2_weight.detach().clone() * 3)
+            observed["old_parameters_released_in_hook"] = [
+                ref() is None for ref in refs
+            ]
+
+        with (
+            patch.object(torch.version, "hip", "test"),
+            patch.object(fp8_moe, "will_use_aiter_moe", return_value=True),
+            patch.object(
+                fp8_moe.CompressedTensorsW8A8Fp8MoE,
+                "process_weights_after_loading", replace_weights,
+            ),
+        ):
+            DefaultModelLoader.load_weights_and_postprocess(
+                model, iter(()), PROCESS_DEVICE
+            )
+        return model, observed
+
+    def test_resident_weights_are_released_before_hook_returns(self):
+        model, observed = self._run_post_load(PROCESS_DEVICE)
+        self.assertEqual(
+            observed["old_parameters_released_in_hook"], [True, True]
+        )
+        self.assertEqual(model.w13_weight.device, PROCESS_DEVICE)
+        self.assertEqual(model.w2_weight.device, PROCESS_DEVICE)
+        torch.testing.assert_close(
+            model.w13_weight, torch.full_like(model.w13_weight, 2)
+        )
+        torch.testing.assert_close(
+            model.w2_weight, torch.full_like(model.w2_weight, 3)
+        )
+
+    def test_mixed_residency_keeps_restore_context(self):
+        model, observed = self._run_post_load(torch.device("cpu"))
+        self.assertEqual(observed["devices_in_hook"], (PROCESS_DEVICE, PROCESS_DEVICE))
+        self.assertEqual(
+            observed["old_parameters_released_in_hook"], [False, False]
+        )
+        self.assertEqual(model.w13_weight.device.type, "cpu")
+        self.assertEqual(model.w2_weight.device, PROCESS_DEVICE)
+        torch.testing.assert_close(
+            model.w13_weight, torch.full_like(model.w13_weight, 2)
+        )
+        torch.testing.assert_close(
+            model.w2_weight, torch.full_like(model.w2_weight, 3)
+        )
 
 
 if __name__ == "__main__":
