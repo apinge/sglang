@@ -306,6 +306,8 @@ class Envs:
     SGLANG_USE_PYHIP_QSA = EnvBool(False)
     # Numerical acceptance only; never enable for performance measurements.
     SGLANG_TEST_PYHIP_QSA = EnvBool(False)
+    # Log actual QSA indexer dispatch once per layer, forward mode and backend.
+    SGLANG_LOG_QSA_INDEXER_BACKEND = EnvBool(False)
     # Split long PyHIP QSA prefill indexer rows across attention-TP ranks,
     # then all-gather the selections.
     SGLANG_OPT_PYHIP_QSA_SPLIT_INDEXER = EnvBool(False)
