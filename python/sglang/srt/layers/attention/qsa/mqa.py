@@ -12,11 +12,6 @@ import torch
 
 from sglang.srt.utils.common import is_hip
 
-# Bound the gathered FP32 K workspace, including CUDA Graph capture. The full
-# logits still cover max_model_len; page-table capacity must not create a
-# batch * context * head_dim FP32 copy in a single allocation.
-_DECODE_FP32_KEY_BUDGET_BYTES = 256 * 1024 * 1024
-
 try:
     import flashinfer.comm  # noqa: F401
 except ImportError:
@@ -98,40 +93,22 @@ def torch_qsa_mqa_decode(
     _validate_decode_inputs(q, k_cache, page_table, context_lens)
     batch = q.shape[0]
     page_size = k_cache.shape[1]
+    total = page_table.shape[1] * page_size
+    gathered = k_cache[page_table.long().clamp_min(0).reshape(-1), :, 0].reshape(
+        batch, total, q.shape[-1]
+    )
+    scores = torch.einsum("bhd,bnd->bnh", q.float(), gathered.float())
+    scores = torch.relu(scores).sum(dim=-1) / (score_scale or math.sqrt(q.shape[-1]))
+    positions = torch.arange(total, device=q.device).unsqueeze(0)
+    scores.masked_fill_(
+        positions >= context_lens.to(q.device).reshape(-1, 1), -float("inf")
+    )
     logits = torch.full(
         (batch, max_model_len), -float("inf"), dtype=torch.float32, device=q.device
     )
-    copy_len = min(page_table.shape[1] * page_size, max_model_len)
-    if batch == 0 or copy_len == 0:
-        return logits
-
-    # Shapes are capture-static; do not read context_lens back to the CPU.
-    # Align chunks to pages so physical KV addressing remains unchanged.
-    keys_per_chunk = max(
-        1, _DECODE_FP32_KEY_BUDGET_BYTES // (batch * q.shape[-1] * 4)
-    )
-    pages_per_chunk = max(1, keys_per_chunk // page_size)
-    needed_pages = (copy_len + page_size - 1) // page_size
-    q_float = q.float()
-    lengths = context_lens.to(q.device).reshape(-1, 1)
-    scale = score_scale or math.sqrt(q.shape[-1])
-    for page_start in range(0, needed_pages, pages_per_chunk):
-        page_end = min(page_start + pages_per_chunk, needed_pages)
-        chunk_keys = (page_end - page_start) * page_size
-        table_chunk = page_table[:, page_start:page_end]
-        gathered = k_cache[table_chunk.long().clamp_min(0).reshape(-1), :, 0].reshape(
-            batch, chunk_keys, q.shape[-1]
-        )
-        scores = torch.einsum("bhd,bnd->bnh", q_float, gathered.float())
-        scores = torch.relu(scores).sum(dim=-1) / scale
-        start = page_start * page_size
-        end = min(start + chunk_keys, copy_len)
-        positions = torch.arange(start, start + chunk_keys, device=q.device)
-        scores.masked_fill_(positions.unsqueeze(0) >= lengths, -float("inf"))
-        logits[:, start:end] = scores[:, : end - start]
-        # Release each chunk before allocating the next one. Graphs can reuse
-        # this workspace because all operations stay ordered on the same stream.
-        del gathered, scores
+    copy_len = min(total, max_model_len)
+    if copy_len:
+        logits[:, :copy_len] = scores[:, :copy_len]
     return logits
 
 
