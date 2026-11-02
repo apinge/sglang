@@ -21,7 +21,7 @@ DATASET_REVISION = "192ab2185289094fc556ec8ce5ce1e8e587154ca"
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", nargs="?", type=Path, default=DEFAULT_PROMPTS)
-    parser.add_argument("--model", default="/models/Qwen3.8-Flash-Next-PTPC-FP8")
+    parser.add_argument("--model", default="/models/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16")
     parser.add_argument("--dataset-path", type=Path, help="Use a local ShareGPT JSON file.")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
