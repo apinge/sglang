@@ -19,14 +19,18 @@ partial block output [T, 2560]
 
 The reduce-scatter plus all-gather (aiter custom kernels) move the same bytes as the all-reduce they
 replace, and AG(RS(x)) is bit-identical to AR(x). The residual is sharded after the last PLE layer
-(PLE's short conv mixes neighbouring tokens) and gathered back before the final mixer.
+(PLE's short conv mixes neighbouring tokens). At the end the final mixer runs on the local rows and only
+its [T, 2560] output is gathered; the [T, 4 x 2560] residual (HC state) is gathered only when the forward
+captures hidden states (speculative decoding, `return_hidden_states`).
 
 | Knob | Default | Effect |
 |---|---|---|
 | `SGLANG_QWEN4_SEQ_PARALLEL` | 0 | enable the sequence-parallel residual for prefill |
 | `SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS` | 2048 | smaller batches keep the all-reduce |
 
-Decode, CUDA graph capture, speculative modes, DP attention and EP all-to-all keep the original path.
+The path covers eager EXTEND / MIXED / TARGET_VERIFY forwards with at least
+`SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS` tokens. Decode, CUDA-graph-captured batches (including captured
+target verify), draft-model forwards, DP attention and EP all-to-all keep the original path.
 
 ## Scripts
 

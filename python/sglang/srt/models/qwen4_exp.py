@@ -1246,6 +1246,13 @@ class Qwen4ExpPLELayer(nn.Module):
         return _pad_token_rows(output, batch.physical_tokens)
 
 
+def _needs_hc_state(forward_batch: ForwardBatch) -> bool:
+    """Whether the forward must return the residual (HC state): speculative
+    drafting and requested hidden states read it."""
+    mode = forward_batch.capture_hidden_mode
+    return mode is not None and mode.need_capture()
+
+
 class Qwen4ExpLayerExtensionMixin:
     def _init_qwen4_exp_layer_extensions(
         self,
@@ -1692,7 +1699,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
     ) -> Optional[SeqParallelPlan]:
         if (
             not self._seq_parallel_enabled
-            or not forward_batch.forward_mode.is_extend_without_speculative()
+            # Eager target-verify batches qualify too; captured ones never do.
+            or forward_batch.forward_mode
+            not in (ForwardMode.EXTEND, ForwardMode.MIXED, ForwardMode.TARGET_VERIFY)
             or get_is_capture_mode()
             # The residual is sharded at an absolute layer index; not split across PP stages.
             or self.start_layer != 0
@@ -1761,6 +1770,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 )
 
         _commit_ple_batch(ple_batch, forward_batch)
+        if seq_parallel is not None and not _needs_hc_state(forward_batch):
+            # Only the mixer output leaves the model, so gather [T, hidden]
+            # rather than the [T, hc_count * hidden] residual.
+            hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
+            return seq_parallel.all_gather(hidden_states), None
         if seq_parallel is not None:
             hidden_states = seq_parallel.all_gather(hidden_states)
 
