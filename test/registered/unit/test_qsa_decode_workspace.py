@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.layers.attention.qsa import mqa
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
@@ -23,7 +24,7 @@ def dense_reference(q, cache, table, lengths, max_len, scale=None):
     return out
 
 
-class TestQsaDecodeWorkspace(unittest.TestCase):
+class TestQsaDecodeWorkspace(CustomTestCase):
     def test_chunked_pages_match_reference_with_masks_and_partial_output(self):
         torch.manual_seed(42)
         q = torch.randn(3, 4, 128).bfloat16()
