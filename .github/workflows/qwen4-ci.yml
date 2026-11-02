@@ -2,7 +2,7 @@ name: Qwen4 MI308X CI
 
 on:
   pull_request:
-    branches: [qwen4_v0.5.21]
+    branches: [qwen4_v0.5.21, qwen4-pr8-port-base]
     types: [opened, reopened, synchronize, ready_for_review, labeled]
   schedule:
     - cron: '0 20 * * *' # 04:00 China time (UTC+8)
