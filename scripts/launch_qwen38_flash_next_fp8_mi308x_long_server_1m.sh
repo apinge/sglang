@@ -7,17 +7,18 @@ MODEL_PATH="${MODEL_PATH:-/models/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-7080}"
-GPU_DEVICES="${GPU_DEVICES:-6,7}"
+GPU_DEVICES="${GPU_DEVICES:-0,1,2,3}"
+TP_SIZE="${TP_SIZE:-2}"
 CONTEXT_LEN="${CONTEXT_LEN:-1048576}"
 CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-8}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-8}"
-for name in CONTEXT_LEN CUDA_GRAPH_MAX_BS_DECODE MAX_RUNNING_REQUESTS; do
+for name in TP_SIZE CONTEXT_LEN CUDA_GRAPH_MAX_BS_DECODE MAX_RUNNING_REQUESTS; do
   if [[ ! "${!name}" =~ ^[1-9][0-9]*$ ]]; then
     echo "$name must be a positive integer (got ${!name})" >&2
     exit 2
   fi
 done
-LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/logs/qwen38_customer_tp2_ctx${CONTEXT_LEN}_c${MAX_RUNNING_REQUESTS}_gb${CUDA_GRAPH_MAX_BS_DECODE}_ple1_$(date -u +%Y%m%dT%H%M%SZ).log}"
+LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/logs/qwen38_customer_tp${TP_SIZE}_ctx${CONTEXT_LEN}_c${MAX_RUNNING_REQUESTS}_gb${CUDA_GRAPH_MAX_BS_DECODE}_ple1_$(date -u +%Y%m%dT%H%M%SZ).log}"
 if [[ "$LOG_FILE" != /* ]]; then
   LOG_FILE="$PWD/$LOG_FILE"
 fi
@@ -29,11 +30,11 @@ exec > >(tee "$LOG_FILE") 2>&1
 printf 'Logging to: %s\n' "$LOG_FILE"
 
 if (( $# > 0 )); then
-  echo "Set CONTEXT_LEN/CUDA_GRAPH_MAX_BS_DECODE/MAX_RUNNING_REQUESTS or PORT/HOST/MODEL_PATH/GPU_DEVICES/LOG_FILE as environment variables." >&2
+  echo "Set TP_SIZE/CONTEXT_LEN/CUDA_GRAPH_MAX_BS_DECODE/MAX_RUNNING_REQUESTS or PORT/HOST/MODEL_PATH/GPU_DEVICES/LOG_FILE as environment variables." >&2
   exit 2
 fi
 
-# Context/request/graph limits and deployment options above are configurable.
+# TP size, context/request/graph limits and deployment options above are configurable.
 # Other inference settings below remain fixed.
 export CUDA_VISIBLE_DEVICES="$GPU_DEVICES"
 export HIP_VISIBLE_DEVICES="$GPU_DEVICES"
@@ -43,10 +44,11 @@ export SGLANG_USE_PYHIP_QSA=1
 export SGLANG_OPT_PYHIP_QSA_SPLIT_INDEXER=1
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 export AITER_MOE_PADDING_SIZE=64
+export SGLANG_LOG_QSA_INDEXER_BACKEND="${SGLANG_LOG_QSA_INDEXER_BACKEND:-1}"
 # Avoid the /opt/sglang repository directory shadowing the editable package.
 cd /tmp
 
-printf 'Customer config: TP=2; GPUs=%s; context=%s; Mamba cache=160; PLE offload=1\n' "$GPU_DEVICES" "$CONTEXT_LEN"
+printf 'Customer config: TP=%s; GPUs=%s; context=%s; Mamba cache=160; PLE offload=1\n' "$TP_SIZE" "$GPU_DEVICES" "$CONTEXT_LEN"
 printf 'mem-fraction argument=1.0; max running=%s; graph max batch=%s; warmups=voice_chat\n' "$MAX_RUNNING_REQUESTS" "$CUDA_GRAPH_MAX_BS_DECODE"
 printf 'GR_READ=1; PYHIP_QSA=1; dtype=bfloat16; reasoning parser=qwen3; tool parser=qwen3_coder\n'
 
@@ -54,26 +56,29 @@ if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
   echo "Model config not found: ${MODEL_PATH}/config.json" >&2
   exit 1
 fi
-python3 - <<'PY'
+python3 - "$TP_SIZE" <<'PY'
+import sys
+
 import torch
 
+tp_size = int(sys.argv[1])
 if torch.version.hip is None or not torch.cuda.is_available():
     raise SystemExit("ROCm PyTorch and visible GPUs are required.")
-if torch.cuda.device_count() < 2:
-    raise SystemExit(f"TP2 requires 2 visible GPUs; got {torch.cuda.device_count()}.")
-for index in range(2):
+if torch.cuda.device_count() < tp_size:
+    raise SystemExit(f"TP{tp_size} requires {tp_size} visible GPUs; got {torch.cuda.device_count()}.")
+for index in range(tp_size):
     arch = torch.cuda.get_device_properties(index).gcnArchName.split(":", 1)[0]
     if arch != "gfx942":
         raise SystemExit(f"GPU {index}: expected gfx942, got {arch}.")
 PY
-# Defaults: 1M context (1048576), max running 8, graph batch 8.
+# Defaults: TP2, 1M context (1048576), max running 8, graph batch 8.
 command=(
   python3 -m sglang.launch_server
   --model-path "$MODEL_PATH"
   --served-model-name "$SERVED_MODEL_NAME"
   --host "$HOST"
   --port "$PORT"
-  --tp-size 2
+  --tp-size "$TP_SIZE"
   --context-length "$CONTEXT_LEN"
   --max-mamba-cache-size 160
   --chunked-prefill-size 16384
