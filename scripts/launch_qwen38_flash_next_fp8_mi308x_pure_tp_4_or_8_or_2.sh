@@ -84,6 +84,9 @@ export SGLANG_USE_AITER=1
 export SGLANG_GR_READ_FLYDSL="${SGLANG_GR_READ_FLYDSL:-1}"
 export SGLANG_USE_PYHIP_QSA="${SGLANG_USE_PYHIP_QSA:-1}"
 export AITER_MOE_PADDING_SIZE
+# Sequence-parallel hyper-connection residual for TP prefill (TP > 1); uncomment to enable.
+# export SGLANG_QWEN4_SEQ_PARALLEL=1
+# export SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS=2048
 printf 'GR read: installed PyHIP enabled=%s; TP=%s; AITER_MOE_PADDING_SIZE=%s\n' \
   "${SGLANG_GR_READ_FLYDSL}" "${TP_SIZE}" "${AITER_MOE_PADDING_SIZE}"
 # export CUDA_VISIBLE_DEVICES=4,5,6,7
