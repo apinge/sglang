@@ -65,7 +65,7 @@ class Device(msgspec.Struct):
     ] = False
     watchdog_timeout: A[
         float,
-        "Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
+        "Set watchdog timeout in seconds. If a forward batch or ROCm IPC feature readiness wait takes longer than this, the server will crash to prevent hanging.",
     ] = 300
     soft_watchdog_timeout: A[
         Optional[float],

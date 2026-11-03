@@ -37,7 +37,7 @@ def stream_wait_value32(
         # HIP stream memory operations cannot safely access peer IPC mappings
         # on all ROCm runtimes. System-scope atomics also work on those mappings.
         with torch.cuda.device(device_id):
-            wait_value32(address, value)
+            wait_value32(address, value, transport_name)
         return
 
     cuda, check_drv = _driver_modules()
