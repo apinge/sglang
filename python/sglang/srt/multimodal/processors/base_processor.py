@@ -46,6 +46,7 @@ from sglang.srt.utils import (
     configure_media_url_security,
     envs,
     is_cpu,
+    is_hip,
     is_npu,
     is_xpu,
     load_audio,
@@ -55,6 +56,7 @@ from sglang.srt.utils import (
 )
 
 _is_cpu = is_cpu()
+_is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
@@ -646,8 +648,11 @@ class BaseMultimodalProcessor(ABC):
     @contextmanager
     def _temporary_fast_processor_cuda_pool(self, device: Optional[str]):
         """Release fast-processor CUDA temporaries after CPU feature transport."""
+        # On ROCm an open MemPool aborts the process (captures_underway assert)
+        # when another thread's allocation has to free cached blocks.
         can_release = (
-            device is not None
+            not _is_hip
+            and device is not None
             and torch.device(device).type == "cuda"
             and not self.keep_mm_features_on_device
             and not self.precompute_hash_before_cpu_transfer
