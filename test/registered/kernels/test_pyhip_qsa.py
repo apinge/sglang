@@ -45,7 +45,7 @@ def _config():
     )
 
 
-def _pool(device):
+def _pool(device, compressed_slots=2112):
     ring = 3 * qsa_ring_slots_per_request(4)
     pool = QSATokenToKVPool.__new__(QSATokenToKVPool)
     pool.full_attention_layer_id_mapping = {3: 0}
@@ -53,7 +53,7 @@ def _pool(device):
         torch.zeros((ring, 1, 128), dtype=torch.bfloat16, device=device)
     ]
     pool.qsa_compressed_k_buffer_pool = [
-        torch.randn((2112, 1, 128), dtype=torch.bfloat16, device=device)
+        torch.randn((compressed_slots, 1, 128), dtype=torch.bfloat16, device=device)
     ]
     pool.qsa_rope_position_buffer = torch.zeros(
         (ring, 3), dtype=torch.int64, device=device
@@ -574,6 +574,143 @@ class TestPyHIPQSA(CustomTestCase):
         self._check_graph_decode(
             module, _pool(self.device), table, (2055, 15), pages=16384
         )
+
+    @torch.no_grad()
+    def test_graph_decode_selection_beyond_65536_compressed_keys(self):
+        """Score real long histories, including a 1M-token row, against Torch.
+
+        Valid tail keys must beat the first 65536 keys. Poisoned invalid keys
+        must stay masked, then become selectable when replay grows the lengths.
+        """
+        from sglang.srt.layers.attention.qsa.kernel import (
+            torch_expand_qsa_block_indices,
+        )
+        from sglang.srt.layers.attention.qsa.mqa import torch_qsa_mqa_decode
+        from sglang.test.qsa_validation import _selection_valid
+
+        old_limit = 65536
+        counts = (old_limit + 513, 250001)
+        pages = (max(counts) + 1 + 15) // 16
+        rotary = get_rope(
+            head_size=256,
+            rotary_dim=256,
+            max_position=262144,
+            base=10000000,
+            rope_scaling={
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 262144,
+                "mrope_section": [11, 11, 10],
+                "mrope_interleaved": True,
+            },
+            dtype=torch.bfloat16,
+            partial_rotary_factor=0.25,
+        )
+        with envs.SGLANG_USE_PYHIP_QSA.override(
+            True
+        ), envs.SGLANG_TEST_PYHIP_QSA.override(True):
+            module = _indexer(self.device, rotary)
+        self.assertIsNotNone(module._pyhip_indexer)
+        # Only a non-rotary coordinate is nonzero, giving deterministic positive
+        # Q/K regardless of the large three-axis positions or top-k tie ordering.
+        module.index_qk_proj.weight.zero_()
+        module.index_qk_proj.weight[127::128, 0] = 1
+        module.q_layernorm.weight.fill_(1)
+        module.k_layernorm.weight.fill_(1)
+        pool = _pool(self.device, compressed_slots=(2 * pages + 1) * 16)
+        compressed = pool.get_qsa_compressed_k_buffer(3)
+        compressed.zero_()
+        compressed[:16, 0, 127] = 256  # Page zero is graph-table padding.
+        page_ids = (
+            torch.arange(1, 2 * pages + 1, dtype=torch.int32, device=self.device)
+            .reshape(2, pages)
+            .flip(1)
+            .contiguous()
+        )
+        key_offsets = torch.arange(16, device=self.device)
+        key_indices = torch.arange(pages * 16, device=self.device)
+        # 512 distinct BF16 values from 2 to 31.875, avoiding top-k cutoff ties.
+        ranks = torch.arange(512, device=self.device)
+        tail_values = (2.0 ** (ranks // 128 + 1)) * (1 + ranks % 128 / 128)
+        for row, count in enumerate(counts):
+            slots = (page_ids[row].long()[:, None] * 16 + key_offsets).flatten()
+            values = torch.full((pages * 16,), 0.01, device=self.device)
+            values[count - 512 : count] = tail_values
+            values = torch.where(key_indices >= count, 256, values)
+            compressed[slots, 0, 127] = values.to(torch.bfloat16)
+        table = (
+            (page_ids.long()[:, :, None] * 64 + torch.arange(64, device=self.device))
+            .reshape(2, -1)
+            .int()
+        )
+        page_table = torch.nn.functional.pad(page_ids, (0, 16384 - pages))
+        lengths = torch.tensor(counts, dtype=torch.int32, device=self.device)
+        seq = lengths * 4 + 1
+        logical = (seq - 1).long()
+        requests = torch.tensor([1, 2], dtype=torch.int64, device=self.device)
+        slots, groups = _ring_slots(requests, logical)
+        positions = torch.stack([logical, logical + 3, logical + 7])
+        hidden = torch.zeros((2, 2560), dtype=torch.bfloat16, device=self.device)
+        hidden[:, 0] = 1
+        metadata = QSAIndexerMetadata(
+            sequence_lengths=seq,
+            token_to_batch_idx=torch.arange(2, dtype=torch.int32, device=self.device),
+            token_slot_table=table,
+            out_cache_loc=torch.zeros(2, dtype=torch.int64, device=self.device),
+            token_to_kv_pool=pool,
+            compress_ratio=4,
+            block_topk=512,
+            req_pool_indices=requests,
+            is_cuda_graph=True,
+            graph_write_locs=torch.zeros(2, dtype=torch.int32, device=self.device),
+            graph_compressed_page_table=page_table,
+            graph_compressed_lengths=lengths,
+            decode_logical_positions=logical,
+            pending_ring_slots=slots,
+            graph_ring_group_locs=groups,
+        )
+        batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+
+        def check_reference(output):
+            q_ref, _, _ = module.project_qk(hidden, positions)
+            cache, table_ref, lengths_ref, width = metadata.get_decode_mqa_inputs(3)
+            logits = torch_qsa_mqa_decode(q_ref, cache, table_ref, lengths_ref, width)
+            blocks = torch.topk(logits, 512, dim=1).indices.int()
+            expected = torch_expand_qsa_block_indices(blocks, logical, seq, 4, 2048)
+            selected = output[:, :2048].reshape(2, 512, 4)[:, :, 0] // 4
+            valid = _selection_valid(
+                logits=logits,
+                lengths=lengths_ref,
+                actual=output,
+                expected=expected,
+                real=torch.ones(2, dtype=torch.bool, device=self.device),
+            )
+            self.assertTrue(bool(valid))
+            self.assertTrue(bool((selected >= old_limit).all()))
+            return selected
+
+        output = module.forward_cuda(hidden, positions, batch, metadata)
+        torch.cuda.synchronize()
+        check_reference(output)
+        graph = torch.cuda.CUDAGraph()
+        with model_capture_mode(), torch.cuda.graph(graph):
+            output = module.forward_cuda(hidden, positions, batch, metadata)
+        graph.replay()
+        torch.cuda.synchronize()
+        check_reference(output)
+        # One previously masked, higher-scoring key becomes valid in each row.
+        lengths.add_(1)
+        seq.add_(4)
+        logical.add_(4)
+        positions.add_(4)
+        for buffer, value in zip((slots, groups), _ring_slots(requests, logical)):
+            buffer.copy_(value)
+        graph.replay()
+        torch.cuda.synchronize()
+        selected = check_reference(output)
+        newly_visible = torch.tensor(counts, device=self.device)[:, None]
+        self.assertTrue(bool((selected == newly_visible).any(1).all()))
+        self.assertEqual(int(module._pyhip_indexer.validation.decode_checks.item()), 3)
 
     def _check_graph_decode(self, module, pool, table, lengths, pages=None):
         seq = torch.tensor(
