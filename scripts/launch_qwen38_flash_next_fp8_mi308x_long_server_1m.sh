@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Customer server_args from /opt/sglang/customer_server.md.
+# ROPE_TYPE=default keeps checkpoint RoPE; ROPE_TYPE=yarn enables HF YaRN.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,6 +11,7 @@ PORT="${PORT:-7080}"
 GPU_DEVICES="${GPU_DEVICES:-0,1,2,3}"
 TP_SIZE="${TP_SIZE:-2}"
 CONTEXT_LEN="${CONTEXT_LEN:-1048576}"
+ROPE_TYPE="${ROPE_TYPE:-default}"
 CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-8}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-8}"
 for name in TP_SIZE CONTEXT_LEN CUDA_GRAPH_MAX_BS_DECODE MAX_RUNNING_REQUESTS; do
@@ -18,7 +20,11 @@ for name in TP_SIZE CONTEXT_LEN CUDA_GRAPH_MAX_BS_DECODE MAX_RUNNING_REQUESTS; d
     exit 2
   fi
 done
-LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/logs/qwen38_customer_tp${TP_SIZE}_ctx${CONTEXT_LEN}_c${MAX_RUNNING_REQUESTS}_gb${CUDA_GRAPH_MAX_BS_DECODE}_ple1_$(date -u +%Y%m%dT%H%M%SZ).log}"
+case "$ROPE_TYPE" in
+  default|yarn) ;;
+  *) echo "ROPE_TYPE must be default or yarn (got $ROPE_TYPE)." >&2; exit 2 ;;
+esac
+LOG_FILE="${LOG_FILE:-${SCRIPT_DIR}/logs/qwen38_customer_tp${TP_SIZE}_ctx${CONTEXT_LEN}_c${MAX_RUNNING_REQUESTS}_gb${CUDA_GRAPH_MAX_BS_DECODE}_rope${ROPE_TYPE}_ple1_$(date -u +%Y%m%dT%H%M%SZ).log}"
 if [[ "$LOG_FILE" != /* ]]; then
   LOG_FILE="$PWD/$LOG_FILE"
 fi
@@ -30,11 +36,11 @@ exec > >(tee "$LOG_FILE") 2>&1
 printf 'Logging to: %s\n' "$LOG_FILE"
 
 if (( $# > 0 )); then
-  echo "Set TP_SIZE/CONTEXT_LEN/CUDA_GRAPH_MAX_BS_DECODE/MAX_RUNNING_REQUESTS or PORT/HOST/MODEL_PATH/GPU_DEVICES/LOG_FILE as environment variables." >&2
+  echo "Set TP_SIZE/CONTEXT_LEN/ROPE_TYPE/CUDA_GRAPH_MAX_BS_DECODE/MAX_RUNNING_REQUESTS or PORT/HOST/MODEL_PATH/GPU_DEVICES/LOG_FILE as environment variables." >&2
   exit 2
 fi
 
-# TP size, context/request/graph limits and deployment options above are configurable.
+# TP size, RoPE, context/request/graph limits and deployment options are configurable.
 # Other inference settings below remain fixed.
 export CUDA_VISIBLE_DEVICES="$GPU_DEVICES"
 export HIP_VISIBLE_DEVICES="$GPU_DEVICES"
@@ -56,6 +62,26 @@ if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
   echo "Model config not found: ${MODEL_PATH}/config.json" >&2
   exit 1
 fi
+MODEL_OVERRIDE_JSON=""
+if [[ "$ROPE_TYPE" == yarn ]]; then
+  if (( 10#$CONTEXT_LEN > 1048576 )); then
+    echo "CONTEXT_LEN=$CONTEXT_LEN exceeds the fixed YaRN limit 1048576 (262144 * 4.0)." >&2
+    exit 2
+  fi
+  # Fixed HF recipe from huggingface.md; do not modify the checkpoint file.
+  MODEL_OVERRIDE_JSON='{"text_config":{"rope_parameters":{
+    "mrope_interleaved":true,
+    "mrope_section":[11,11,10],
+    "rope_type":"yarn",
+    "rope_theta":10000000,
+    "partial_rotary_factor":0.25,
+    "factor":4.0,
+    "original_max_position_embeddings":262144
+  }}}'
+  printf 'RoPE: yarn; factor=4.0; original context=262144; model override=%s\n' "$MODEL_OVERRIDE_JSON"
+else
+  printf 'RoPE: checkpoint configuration (ROPE_TYPE=default)\n'
+fi
 python3 - "$TP_SIZE" <<'PY'
 import sys
 
@@ -71,7 +97,7 @@ for index in range(tp_size):
     if arch != "gfx942":
         raise SystemExit(f"GPU {index}: expected gfx942, got {arch}.")
 PY
-# Defaults: TP2, 1M context (1048576), max running 8, graph batch 8.
+# Defaults: TP2, default checkpoint RoPE, context 1048576, running/graph batch 8.
 command=(
   python3 -m sglang.launch_server
   --model-path "$MODEL_PATH"
@@ -104,6 +130,9 @@ command=(
   --speculative-num-steps 3
   --log-requests-level 0
 )
+if [[ "$ROPE_TYPE" == yarn ]]; then
+  command+=(--json-model-override-args "$MODEL_OVERRIDE_JSON")
+fi
 # disable_radix_cache=false: retain the default enabled radix cache.
 printf 'Launching: '
 printf '%q ' "${command[@]}"
