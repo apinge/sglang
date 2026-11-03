@@ -1312,7 +1312,7 @@ class ServerArgs:
     ] = False
     watchdog_timeout: A[
         float,
-        "Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
+        "Set watchdog timeout in seconds. If a forward batch or ROCm IPC feature readiness wait takes longer than this, the server will crash to prevent hanging.",
         NS("device"),
     ] = 300
     soft_watchdog_timeout: A[
@@ -8745,9 +8745,11 @@ class ServerArgs:
             )
 
         if requested_transport == "cuda_ipc":
-            if not is_cuda():
+            # PyTorch storage sharing dispatches to HIP IPC on ROCm. The pool's
+            # ready/ack protocol also needs the ROCm stream-control implementation.
+            if not (is_cuda() or is_hip()):
                 raise ValueError(
-                    "--mm-feature-transport=cuda_ipc requires NVIDIA CUDA."
+                    "--mm-feature-transport=cuda_ipc requires NVIDIA CUDA or AMD ROCm/HIP."
                 )
             if cfg.nnodes != 1:
                 raise ValueError(

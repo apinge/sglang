@@ -72,6 +72,7 @@ command=(
   --speculative-num-steps 3
   --speculative-eagle-topk 1
   --speculative-num-draft-tokens 4
+  --mm-feature-transport cuda_ipc
 )
 
 if (( $# > 0 )); then
