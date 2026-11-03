@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "${ROOT}/logs/server"
@@ -18,11 +19,11 @@ export USE_AITER_COMM=1
 export TVM_FFI_DISABLE_TORCH_C_DLPACK=1 # pip uninstall torch-c-dlpack-ext
 
 
-model=/models/Qwen3.5-35B-A3B-PTPC-FP8/
+model="${MODEL_PATH:-/models/Qwen3.5-35B-A3B-PTPC-FP8/}"
 
-python3 -m sglang.launch_server \
-  --port 7080 \
-  --model-path ${model} \
+"${SERVER_PYTHON:-python3}" -m sglang.launch_server \
+  --host "${HOST:-0.0.0.0}" --port "${PORT:-7080}" --served-model-name "${SERVED_MODEL_NAME:-$model}" \
+  --model-path "${model}" \
   --tp-size 4 \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
@@ -39,8 +40,8 @@ python3 -m sglang.launch_server \
   --kv-cache-dtype fp8_e4m3 \
   --disable-radix-cache \
   --watchdog-timeout 1200 \
-  2>&1 | tee "${ROOT}/logs/server"/qwen3.5-35B-fp8_tp4_disable_prefix_cache.log
+  2>&1 | tee "${LOG_FILE:-${ROOT}/logs/server/qwen3.5-35B-fp8_tp4_disable_prefix_cache.log}"
   # --linear-attn-backend aiter \
   # --linear-attn-decode-backend aiter \
   # --linear-attn-prefill-backend aiter \
-  
+

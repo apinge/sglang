@@ -2,6 +2,7 @@
 
 import os
 import resource
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -115,6 +116,8 @@ class ChatCompletionSampler(SamplerBase):
         self._completion_tokens: list[int] = []
         self.record_meta_info = record_meta_info
         self._meta_infos: List[Dict[str, Any]] = []
+        self.request_counts = {"attempted": 0, "completed": 0}
+        self._request_lock = threading.Lock()
         print(
             f"ChatCompletionSampler initialized with {self.system_message=} {self.temperature=} {self.max_tokens=} {self.reasoning_effort=} {self.extra_body=} {self.stop=} {self.record_meta_info=}"
         )
@@ -141,6 +144,9 @@ class ChatCompletionSampler(SamplerBase):
         return {"role": str(role), "content": content}
 
     def __call__(self, message_list: MessageList) -> str:
+        # Count logical requests once, including those whose retries all fail.
+        with self._request_lock:
+            self.request_counts["attempted"] += 1
         if self.system_message:
             message_list = [
                 self._pack_message("system", self.system_message)
@@ -167,7 +173,10 @@ class ChatCompletionSampler(SamplerBase):
                         self._meta_infos.append(meta_info)
                 if response.usage and response.usage.completion_tokens is not None:
                     self._completion_tokens.append(response.usage.completion_tokens)
-                return response.choices[0].message.content or ""
+                response_text = response.choices[0].message.content or ""
+                with self._request_lock:
+                    self.request_counts["completed"] += 1
+                return response_text
             # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are rerunning MMMU
             except openai.BadRequestError as e:
                 print("Bad Request Error", e)
