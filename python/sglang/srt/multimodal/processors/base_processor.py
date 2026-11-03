@@ -990,18 +990,16 @@ class BaseMultimodalProcessor(ABC):
             return data
         try:
             if modality == Modality.IMAGE:
-                gpu_image_decode = cls.gpu_image_decode
                 if (
                     discard_alpha_channel
                     and not isinstance(data, Image.Image)
-                    and rocjpeg_decode_enabled(gpu_image_decode)
+                    and rocjpeg_decode_enabled(cls.gpu_image_decode)
                 ):
                     data = image_input_bytes(data)
                     if rocjpeg_can_decode(data):
                         # Decoded with the request's other JPEGs in _decode_deferred_jpegs.
                         return DeferredJpeg(data)
-                    gpu_image_decode = False
-                img, _ = load_image(data, gpu_image_decode)
+                img, _ = load_image(data, cls.gpu_image_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
                 # PIL decodes lazily; do it here in the io worker so the decode

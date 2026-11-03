@@ -10,8 +10,6 @@ from urllib.parse import unquote, urlparse
 
 import numpy as np
 import torch
-import triton
-import triton.language as tl
 from PIL import Image
 
 from sglang.srt.environ import envs
@@ -52,79 +50,21 @@ def _ycbcr_from_rgb(kr: float, kb: float) -> np.ndarray:
 BT709_TO_BT601 = np.linalg.inv(_ycbcr_from_rgb(0.299, 0.114)) @ _ycbcr_from_rgb(
     0.2126, 0.0722
 )
-_BT709_TO_BT601_ARGS = tuple(BT709_TO_BT601.ravel().tolist())
-
-
-@triton.jit
-def _bt709_to_bt601_kernel(
-    src,
-    dst,
-    n,
-    width,
-    stride_c,
-    stride_h,
-    m00,
-    m01,
-    m02,
-    m10,
-    m11,
-    m12,
-    m20,
-    m21,
-    m22,
-    BLOCK: tl.constexpr,
-):
-    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n
-    src_offs = (offs // width) * stride_h + offs % width
-    r = tl.load(src + src_offs, mask=mask).to(tl.float32)
-    g = tl.load(src + stride_c + src_offs, mask=mask).to(tl.float32)
-    b = tl.load(src + 2 * stride_c + src_offs, mask=mask).to(tl.float32)
-    out_r = tl.floor(m00 * r + m01 * g + m02 * b + 0.5)
-    out_g = tl.floor(m10 * r + m11 * g + m12 * b + 0.5)
-    out_b = tl.floor(m20 * r + m21 * g + m22 * b + 0.5)
-    tl.store(
-        dst + offs, tl.minimum(tl.maximum(out_r, 0.0), 255.0).to(tl.uint8), mask=mask
-    )
-    tl.store(
-        dst + n + offs,
-        tl.minimum(tl.maximum(out_g, 0.0), 255.0).to(tl.uint8),
-        mask=mask,
-    )
-    tl.store(
-        dst + 2 * n + offs,
-        tl.minimum(tl.maximum(out_b, 0.0), 255.0).to(tl.uint8),
-        mask=mask,
-    )
 
 
 def bt709_to_bt601(image: torch.Tensor) -> torch.Tensor:
-    """Correct a (3, H, W) uint8 rocJPEG output in one pass; returns a contiguous tensor."""
-    if image.stride(2) != 1:
-        image = image.contiguous()
-    _, height, width = image.shape
-    n = height * width
-    out = torch.empty((3, height, width), dtype=torch.uint8, device=image.device)
-    _bt709_to_bt601_kernel[(triton.cdiv(n, 1024),)](
-        image,
-        out,
-        n,
-        width,
-        image.stride(0),
-        image.stride(1),
-        *_BT709_TO_BT601_ARGS,
-        BLOCK=1024,
-    )
-    return out
+    """Map a (3, H, W) uint8 image decoded with BT.709 colors to JPEG's BT.601."""
+    matrix = torch.tensor(BT709_TO_BT601, dtype=torch.float32, device=image.device)
+    rgb = matrix @ image.reshape(3, -1).float()
+    return rgb.round_().clamp_(0, 255).to(torch.uint8).reshape(image.shape)
 
 
 @lru_cache(maxsize=1)
-def _rocjpeg_color_correction() -> Optional[bool]:
-    """Decode a color test image with rocJPEG and compare it with PIL, first as
-    decoded and then after bt709_to_bt601. Returns whether the correction is
-    needed, or None if rocJPEG is unavailable or neither output matches.
-    Runs once per process on a 128x128 image (48 KiB copied to the host);
-    request images stay on the GPU."""
+def _rocjpeg_needs_correction() -> Optional[bool]:
+    """Decode a 128x128 color test image with rocJPEG once per process and compare
+    it with PIL, as decoded and after bt709_to_bt601. Returns whether the correction
+    is needed, or None if rocJPEG is unusable. Only the test image is copied to the
+    host; request images stay on the GPU."""
     try:
         from torchvision.io import decode_jpeg  # lazy: ~1 s of torch._dynamo
 
@@ -135,37 +75,36 @@ def _rocjpeg_color_correction() -> Optional[bool]:
             buf, format="JPEG", quality=95, subsampling=0
         )
         data = buf.getvalue()
-        expected = torch.from_numpy(np.array(Image.open(BytesIO(data)).convert("RGB")))
-        expected = expected.permute(2, 0, 1).float()
+        expected = torch.from_numpy(np.array(Image.open(BytesIO(data)))).permute(
+            2, 0, 1
+        )
         decoded = decode_jpeg(
             torch.frombuffer(bytearray(data), dtype=torch.uint8), device="cuda"
         )
-        error = (decoded.cpu().float() - expected).abs().mean().item()
-        corrected_error = None
-        if error > 1.0:
-            corrected = bt709_to_bt601(decoded).cpu().float()
-            corrected_error = (corrected - expected).abs().mean().item()
+        errors = [
+            (output.cpu().float() - expected.float()).abs().mean().item()
+            for output in (decoded, bt709_to_bt601(decoded))
+        ]
+        if min(errors) > 1.0:
+            raise ValueError(
+                f"output differs from PIL (mean abs error {errors[0]:.2f}, "
+                f"{errors[1]:.2f} with color correction)"
+            )
     except Exception as e:
-        logger.warning("rocJPEG decode is unavailable, decoding JPEG with PIL: %s", e)
-        return None
-    if corrected_error is None:
-        logger.info("Decoding JPEG with rocJPEG (mean abs error vs PIL %.2f)", error)
-        return False
-    if corrected_error <= 1.0:
-        logger.info(
-            "Decoding JPEG with rocJPEG and BT.709-to-BT.601 correction "
-            "(mean abs error vs PIL %.2f, %.2f uncorrected)",
-            corrected_error,
-            error,
+        logger.warning(
+            "rocJPEG GPU JPEG decoding: off, using PIL: %s. It needs a torchvision "
+            "built with rocJPEG and, for ROCm's bundled libva, LIBVA_DRIVERS_PATH="
+            "<ROCm>/lib/rocm_sysdeps/lib and LIBVA_DRIVER_NAME=radeonsi.",
+            e,
         )
-        return True
-    logger.warning(
-        "rocJPEG output differs from PIL (mean abs error %.2f, %.2f after "
-        "BT.709-to-BT.601 correction), decoding JPEG with PIL",
-        error,
-        corrected_error,
+        return None
+    correct = errors[1] < errors[0]
+    logger.info(
+        "rocJPEG GPU JPEG decoding: on, color correction %s (mean abs error vs PIL %.2f)",
+        "on" if correct else "off",
+        min(errors),
     )
-    return None
+    return correct
 
 
 def rocjpeg_decode_enabled(gpu_image_decode) -> bool:
@@ -173,7 +112,7 @@ def rocjpeg_decode_enabled(gpu_image_decode) -> bool:
         gpu_image_decode is True
         and is_hip()
         and envs.SGLANG_ROCM_GPU_JPEG_DECODE.get()
-        and _rocjpeg_color_correction() is not None
+        and _rocjpeg_needs_correction() is not None
     )
 
 
@@ -187,42 +126,23 @@ def image_input_bytes(image_file: Union[str, bytes, ImageData]) -> bytes:
 
 
 def rocjpeg_can_decode(data: bytes) -> bool:
-    """Whether rocJPEG's hardware decoder accepts this JPEG: complete, 8-bit
-    baseline or extended sequential, 1 or 3 components, at least 64x64, not 4:1:1."""
-    if not (data.startswith(b"\xff\xd8") and data.endswith(b"\xff\xd9")):
+    """Whether rocJPEG's hardware decoder accepts this JPEG: complete, 8-bit, not
+    progressive, gray or YCbCr, at least 64x64, not 4:1:1. Reads only the header."""
+    try:
+        image = Image.open(BytesIO(data), formats=["JPEG"])
+    except Exception:
         return False
-    i = 2
-    while i + 4 <= len(data):
-        if data[i] != 0xFF:
-            return False
-        marker = data[i + 1]
-        if marker == 0xFF:
-            i += 1
-            continue
-        if marker == 0x01 or 0xD0 <= marker <= 0xD8:
-            i += 2
-            continue
-        if marker in (0xC0, 0xC1):
-            if i + 12 > len(data):
-                return False
-            height = int.from_bytes(data[i + 5 : i + 7], "big")
-            width = int.from_bytes(data[i + 7 : i + 9], "big")
-            components = data[i + 9]
-            if data[i + 4] != 8 or components not in (1, 3) or min(height, width) < 64:
-                return False
-            return components == 1 or data[i + 11] >> 4 != 4
-        if marker == 0xDA or (
-            0xC2 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC)
-        ):
-            return False
-        i += 2 + int.from_bytes(data[i + 2 : i + 4], "big")
-    return False
+    return (
+        data.endswith(b"\xff\xd9")
+        and image.mode in ("L", "RGB")
+        and min(image.size) >= 64
+        and "progressive" not in image.info
+        and image.layer[0][1] != 4  # horizontal luma sampling factor, 4 in 4:1:1
+    )
 
 
 class DeferredJpeg:
     """JPEG bytes held back so that a request's images are decoded in one rocJPEG call."""
-
-    __slots__ = ("data",)
 
     def __init__(self, data: bytes):
         self.data = data
@@ -258,6 +178,6 @@ def decode_deferred_jpegs(
     if color_correction is None:
         color_correction = envs.SGLANG_ROCM_JPEG_COLOR_CORRECTION.get()
     if color_correction is None:
-        color_correction = _rocjpeg_color_correction()
+        color_correction = _rocjpeg_needs_correction()
     for i, image in zip(indices, decoded):
         images[i] = bt709_to_bt601(image) if color_correction else image
