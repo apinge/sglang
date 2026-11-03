@@ -98,6 +98,7 @@ command=(
   --mem-fraction-static "${MEM_FRACTION_STATIC}"
   --max-running-requests "${MAX_RUNNING_REQUESTS}"
   --cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE}"
+  --mm-feature-transport cuda_ipc
 )
 
 if [[ "$MTP" == 1 ]]; then
