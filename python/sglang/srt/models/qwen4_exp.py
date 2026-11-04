@@ -28,6 +28,7 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     dp_scatter,
     get_attention_dp_size,
+    get_attn_tp_group,
     get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer,
@@ -44,6 +45,11 @@ from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scat
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.layers.sdma_tp_pipeline import (
+    PendingReduce,
+    SdmaTp2Pipeline,
+    get_sdma_tp2_pipeline,
+)
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -60,8 +66,9 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5LinearDecoderLayer,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import logger
+from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import is_hip, logger
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
@@ -1245,6 +1252,79 @@ class Qwen4ExpPLELayer(nn.Module):
         return _pad_token_rows(output, batch.physical_tokens)
 
 
+def _sdma_tp2_pipeline_for(
+    *, num_tokens: int, hidden_size: int, dtype: torch.dtype
+) -> Optional[SdmaTp2Pipeline]:
+    """The SDMA pipeline if this batch takes it, else None. Depends only on
+    values identical on both TP ranks, so the ranks always agree."""
+    if (
+        num_tokens < envs.SGLANG_QWEN4_SDMA_PROJ_PIPELINE_MIN_TOKENS.get()
+        or get_is_capture_mode()
+    ):
+        return None
+    pipeline = get_sdma_tp2_pipeline(
+        capacity_tokens=get_global_server_args().max_prefill_tokens,
+        hidden_size=hidden_size,
+        dtype=dtype,
+        cpu_group=get_attn_tp_group().cpu_group,
+        transport=envs.SGLANG_QWEN4_SDMA_PIPELINE_TRANSPORT.get(),
+    )
+    return pipeline if pipeline.fits(num_tokens) else None
+
+
+def _install_sdma_proj_pipeline(proj: nn.Module, *, defer_reduce: bool) -> None:
+    """Route large prefill calls of a TP2 row-parallel projection through the
+    SDMA chunk pipeline. The output is either the finished all-reduce (tagged
+    `_sglang_tp_reduced`) or, with `defer_reduce`, this rank's partial sum
+    tagged with the in-flight reduce for `_combine_sdma_pending`."""
+    plain_forward = proj.forward
+    chunks = envs.SGLANG_QWEN4_SDMA_PROJ_PIPELINE_CHUNKS.get()
+
+    def forward(x: torch.Tensor):
+        pipeline = _sdma_tp2_pipeline_for(
+            num_tokens=x.shape[0], hidden_size=proj.output_size, dtype=x.dtype
+        )
+        if pipeline is None:
+            return plain_forward(x)
+        pending = pipeline.send(
+            rows=lambda r0, r1: plain_forward(x[r0:r1])[0],
+            num_tokens=x.shape[0],
+            chunks=chunks,
+        )
+        if defer_reduce:
+            return _tag_sdma_pending(pending), None
+        out = pending.sum()
+        out._sglang_tp_reduced = True
+        return out, None
+
+    proj.forward = forward
+
+
+def _tag_sdma_pending(pending: PendingReduce) -> torch.Tensor:
+    out = pending.partial
+    out._sglang_sdma_pending = pending
+    return out
+
+
+def _take_sdma_pending(hidden_states: torch.Tensor) -> Optional[PendingReduce]:
+    if hasattr(hidden_states, "_sglang_sdma_pending"):
+        return hidden_states._sglang_sdma_pending
+    return None
+
+
+def _combine_sdma_pending(
+    hyper_connection: GatedResidual, pending: PendingReduce, residuals
+) -> torch.Tensor:
+    """Finish the all-reduce chunk by chunk, combining each row range into the
+    residual stream as soon as its peer partial sum has landed."""
+    if not hyper_connection.can_combine_rows(pending.partial.dtype, residuals):
+        return hyper_connection.combine(pending.sum(), residuals)
+    out = torch.empty_like(residuals[0])
+    for r0, r1, reduced in pending.chunks():
+        hyper_connection.combine_rows(reduced, residuals, out=out, rows=slice(r0, r1))
+    return out
+
+
 class Qwen4ExpLayerExtensionMixin:
     def _init_qwen4_exp_layer_extensions(
         self,
@@ -1299,6 +1379,17 @@ class Qwen4ExpLayerExtensionMixin:
             use_mix=True,
             use_combine=True,
         )
+        sdma_tp2 = is_hip() and get_parallel().attn_tp_size == 2
+        if sdma_tp2 and envs.SGLANG_QWEN4_SDMA_PROJ_PIPELINE.get():
+            _install_sdma_proj_pipeline(
+                (
+                    self.linear_attn.out_proj
+                    if isinstance(self, Qwen3_5LinearDecoderLayer)
+                    else self.o_proj
+                ),
+                defer_reduce=envs.SGLANG_QWEN4_SDMA_PIPELINE_CONSUMER.get(),
+            )
+        self._sdma_moe = sdma_tp2 and envs.SGLANG_QWEN4_SDMA_PIPELINE_MOE.get()
 
     def _prepare_qwen4_exp_attn(
         self,
@@ -1339,9 +1430,16 @@ class Qwen4ExpLayerExtensionMixin:
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ):
-        if not forward_batch.forward_mode.is_idle():
-            hidden_states = attn_tp_all_reduce(hidden_states)
-        hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
+        pending = _take_sdma_pending(hidden_states)
+        if pending is not None:
+            hidden_states = _combine_sdma_pending(
+                self.attn_hyper_connection, pending, residual
+            )
+        else:
+            already_reduced = hasattr(hidden_states, "_sglang_tp_reduced")
+            if not forward_batch.forward_mode.is_idle() and not already_reduced:
+                hidden_states = attn_tp_all_reduce(hidden_states)
+            hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
         hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
         return hidden_states, residual
 
@@ -1379,6 +1477,19 @@ class Qwen4ExpLayerExtensionMixin:
             attn_tp_chunks = list(hidden_states.tensor_split(attn_tp_size))
             hidden_states = attn_tp_chunks[get_parallel().attn_tp_rank].contiguous()
 
+        pipeline = (
+            _sdma_tp2_pipeline_for(
+                num_tokens=hidden_states.shape[0],
+                hidden_size=hidden_states.shape[1],
+                dtype=hidden_states.dtype,
+            )
+            if self._sdma_moe and not use_dp_moe_gather and not use_attn_tp_a2a_scatter
+            else None
+        )
+        if pipeline is not None:
+            return self._send_qwen4_exp_moe_over_sdma(
+                pipeline, hidden_states, forward_batch
+            )
         hidden_states = self.mlp(hidden_states, forward_batch)
 
         if use_dp_moe_gather:
@@ -1402,13 +1513,45 @@ class Qwen4ExpLayerExtensionMixin:
 
         return hidden_states
 
+    def _send_qwen4_exp_moe_over_sdma(
+        self,
+        pipeline: SdmaTp2Pipeline,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Run the MoE without its TP all-reduce and start the SDMA reduce of
+        its output; `_postprocess_qwen4_exp_layer` finishes it."""
+        num_tokens = hidden_states.shape[0]
+        moe_chunks = envs.SGLANG_QWEN4_SDMA_PIPELINE_MOE_CHUNKS.get()
+        with get_forward().scoped(fuse_mlp_allreduce=True):
+            if moe_chunks > 1:
+                pending = pipeline.send(
+                    rows=lambda r0, r1: self.mlp(hidden_states[r0:r1], forward_batch),
+                    num_tokens=num_tokens,
+                    chunks=moe_chunks,
+                )
+            else:
+                partial = self.mlp(hidden_states, forward_batch)
+                pending = pipeline.send(
+                    rows=lambda r0, r1: partial[r0:r1],
+                    num_tokens=num_tokens,
+                    chunks=envs.SGLANG_QWEN4_SDMA_PROJ_PIPELINE_CHUNKS.get(),
+                )
+        return _tag_sdma_pending(pending)
+
     def _postprocess_qwen4_exp_layer(
         self,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ):
-        hidden_states = self.mlp_hyper_connection.combine(hidden_states, residual)
+        pending = _take_sdma_pending(hidden_states)
+        if pending is not None:
+            hidden_states = _combine_sdma_pending(
+                self.mlp_hyper_connection, pending, residual
+            )
+        else:
+            hidden_states = self.mlp_hyper_connection.combine(hidden_states, residual)
         return hidden_states, None
 
 
