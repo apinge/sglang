@@ -13,6 +13,13 @@ from sglang.srt.environ import (
 
 _redirect_third_party_caches()
 
+import os as _os
+
+if _os.environ.get("SGLANG_EARLY_FORKSERVER") == "1":
+    from sglang._early_forkserver import maybe_start as _start_early_forkserver
+
+    _start_early_forkserver()
+
 if _sys.platform == "darwin" and _platform.machine() == "arm64":
     from sglang._platform_stubs import install_platform_stubs as _install_platform_stubs
 
