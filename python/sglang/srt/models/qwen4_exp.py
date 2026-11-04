@@ -53,6 +53,9 @@ from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
@@ -1702,7 +1705,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             # Eager target-verify batches qualify too; captured ones never do.
             or forward_batch.forward_mode
             not in (ForwardMode.EXTEND, ForwardMode.MIXED, ForwardMode.TARGET_VERIFY)
+            # The row split depends on the token count, so any captured forward
+            # (decode, breakable, tc_piecewise, full prefill graph) keeps the all-reduce.
             or get_is_capture_mode()
+            or is_in_tc_piecewise_cuda_graph()
+            or torch.cuda.is_current_stream_capturing()
             # The residual is sharded at an absolute layer index; not split across PP stages.
             or self.start_layer != 0
             or self._seq_parallel_first_layer >= self.end_layer
