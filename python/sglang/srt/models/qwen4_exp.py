@@ -34,6 +34,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.hc_seq_parallel import SeqParallelPlan, plan_seq_parallel
 from sglang.srt.layers.hyperconnection import (
     GatedResidual,
     HyperConnectionConfig,
@@ -52,6 +53,9 @@ from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
@@ -60,7 +64,7 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5LinearDecoderLayer,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils import logger
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
@@ -1245,6 +1249,13 @@ class Qwen4ExpPLELayer(nn.Module):
         return _pad_token_rows(output, batch.physical_tokens)
 
 
+def _needs_hc_state(forward_batch: ForwardBatch) -> bool:
+    """Whether the forward must return the residual (HC state): speculative
+    drafting and requested hidden states read it."""
+    mode = forward_batch.capture_hidden_mode
+    return mode is not None and mode.need_capture()
+
+
 class Qwen4ExpLayerExtensionMixin:
     def _init_qwen4_exp_layer_extensions(
         self,
@@ -1307,6 +1318,7 @@ class Qwen4ExpLayerExtensionMixin:
         forward_batch: ForwardBatch,
         *,
         ple_batch: Optional[_PLEBatch],
+        seq_parallel: Optional[SeqParallelPlan],
     ):
         hc_dim = self.hc_count * self.hidden_size
         if hidden_states.shape[-1] != hc_dim:
@@ -1331,6 +1343,8 @@ class Qwen4ExpLayerExtensionMixin:
                 )
 
         hidden_states, residual = self.attn_hyper_connection.mix(hidden_states)
+        if seq_parallel is not None:
+            hidden_states = seq_parallel.all_gather(hidden_states)
         return hidden_states, residual
 
     def _prepare_qwen4_exp_mlp(
@@ -1338,11 +1352,17 @@ class Qwen4ExpLayerExtensionMixin:
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        *,
+        seq_parallel: Optional[SeqParallelPlan],
     ):
-        if not forward_batch.forward_mode.is_idle():
+        if seq_parallel is not None:
+            hidden_states = seq_parallel.reduce_scatter(hidden_states)
+        elif not forward_batch.forward_mode.is_idle():
             hidden_states = attn_tp_all_reduce(hidden_states)
         hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
         hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
+        if seq_parallel is not None:
+            hidden_states = seq_parallel.all_gather(hidden_states)
         return hidden_states, residual
 
     def _qwen4_exp_use_dp_moe_gather(self) -> bool:
@@ -1355,9 +1375,15 @@ class Qwen4ExpLayerExtensionMixin:
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        *,
+        seq_parallel: Optional[SeqParallelPlan],
     ) -> torch.Tensor:
         if not self.config.num_experts:
             return self.mlp(hidden_states)
+        if seq_parallel is not None:
+            # Returns this rank's partial sum; the postprocess reduce-scatters it.
+            with get_forward().scoped(mlp_reduce_scatter=True):
+                return self.mlp(hidden_states, forward_batch)
 
         use_dp_moe_gather = self._qwen4_exp_use_dp_moe_gather()
         use_attn_tp_a2a_scatter = self._qwen4_exp_use_attn_tp_a2a_scatter()
@@ -1407,7 +1433,11 @@ class Qwen4ExpLayerExtensionMixin:
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        *,
+        seq_parallel: Optional[SeqParallelPlan],
     ):
+        if seq_parallel is not None:
+            hidden_states = seq_parallel.reduce_scatter(hidden_states)
         hidden_states = self.mlp_hyper_connection.combine(hidden_states, residual)
         return hidden_states, None
 
@@ -1440,16 +1470,22 @@ class Qwen4ExpLinearDecoderLayer(
             residual,
             forward_batch,
             ple_batch=kwargs.get("ple_batch"),
+            seq_parallel=kwargs.get("seq_parallel"),
         )
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.linear_attn(hidden_states, forward_batch)
 
+        seq_parallel = kwargs.get("seq_parallel")
         hidden_states, residual = self._prepare_qwen4_exp_mlp(
-            hidden_states, residual, forward_batch
+            hidden_states, residual, forward_batch, seq_parallel=seq_parallel
         )
-        hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch)
-        return self._postprocess_qwen4_exp_layer(hidden_states, residual, forward_batch)
+        hidden_states = self._run_qwen4_exp_mlp(
+            hidden_states, forward_batch, seq_parallel=seq_parallel
+        )
+        return self._postprocess_qwen4_exp_layer(
+            hidden_states, residual, forward_batch, seq_parallel=seq_parallel
+        )
 
 
 class Qwen4ExpAttentionDecoderLayer(
@@ -1584,6 +1620,7 @@ class Qwen4ExpAttentionDecoderLayer(
             residual,
             forward_batch,
             ple_batch=kwargs.get("ple_batch"),
+            seq_parallel=kwargs.get("seq_parallel"),
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -1593,11 +1630,16 @@ class Qwen4ExpAttentionDecoderLayer(
                 forward_batch=forward_batch,
             )
 
+        seq_parallel = kwargs.get("seq_parallel")
         hidden_states, residual = self._prepare_qwen4_exp_mlp(
-            hidden_states, residual, forward_batch
+            hidden_states, residual, forward_batch, seq_parallel=seq_parallel
         )
-        hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch)
-        return self._postprocess_qwen4_exp_layer(hidden_states, residual, forward_batch)
+        hidden_states = self._run_qwen4_exp_mlp(
+            hidden_states, forward_batch, seq_parallel=seq_parallel
+        )
+        return self._postprocess_qwen4_exp_layer(
+            hidden_states, residual, forward_batch, seq_parallel=seq_parallel
+        )
 
 
 ALL_DECODER_LAYER_TYPES = {
@@ -1644,6 +1686,45 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_per_branch_norm=True,
         )
         self.hyper_connection_mixer = GatedResidual(hc_config, use_combine=False)
+        # PLE's short conv mixes neighbouring tokens, so the residual stream is
+        # sharded only after the last PLE layer.
+        self._seq_parallel_first_layer = max(config.ple_layer_ids, default=0)
+        self._seq_parallel_enabled = (
+            envs.SGLANG_QWEN4_SEQ_PARALLEL.get()
+            and get_parallel().attn_tp_size > 1
+            and not is_dp_attention_enabled()
+            and get_moe_a2a_backend().is_none()
+            and bool(config.num_experts)
+        )
+
+    def _plan_seq_parallel(
+        self, forward_batch: ForwardBatch, num_tokens: int
+    ) -> Optional[SeqParallelPlan]:
+        if (
+            not self._seq_parallel_enabled
+            # Eager target-verify batches qualify too; captured ones never do.
+            or forward_batch.forward_mode
+            not in (ForwardMode.EXTEND, ForwardMode.MIXED, ForwardMode.TARGET_VERIFY)
+            # The row split depends on the token count, so any captured forward
+            # (decode, breakable, tc_piecewise, full prefill graph) keeps the all-reduce.
+            or get_is_capture_mode()
+            or is_in_tc_piecewise_cuda_graph()
+            or torch.cuda.is_current_stream_capturing()
+            # The residual is sharded at an absolute layer index; not split across PP stages.
+            or self.start_layer != 0
+            or self._seq_parallel_first_layer >= self.end_layer
+            or any(
+                getattr(self.layers[i], "_is_layer_to_capture", False)
+                for i in range(self.start_layer, self.end_layer)
+            )
+        ):
+            return None
+        return plan_seq_parallel(
+            num_tokens=num_tokens,
+            rank=get_parallel().attn_tp_rank,
+            world_size=get_parallel().attn_tp_size,
+            min_tokens=envs.SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS.get(),
+        )
 
     def forward(
         self,
@@ -1669,8 +1750,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         )
         residual = None
         aux_hidden_states = []
+        seq_parallel = self._plan_seq_parallel(forward_batch, hidden_states.shape[0])
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
+            if seq_parallel is not None and i == self._seq_parallel_first_layer:
+                hidden_states = seq_parallel.scatter(hidden_states)
             if i + 1 < self.end_layer:
                 next_ple = getattr(self.layers[i + 1], "ple", None)
                 if next_ple is not None:
@@ -1682,6 +1766,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     residual=residual,
                     forward_batch=forward_batch,
                     ple_batch=ple_batch,
+                    seq_parallel=(
+                        seq_parallel if i >= self._seq_parallel_first_layer else None
+                    ),
                     captured_last_layer_outputs=(
                         aux_hidden_states
                         if getattr(layer, "_is_layer_to_capture", False)
@@ -1690,6 +1777,13 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 )
 
         _commit_ple_batch(ple_batch, forward_batch)
+        if seq_parallel is not None and not _needs_hc_state(forward_batch):
+            # Only the mixer output leaves the model, so gather [T, hidden]
+            # rather than the [T, hc_count * hidden] residual.
+            hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
+            return seq_parallel.all_gather(hidden_states), None
+        if seq_parallel is not None:
+            hidden_states = seq_parallel.all_gather(hidden_states)
 
         hc_hidden_states = hidden_states
         hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)

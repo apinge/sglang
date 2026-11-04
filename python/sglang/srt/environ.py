@@ -299,6 +299,11 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # Qwen4 TP prefill path: keep the hyper-connection residual stream sharded by
+    # tokens (reduce-scatter / all-gather instead of all-reduce); 0 restores the all-reduce.
+    SGLANG_QWEN4_SEQ_PARALLEL = EnvBool(True)
+    # Arbitrary; smaller batches (decode, short prefill) keep the all-reduce.
+    SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS = EnvInt(2048)
     # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
     # path is ported, so setting this fails loudly instead of degrading.
     SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
