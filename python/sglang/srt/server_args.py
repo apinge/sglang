@@ -416,6 +416,9 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "helion",
     "intel_xpu",
 ]
+LINEAR_ATTN_PREFILL_BACKEND_CHOICES = list(
+    dict.fromkeys([*LINEAR_ATTN_KERNEL_BACKEND_CHOICES, "aiter"])
+)
 
 
 # Allow external code to add more choices
@@ -480,7 +483,11 @@ def add_rl_on_policy_target_choices(choices):
 
 
 def add_linear_attn_kernel_backend_choices(choices):
-    LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
+    for choice in choices:
+        if choice not in LINEAR_ATTN_KERNEL_BACKEND_CHOICES:
+            LINEAR_ATTN_KERNEL_BACKEND_CHOICES.append(choice)
+        if choice not in LINEAR_ATTN_PREFILL_BACKEND_CHOICES:
+            LINEAR_ATTN_PREFILL_BACKEND_CHOICES.append(choice)
 
 
 @dataclasses.dataclass
@@ -2716,8 +2723,8 @@ class ServerArgs:
     linear_attn_prefill_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention prefill/extend. If not set, uses --linear-attn-backend; compatible SM100 GDN models may automatically select FlashInfer.",
-            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            help="Override the kernel backend for linear attention prefill/extend. If not set, uses --linear-attn-backend; compatible SM100 GDN models may automatically select FlashInfer. AITER supports GDN prefill on ROCm, with Triton fallback for unsupported inputs.",
+            choices=LINEAR_ATTN_PREFILL_BACKEND_CHOICES,
         ),
         NS("exec.mamba"),
     ] = None
