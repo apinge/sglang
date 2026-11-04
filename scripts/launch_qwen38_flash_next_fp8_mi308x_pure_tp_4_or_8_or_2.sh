@@ -88,6 +88,23 @@ export AITER_MOE_PADDING_SIZE
 # Sequence-parallel hyper-connection residual for TP prefill (TP > 1); set 0 to disable.
 export SGLANG_QWEN4_SEQ_PARALLEL="${SGLANG_QWEN4_SEQ_PARALLEL:-1}"
 export SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS="${SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS:-2048}"
+# SP communication over SDMA, overlapped with compute (RS, attention/GDN input AG,
+# MoE input AG); set a switch to 0 to keep that collective on aiter.
+export SGLANG_QWEN4_SP_SDMA_RS="${SGLANG_QWEN4_SP_SDMA_RS:-1}"
+export SGLANG_QWEN4_SP_SDMA_AG="${SGLANG_QWEN4_SP_SDMA_AG:-1}"
+export SGLANG_QWEN4_SP_SDMA_AG_MOE="${SGLANG_QWEN4_SP_SDMA_AG_MOE:-1}"
+export SGLANG_QWEN4_SP_SDMA_RS_TRANSPORT="${SGLANG_QWEN4_SP_SDMA_RS_TRANSPORT:-bf16}"
+# mori posts the copies from the GPU; without a usable mori the hip backend is used.
+export SGLANG_QWEN4_SP_SDMA_BACKEND="${SGLANG_QWEN4_SP_SDMA_BACKEND:-mori}"
+export MORI_ENABLE_SDMA="${MORI_ENABLE_SDMA:-1}"
+export MORI_SOCKET_IFNAME="${MORI_SOCKET_IFNAME:-lo}"
+# Read by a mori built with the MI308X engine-spread patch; ignored otherwise.
+export MORI_SDMA_SPREAD_MI308X="${MORI_SDMA_SPREAD_MI308X:-1}"
+# mori must use the same libdrm copy as the HIP runtime (ROCm's rocm_sysdeps one).
+ROCM_SYSDEPS_LIB="${ROCM_PATH:-/opt/rocm}/lib/rocm_sysdeps/lib"
+if [[ -f "${ROCM_SYSDEPS_LIB}/librocm_sysdeps_drm_amdgpu.so.1" && "${LD_PRELOAD:-}" != *rocm_sysdeps_drm_amdgpu* ]]; then
+  export LD_PRELOAD="${ROCM_SYSDEPS_LIB}/librocm_sysdeps_drm.so.2:${ROCM_SYSDEPS_LIB}/librocm_sysdeps_drm_amdgpu.so.1${LD_PRELOAD:+:${LD_PRELOAD}}"
+fi
 printf 'GR read: installed PyHIP enabled=%s; TP=%s; AITER_MOE_PADDING_SIZE=%s\n' \
   "${SGLANG_GR_READ_FLYDSL}" "${TP_SIZE}" "${AITER_MOE_PADDING_SIZE}"
 # export CUDA_VISIBLE_DEVICES=4,5,6,7

@@ -53,3 +53,47 @@ interleaved rounds (TP4 and TP2 run one after the other):
 
 Greedy outputs of a long-context probe are bit-identical to the baseline; the long-context check is
 48/48 and gsm8k stays within run-to-run noise.
+
+## SDMA overlap (ROCm)
+
+On top of sequence parallelism, each of its communications moves to the SDMA copy engines and runs
+under compute (`layers/sdma_reduce_scatter.py`, `layers/sdma_mori.py`):
+
+```
+RS       o_proj / out_proj in row chunks, peers' blocks first, own block last;
+         each chunk is pushed to its owner as soon as it is computed       -> overlaps the next chunk's GEMM
+         (the MoE output, computed whole, is pushed in the same chunks)
+attn AG  mix -> push this rank's rows; in_proj runs on the local rows,
+         then on each peer's block as it lands                             -> overlaps in_proj on local rows
+MoE AG   combine / hc_norm / mix in row ranges, each range pushed as
+         soon as it is mixed; the MoE waits for every range                -> overlaps the next range's HC ops
+```
+
+With the `mori` backend (default) the copies are posted by one-wave kernels on the compute stream, which
+write the SDMA packets directly (mori CCO `put_ptr`); the copy engine bumps the receiver's counter when the
+bytes land and the consumer waits with a one-wave spin kernel. No side streams or cross-stream events are
+involved, so fine-grained pipelining stays cheap. The `hip` backend uses `hipMemcpyAsync` on per-peer copy
+streams with an event per push and a flag kernel; it is used automatically when mori cannot run.
+
+| Knob | Default | Effect |
+|---|---|---|
+| `SGLANG_QWEN4_SP_SDMA_RS` | 1 | reduce-scatters over SDMA |
+| `SGLANG_QWEN4_SP_SDMA_AG` | 1 | attention / GDN input all-gather over SDMA, consumed per block by the input projection |
+| `SGLANG_QWEN4_SP_SDMA_AG_MOE` | 1 | MoE input all-gather over SDMA, pushed per HC row range |
+| `SGLANG_QWEN4_SP_SDMA_BACKEND` | mori | `mori` or `hip`; an unusable mori falls back to `hip` with a warning |
+| `SGLANG_QWEN4_SP_SDMA_RS_TRANSPORT` | bf16 | `bf16` (exact) or `fp8` (peers' rows as fp8 + a bf16 scale per 32; lossy) |
+| `SGLANG_QWEN4_SP_SDMA_RS_CHUNKS` | auto | row chunks per owner block; auto = 2 at TP2, 1 above |
+| `SGLANG_QWEN4_SP_SDMA_AG_MOE_CHUNKS` | auto | minimum HC row ranges; auto = 4 at TP2, 2 above |
+
+All of them act only with `SGLANG_QWEN4_SEQ_PARALLEL=1`.
+
+mori requirements: mori built with `BUILD_CCO_SDMA=ON`, `MORI_ENABLE_SDMA=1`, and ROCm's private libdrm
+copies preloaded so mori and the HIP runtime share the GPU VM (the MI308X launch script does both). On
+MI308X, mori needs its SDMA engine selection not to put two peers of one GPU on the same engine
+(`MORI_SDMA_SPREAD_MI308X=1` with the engine-spread patch); without it TP4 copies to two peers serialize.
+mori's own symmetric windows are not used (destinations are hipIpc mappings), so hosts whose kernel lacks
+`CONFIG_DMABUF_MOVE_NOTIFY` work too.
+
+| Script | What it measures |
+|---|---|
+| `bench_sdma_rs.py` | `SdmaReduceScatter` vs an fp32 reference (bf16 / fp8, uneven T), and GEMM + RS + combine vs aiter |

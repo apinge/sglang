@@ -304,6 +304,23 @@ class Envs:
     SGLANG_QWEN4_SEQ_PARALLEL = EnvBool(True)
     # Arbitrary; smaller batches (decode, short prefill) keep the all-reduce.
     SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS = EnvInt(2048)
+    # ROCm, sequence-parallel prefill: move each communication to SDMA, overlapped with compute.
+    # RS: the producing projection runs in row chunks, each pushed as it finishes.
+    SGLANG_QWEN4_SP_SDMA_RS = EnvBool(True)
+    # "bf16" (exact) or "fp8" (peers' rows as fp8 + a bf16 scale per 32 values; lossy).
+    SGLANG_QWEN4_SP_SDMA_RS_TRANSPORT = EnvStr("bf16")
+    # Row chunks per owner block; None picks the measured best (2 at TP2, 1 above).
+    SGLANG_QWEN4_SP_SDMA_RS_CHUNKS = EnvInt(None)
+    # Attention / GDN input AG: the input projection consumes each peer's block as it lands.
+    SGLANG_QWEN4_SP_SDMA_AG = EnvBool(True)
+    # MoE input AG: combine / norm / mix run in row ranges, each pushed as soon as it is mixed.
+    SGLANG_QWEN4_SP_SDMA_AG_MOE = EnvBool(True)
+    # Minimum number of row ranges; None picks the measured best (4 at TP2, 2 above).
+    SGLANG_QWEN4_SP_SDMA_AG_MOE_CHUNKS = EnvInt(None)
+    # "mori": SDMA copies posted from the GPU on the compute stream (needs mori, see
+    # layers/sdma_mori.py); "hip": hipMemcpyAsync on per-peer copy streams. An unusable
+    # mori falls back to hip with a warning.
+    SGLANG_QWEN4_SP_SDMA_BACKEND = EnvStr("mori")
     # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
     # path is ported, so setting this fails loudly instead of degrading.
     SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
