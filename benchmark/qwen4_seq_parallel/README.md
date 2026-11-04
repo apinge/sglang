@@ -6,7 +6,7 @@ blocks, three per-token ops run on it: `hc_combine` (inject the block output), `
 next block's input. With the usual layout every TP rank repeats them on all tokens; in a 12k-token
 prefill step that is ~165 ms per rank (31% of the step at TP4, 22% at TP2).
 
-With `SGLANG_QWEN4_SEQ_PARALLEL=1` each rank keeps only its 1/TP slice of the token rows of the residual
+With `SGLANG_QWEN4_SEQ_PARALLEL=1` (the default) each rank keeps only its 1/TP slice of the token rows of the residual
 stream during prefill:
 
 ```
@@ -25,7 +25,7 @@ captures hidden states (speculative decoding, `return_hidden_states`).
 
 | Knob | Default | Effect |
 |---|---|---|
-| `SGLANG_QWEN4_SEQ_PARALLEL` | 0 | enable the sequence-parallel residual for prefill |
+| `SGLANG_QWEN4_SEQ_PARALLEL` | 1 | sequence-parallel residual for prefill; 0 keeps the all-reduce |
 | `SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS` | 2048 | smaller batches keep the all-reduce |
 
 The path covers eager EXTEND / MIXED / TARGET_VERIFY forwards with at least
