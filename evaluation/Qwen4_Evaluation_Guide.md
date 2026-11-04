@@ -274,8 +274,9 @@ Default runs evaluate all six cases with 128 fixed-length performance requests a
 | Qwen3.5-397B-TP8-DFlash | 98.5%     | 192                   |
 
 
-Use `--case Qwen3.5-35B-TP1-DFlash --gpus 2` to run one selected case on a free
-GPU. Comma-separated case IDs and GPU indices are supported. A selected subset
+Each case runs on the first idle GPUs (under 1 GiB used) among `--gpus`, which
+defaults to all eight; use `--case Qwen3.5-35B-TP1-DFlash --gpus 2,3` to restrict
+the candidates. Comma-separated case IDs and GPU indices are supported. A selected subset
 reports its coverage and does not reuse prior results. `--accuracy-only` runs the
 200-example gate without the performance benchmark. `--smoke` uses two requests
 and two examples and reports diagnostic results with the accuracy gate disabled.
