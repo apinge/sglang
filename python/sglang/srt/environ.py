@@ -316,6 +316,11 @@ class Envs:
     # sizes the KV pool. Cap its resident set; 0 disables the trim.
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
+    # Qwen4 TP prefill path: keep the hyper-connection residual stream sharded by
+    # tokens (reduce-scatter / all-gather instead of all-reduce); 0 restores the all-reduce.
+    SGLANG_QWEN4_SEQ_PARALLEL = EnvBool(True)
+    # Arbitrary; smaller batches (decode, short prefill) keep the all-reduce.
+    SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS = EnvInt(2048)
     # Direct gfx942 compressed-QSA operators; unsupported layouts stay native.
     SGLANG_USE_PYHIP_QSA = EnvBool(False)
     # Numerical acceptance only; never enable for performance measurements.
