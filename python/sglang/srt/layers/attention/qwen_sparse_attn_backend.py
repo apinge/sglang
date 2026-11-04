@@ -1541,8 +1541,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return self._pad_extend_output(output, num_output_rows)
 
-        # The validated chunk-prefill kernel consumes tightly packed full-context
-        # K/V. Current-chunk K/V has already been committed to the cache above.
+        # PyHIP reads the full-context K/V in place from the pool through the packed
+        # slot table; the other chunk-prefill kernel consumes tightly packed K/V.
+        # Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
         metadata = self._resolve_metadata(forward_batch)
         slots = metadata.packed_kv_slots
@@ -1556,8 +1557,25 @@ class QwenSparseAttnBackend(AttentionBackend):
                 seq_lens=forward_batch.seq_lens[:batch_size],
                 total=sum(sequence_lens),
             )
-        packed_k = pool.get_key_buffer(layer.layer_id).index_select(0, slots)
-        packed_v = pool.get_value_buffer(layer.layer_id).index_select(0, slots)
+        key_buffer = pool.get_key_buffer(layer.layer_id)
+        value_buffer = pool.get_value_buffer(layer.layer_id)
+        if can_use_pyhip_attention and self._pyhip_attention.can_read_kv_slots(
+            key_buffer=key_buffer, value_buffer=value_buffer, slots=slots
+        ):
+            output = self._pyhip_attention.forward(
+                q=q.contiguous(),
+                k=key_buffer,
+                v=value_buffer,
+                indices=topk_indices,
+                query_lens=extend_lens,
+                prefix_lens=prefix_lens,
+                scale=layer.scaling,
+                layer_id=layer.layer_id,
+                kv_slots=slots,
+            )
+            return self._pad_extend_output(output, num_output_rows)
+        packed_k = key_buffer.index_select(0, slots)
+        packed_v = value_buffer.index_select(0, slots)
         if can_use_pyhip_attention:
             output = self._pyhip_attention.forward(
                 q=q.contiguous(),

@@ -7,13 +7,17 @@ import logging
 
 import torch
 
+from sglang.srt.distributed import get_attn_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.metadata import (
     build_group_ring_slots,
     build_rope_position_matrix,
 )
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
-from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
+from sglang.srt.layers.rotary_embedding.mrope import (
+    MRotaryEmbedding,
+    YaRNScalingMRotaryEmbedding,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
@@ -21,6 +25,31 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
 logger = logging.getLogger(__name__)
+
+# MI308X: indexer ~1.06e-5 us per row and key, TP2 all-gather ~0.087 us per row,
+# so TP2 breaks even near 16k keys per row; these keep a 2x margin.
+_SPLIT_MIN_ROWS = 2048
+_SPLIT_MIN_KEYS_PER_ROW = 32768
+
+
+def _worth_splitting(*, lengths, extends):
+    rows = sum(extends)
+    # Row i of a request sees (prefix + i + 1) // 4 compressed keys.
+    keys = sum(e * (2 * s - e + 1) for s, e in zip(lengths, extends)) // 8
+    return rows >= _SPLIT_MIN_ROWS and keys >= _SPLIT_MIN_KEYS_PER_ROW * rows
+
+
+def _split_prefill(run, *, group, rows, device, q_out=None):
+    """Select this rank's equal share of the rows, then all-gather all shares."""
+    share = -(-rows // group.world_size)
+    first = share * group.rank_in_group
+    out = torch.empty(
+        (share * group.world_size, 2051), dtype=torch.int32, device=device
+    )
+    run(row_range=(min(first, rows), min(first + share, rows)), out=out, q_out=q_out)
+    # In place: this rank's rows already sit at its share of out.
+    group.all_gather_into_tensor(out, out[first : first + share])
+    return out[:rows]
 
 
 class PyHIPAttention:
@@ -61,7 +90,33 @@ class PyHIPAttention:
             )
         )
 
-    def forward(self, *, q, k, v, indices, query_lens, prefix_lens, scale, layer_id):
+    @staticmethod
+    def can_read_kv_slots(*, key_buffer, value_buffer, slots):
+        """Whether PyHIP can read this layer's K/V pool in place through ``slots``."""
+        return (
+            slots.dtype == torch.int32
+            and slots.ndim == 1
+            and slots.is_contiguous()
+            and slots.device == key_buffer.device
+            and key_buffer.shape == value_buffer.shape
+            and key_buffer.is_contiguous()
+            and value_buffer.is_contiguous()
+        )
+
+    def forward(
+        self,
+        *,
+        q,
+        k,
+        v,
+        indices,
+        query_lens,
+        prefix_lens,
+        scale,
+        layer_id,
+        kv_slots=None,
+    ):
+        # With kv_slots, k/v are the layer's token pool and kv_slots maps packed context tokens to it.
         output = self.attention(
             q,
             k,
@@ -70,11 +125,14 @@ class PyHIPAttention:
             query_lens=query_lens,
             prefix_lens=prefix_lens,
             softmax_scale=scale,
+            kv_slots=kv_slots,
         )
         layout = (layer_id, tuple(query_lens), tuple(prefix_lens), q.shape[1], scale)
         if self.validate and layout not in self.checked_layouts:
             from sglang.test.qsa_validation import check_attention
 
+            if kv_slots is not None:
+                k, v = k.index_select(0, kv_slots), v.index_select(0, kv_slots)
             check_attention(
                 q=q,
                 k=k,
@@ -105,6 +163,11 @@ class PyHIPIndexer:
             from sglang.test.qsa_validation import IndexerValidation
 
             self.validation = IndexerValidation()
+        self.split_group = None
+        if envs.SGLANG_OPT_PYHIP_QSA_SPLIT_INDEXER.get():
+            group = get_attn_tp_group()
+            if group.world_size > 1:
+                self.split_group = group
 
     @classmethod
     def create(cls, *, indexer):
@@ -118,7 +181,8 @@ class PyHIPIndexer:
         ) != (4, 1, 128, 4, 512, 2048):
             return None
         rotary = indexer.rotary_emb
-        if type(rotary) is MRotaryEmbedding:
+        # YaRN only rescales the cos/sin cache, which the PyHIP prep reads as is.
+        if type(rotary) in (MRotaryEmbedding, YaRNScalingMRotaryEmbedding):
             if rotary.mrope_interleaved_glm or len(rotary.mrope_section or ()) not in (
                 0,
                 3,
@@ -296,6 +360,16 @@ class PyHIPIndexer:
             seq_lens=lengths,
             extend_lens=extends,
         )
+        if self.split_group is not None and _worth_splitting(
+            lengths=lengths, extends=extends
+        ):
+            run = functools.partial(
+                _split_prefill,
+                run,
+                group=self.split_group,
+                rows=len(hidden),
+                device=hidden.device,
+            )
         with torch.profiler.record_function("pyhip_qsa.indexer.prefill"):
             if (
                 self.validation is not None
@@ -314,8 +388,7 @@ class PyHIPIndexer:
                 )
             return run()
 
-    @staticmethod
-    def _supports_decode(*, rows, device, cache, table, lengths):
+    def _supports_decode(self, *, rows, device, cache, table, lengths):
         return (
             0 < rows < 65536
             and cache.dtype == torch.bfloat16
@@ -327,8 +400,18 @@ class PyHIPIndexer:
             and table.ndim == 2
             and table.shape[0] == rows
             and table.is_contiguous()
-            and table.shape[1] > 0
-            and table.shape[1] * 16 <= 65536
+            and 0 < table.shape[1] * 16 <= self.runtime.MAX_COMPRESSED_KEYS
+            # PyHIP's FP32 decode logits, padded by 512 values, use 32-bit offsets.
+            # Mirrors decode_indexer's check, which raises instead of falling back.
+            #   rows            query rows (per token in verify and draft extend)
+            #   table.shape[1]  compressed-K pages per row, 16 keys each
+            #   + 512           the top-k reads up to the next 512-value boundary
+            # Graph decode sizes the table by context_len, so PyHIP handles up to:
+            #   context_len  keys/row  bytes/row  max rows
+            #       262,144    65,536    256 KiB     8,191
+            #     1,000,000   250,000    977 KiB     2,147
+            #     1,048,576   262,144      1 MiB     2,047
+            and (rows * table.shape[1] * 16 + 512) * 4 < 2**31
             and lengths.dtype == torch.int32
             and lengths.shape == (rows,)
             and lengths.is_contiguous()
