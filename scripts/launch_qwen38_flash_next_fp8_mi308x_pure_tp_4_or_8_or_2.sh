@@ -121,8 +121,6 @@ export SGLANG_QWEN4_SP_SDMA_RS_TRANSPORT="${SGLANG_QWEN4_SP_SDMA_RS_TRANSPORT:-b
 # without a usable mori the aiter collectives run, with a warning.
 export MORI_ENABLE_SDMA="${MORI_ENABLE_SDMA:-1}"
 export MORI_SOCKET_IFNAME="${MORI_SOCKET_IFNAME:-lo}"
-# Read by a mori built with the MI308X engine-spread patch; ignored otherwise.
-export MORI_SDMA_SPREAD_MI308X="${MORI_SDMA_SPREAD_MI308X:-1}"
 # mori must use the same libdrm copy as the HIP runtime (ROCm's rocm_sysdeps one).
 ROCM_SYSDEPS_LIB="${ROCM_PATH:-/opt/rocm}/lib/rocm_sysdeps/lib"
 if [[ -f "${ROCM_SYSDEPS_LIB}/librocm_sysdeps_drm_amdgpu.so.1" && "${LD_PRELOAD:-}" != *rocm_sysdeps_drm_amdgpu* ]]; then

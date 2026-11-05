@@ -110,8 +110,6 @@ moves no bytes). Runtime requirements, all set by the MI308X launch script:
 - `LD_PRELOAD` of ROCm's `rocm_sysdeps/lib/librocm_sysdeps_drm{,_amdgpu}`: mori links the system libdrm,
   the HIP runtime its private copy, and two copies cannot share the GPU VM (mori's KFD setup would exit
   the process; sglang checks this and falls back before touching mori).
-- `MORI_SDMA_SPREAD_MI308X=1`, read by the patch: on MI308X two of a GPU's xGMI links can map to the same
-  SDMA engine, which serializes its copies to two TP4 peers.
 
 Check: `python -c "import mori.cco, flydsl.compiler"` and look for `push_one_0` / `push_all_0` kernels in
 a prefill trace.
