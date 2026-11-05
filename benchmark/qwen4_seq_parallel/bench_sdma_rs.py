@@ -4,6 +4,8 @@ Layer: out_proj FP8 GEMM [T, 6144/N] -> [T, 2560] partial -> reduce-scatter -> h
 
     WORLD=2 HIP_VISIBLE_DEVICES=0,1 python benchmark/qwen4_seq_parallel/bench_sdma_rs.py
     WORLD=4 HIP_VISIBLE_DEVICES=0,1,2,3 python benchmark/qwen4_seq_parallel/bench_sdma_rs.py
+
+Needs mori and its runtime environment (see README: MORI_ENABLE_SDMA, the libdrm LD_PRELOAD).
 """
 
 import os

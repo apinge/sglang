@@ -1,26 +1,27 @@
-"""Reduce-scatter over SDMA for the sequence-parallel prefill path (ROCm).
+"""Reduce-scatter and all-gather over SDMA for the sequence-parallel prefill path (ROCm).
 
-Rank r owns rows [r * L, (r + 1) * L) of the padded [N * L, hidden] partial sums.
-Each rank produces the rows in row chunks, the blocks it does not own first and
-its own block last. After computing a chunk of block b it pushes it with an SDMA
-copy into rank b's IPC-shared receive buffer and then bumps a flag in rank b's
-memory, both on a per-destination copy stream that only waits on local events.
-The owner waits on the flags (hipStreamWaitValue32) on its compute stream right
-before it sums the chunk; a wait on a side stream could block the compute
-stream when HIP maps both onto one hardware queue.
+Rank r owns rows [r * L, (r + 1) * L) of the padded [N * L, hidden] tensors.
+Every copy is an SDMA put posted from the compute stream through mori (see
+`sdma_mori.py`) into a peer's IPC-shared receive buffer; the copy engine bumps
+the receiver's per-sender counter once the bytes have landed, and the consumer
+waits on that counter on its compute stream right before it reads the rows.
 
-With an `fp8` transport each pushed row is float8 e4m3fnuz values plus one bf16
-scale per 32 (symmetric absmax); only peers' rows are quantized.
+Reduce-scatter: each rank produces its partial sums in row chunks, the blocks it
+does not own first and its own block last, and pushes each finished chunk to its
+owner. With an `fp8` transport each pushed row is float8 e4m3fnuz values plus
+one bf16 scale per 32 (symmetric absmax); only peers' rows are quantized.
 
-Flags carry a sequence number that grows by one per call, so they are never
-reset. Receive buffers are double-buffered: callers must run a collective over
-the group (the all-gather of the sequence-parallel layer) between two sends, so
-that a rank pushes call i + 2 only after the owner consumed call i.
+All-gather: either one push of this rank's rows consumed block by block
+(`SdmaAllGather.send`), or row ranges pushed as the producer finishes them
+(`SdmaAllGather.begin`).
+
+Receive buffers are double-buffered: callers must run a collective over the
+group between two sends of one instance, so that a rank pushes call i + 2 only
+after every peer consumed call i.
 """
 
 import ctypes
 import functools
-import logging
 from typing import Callable, Iterator, List, Optional, Tuple
 
 import torch
@@ -28,14 +29,9 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
-
-logger = logging.getLogger(__name__)
+from sglang.srt.layers.sdma_mori import get_mori_hub
 
 _HIP_IPC_LAZY_PEER = 0x1
-# hipMemcpyDeviceToDeviceNoCU: force the SDMA engine instead of a blit kernel.
-_HIP_MEMCPY_D2D_NO_CU = 1024
-_HIP_STREAM_WAIT_GEQ = 0x0
 _MAX_CHUNKS = 64
 _TRANSPORTS = ("bf16", "fp8")
 _QUANT_GROUP = 32
@@ -59,44 +55,12 @@ def _load_hip():
         ctypes.POINTER(ctypes.c_size_t),
         ctypes.c_void_p,
     ]
-    hip.hipMemcpyAsync.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-        ctypes.c_int,
-        ctypes.c_void_p,
-    ]
-    hip.hipStreamWaitValue32.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_uint32,
-        ctypes.c_uint,
-        ctypes.c_uint32,
-    ]
     return hip
 
 
 def _check(rc: int, what: str) -> None:
     if rc != 0:
         raise RuntimeError(f"{what} failed with hipError {rc}")
-
-
-class _RawPtr:
-    """Pointer argument for Triton when there is no torch tensor to pass."""
-
-    def __init__(self, ptr: int, dtype: torch.dtype):
-        self._ptr = ptr
-        self.dtype = dtype
-
-    def data_ptr(self) -> int:
-        return self._ptr
-
-
-@triton.jit
-def _signal_peer(flag_ptr, value):
-    # System-scope release: the rows written by the preceding kernel are visible
-    # to the peer's SDMA read once the peer observes the flag.
-    tl.atomic_xchg(flag_ptr, value, sem="release", scope="sys")
 
 
 @triton.jit
@@ -224,7 +188,6 @@ class SdmaReduceScatter:
         device: torch.device,
         cpu_group: dist.ProcessGroup,
         transport: str = "bf16",
-        backend: str = "hip",
     ):
         if transport not in _TRANSPORTS:
             raise ValueError(
@@ -265,34 +228,18 @@ class SdmaReduceScatter:
             if self._fp8
             else None
         )
-        # [source rank, chunk of this rank's block]
-        self._flags = torch.zeros(
-            self._world, _MAX_CHUNKS, dtype=torch.int32, device=device
-        )
         torch.cuda.synchronize(device)
 
         exported = [None] * self._world
-        dist.all_gather_object(
-            exported,
-            (self._export(self._recv), self._export(self._flags)),
-            group=cpu_group,
-        )
-        others = [p for p in range(self._world) if p != self._rank]
-        self._peer_recv = {p: self._import(exported[p][0]) for p in others}
-        self._peer_flags = {p: self._import(exported[p][1]) for p in others}
-        self._seq = 0
+        dist.all_gather_object(exported, self._export(self._recv), group=cpu_group)
+        self._peer_recv = {
+            p: self._import(exported[p]) for p in range(self._world) if p != self._rank
+        }
         self._slot = 0
-        self._mori = None
-        if backend == "mori":
-            from sglang.srt.layers.sdma_mori import get_mori_hub
-
-            self._mori = get_mori_hub(cpu_group, device)
-            self._copy_streams = {}
-        else:
-            self._copy_streams = {p: torch.cuda.Stream(device) for p in others}
-        # [slot]: bf16 sources the copy engines may still read; a send two calls
+        self._mori = get_mori_hub(cpu_group, device)
+        # [slot]: bf16 sources the copy engine may still read; a send two calls
         # later runs after the group collective, so every peer has received them.
-        self._mori_sources: List[List[torch.Tensor]] = [[], []]
+        self._sources: List[List[torch.Tensor]] = [[], []]
 
     def fits(self, local_rows: int) -> bool:
         return local_rows <= self._local_capacity
@@ -309,11 +256,7 @@ class SdmaReduceScatter:
         [r0, r1) < num_tokens) over the padded [world * local_rows] rows."""
         if not 1 <= chunks <= _MAX_CHUNKS:
             raise ValueError(f"chunks must be in [1, {_MAX_CHUNKS}], got {chunks}")
-        comp = torch.cuda.current_stream()
-        for stream in self._copy_streams.values():
-            comp.wait_stream(stream)
-        self._seq += 1
-        self._mori_sources[self._slot] = []
+        self._sources[self._slot] = []
         bounds = [local_rows * j // chunks for j in range(chunks + 1)]
         local_chunks: List[Optional[torch.Tensor]] = [None] * chunks
         for i in range(1, self._world + 1):
@@ -325,29 +268,25 @@ class SdmaReduceScatter:
                 if block == self._rank:
                     local_chunks[j] = x
                 else:
-                    self._push(x=x, owner=block, r0=bounds[j], row0=r0, chunk=j)
+                    self._push(x=x, owner=block, r0=bounds[j], row0=r0)
         slot = self._slot
         self._slot ^= 1
-        recv = self._recv[slot]
-        wait_landed = self._wait_landed
-        if self._mori is not None:
-            wait_landed = functools.partial(
-                self._mori_wait_landed, received_before=self._mori.received
-            )
-            self._mori.received += chunks
+        received_before = self._mori.received
+        self._mori.received += chunks
         return PendingReduceScatter(
             carrier=self._recv.view(-1, self._recv.shape[-1])[:num_tokens],
             local_chunks=local_chunks,
-            recv_records=recv.view(self._world - 1, -1).view(torch.int8),
+            recv_records=self._recv[slot].view(self._world - 1, -1).view(torch.int8),
             rec_bytes=self._rec_bytes,
             fp8=self._fp8,
             bounds=bounds,
-            wait_landed=wait_landed,
+            wait_landed=functools.partial(
+                self._wait_landed, received_before=received_before
+            ),
         )
 
-    def _push(self, *, x: torch.Tensor, owner: int, r0: int, row0: int, chunk: int):
-        """Push rows [r0, r0 + len(x)) of owner's block, then flag them."""
-        comp = torch.cuda.current_stream()
+    def _push(self, *, x: torch.Tensor, owner: int, r0: int, row0: int) -> None:
+        """Push rows [r0, r0 + len(x)) of owner's block."""
         if self._fp8:
             records = (
                 self._staging[self._slot]
@@ -358,6 +297,7 @@ class SdmaReduceScatter:
             src = records.data_ptr()
         else:
             x = x.contiguous()
+            self._sources[self._slot].append(x)
             src = x.data_ptr()
         source_index = (self._rank - owner - 1) % self._world
         dst = (
@@ -366,56 +306,14 @@ class SdmaReduceScatter:
             * self._row_bytes
             + r0 * self._rec_bytes
         )
-        if self._mori is not None:
-            if not self._fp8:
-                self._mori_sources[self._slot].append(x)
-            self._mori.push_one(
-                peer=owner,
-                dst_ptr=dst,
-                src_ptr=src,
-                nbytes=x.shape[0] * self._rec_bytes,
-            )
-            return
-        stream = self._copy_streams[owner]
-        stream.wait_stream(comp)
-        x.record_stream(stream)
-        _check(
-            self._hip.hipMemcpyAsync(
-                dst,
-                src,
-                x.shape[0] * self._rec_bytes,
-                _HIP_MEMCPY_D2D_NO_CU,
-                stream.cuda_stream,
-            ),
-            "hipMemcpyAsync",
+        self._mori.push_one(
+            peer=owner, dst_ptr=dst, src_ptr=src, nbytes=x.shape[0] * self._rec_bytes
         )
-        with torch.cuda.stream(stream):
-            _signal_peer[(1,)](
-                _RawPtr(
-                    self._peer_flags[owner] + 4 * (self._rank * _MAX_CHUNKS + chunk),
-                    torch.int32,
-                ),
-                self._seq,
-            )
 
-    def _mori_wait_landed(self, chunk: int, *, received_before: int) -> None:
+    def _wait_landed(self, chunk: int, *, received_before: int) -> None:
         # Each peer pushes chunks in order on one queue, so chunk j has landed
         # once that peer's counter reaches received_before + j + 1.
         self._mori.wait(expected=received_before + chunk + 1)
-
-    def _wait_landed(self, chunk: int) -> None:
-        stream = torch.cuda.current_stream().cuda_stream
-        for peer in self._peer_recv:
-            _check(
-                self._hip.hipStreamWaitValue32(
-                    stream,
-                    self._flags[peer, chunk].data_ptr(),
-                    self._seq,
-                    _HIP_STREAM_WAIT_GEQ,
-                    0xFFFFFFFF,
-                ),
-                "hipStreamWaitValue32",
-            )
 
     def _padded_rows(self, rows, r0, r1, num_tokens) -> torch.Tensor:
         if r1 <= num_tokens:
@@ -468,32 +366,6 @@ class SdmaReduceScatter:
         return ptr.value + offset
 
 
-_BACKEND: Optional[str] = None
-
-
-def resolve_sdma_backend() -> str:
-    """SGLANG_QWEN4_SP_SDMA_BACKEND, falling back to "hip" (with one warning) when
-    mori cannot run in this process."""
-    global _BACKEND
-    if _BACKEND is None:
-        wanted = envs.SGLANG_QWEN4_SP_SDMA_BACKEND.get()
-        if wanted not in ("mori", "hip"):
-            raise ValueError(
-                f"SGLANG_QWEN4_SP_SDMA_BACKEND must be mori or hip, got {wanted!r}"
-            )
-        _BACKEND = wanted
-        if wanted == "mori":
-            from sglang.srt.layers.sdma_mori import mori_unavailable_reason
-
-            reason = mori_unavailable_reason()
-            if reason is not None:
-                logger.warning(
-                    "SDMA backend mori unavailable (%s); using hip copy streams", reason
-                )
-                _BACKEND = "hip"
-    return _BACKEND
-
-
 _INSTANCE: Optional[SdmaReduceScatter] = None
 
 
@@ -515,16 +387,15 @@ def get_sdma_reduce_scatter(
             device=torch.device("cuda", torch.cuda.current_device()),
             cpu_group=cpu_group,
             transport=transport,
-            backend=resolve_sdma_backend(),
         )
     return _INSTANCE
 
 
 class PendingAllGather:
     """All-gather in flight: this rank's rows are local, peers' rows land in
-    `gathered` once their flags are set. `wait_block(src)` on the consuming
-    stream before reading block src; after waiting every block, `gathered` is
-    the complete [num_tokens, hidden] tensor."""
+    `gathered`. `wait_block(src)` on the consuming stream before reading block
+    src; after waiting every block, `gathered` is the complete [num_tokens,
+    hidden] tensor."""
 
     def __init__(
         self,
@@ -572,15 +443,11 @@ class PendingAllGather:
 class SdmaAllGather:
     """All-gather over SDMA for the sequence-parallel layout (ROCm).
 
-    Each rank copies its rows into its own slot and pushes them with SDMA into
-    every peer's IPC-shared buffer at its row offset, then bumps a flag in the
-    peer's memory, all on per-destination copy streams that only wait on local
-    events. Consumers wait on the flags on their compute stream block by block
-    (`PendingAllGather.blocks()`), so the next projection can start on the
-    local rows while peers' rows are in flight.
-
-    Buffers are double-buffered under the same contract as SdmaReduceScatter:
-    a group collective runs between two sends.
+    Each rank copies its rows into its own slot and pushes them into every
+    peer's IPC-shared buffer at its row offset. Consumers wait block by block
+    (`PendingAllGather.blocks()`), so the next projection can start on the local
+    rows while peers' rows are in flight. Buffers are double-buffered under the
+    same contract as SdmaReduceScatter: a group collective runs between two sends.
     """
 
     def __init__(
@@ -591,7 +458,6 @@ class SdmaAllGather:
         dtype: torch.dtype,
         device: torch.device,
         cpu_group: dist.ProcessGroup,
-        backend: str = "hip",
     ):
         self._hip = _load_hip()
         self._world = dist.get_world_size(cpu_group)
@@ -605,42 +471,25 @@ class SdmaAllGather:
             device=device,
         )
         self._row_bytes = hidden_size * self._buf.element_size()
-        # [source rank]
-        self._flags = torch.zeros(self._world, dtype=torch.int32, device=device)
         torch.cuda.synchronize(device)
 
         exported = [None] * self._world
-        dist.all_gather_object(
-            exported,
-            (self._export(self._buf), self._export(self._flags)),
-            group=cpu_group,
-        )
-        others = [p for p in range(self._world) if p != self._rank]
-        self._peer_buf = {p: self._import(exported[p][0]) for p in others}
-        self._peer_flags = {p: self._import(exported[p][1]) for p in others}
-        self._seq = 0
+        dist.all_gather_object(exported, self._export(self._buf), group=cpu_group)
+        peer_buf = {
+            p: self._import(exported[p]) for p in range(self._world) if p != self._rank
+        }
         self._slot = 0
-        self._mori = None
-        if backend == "mori":
-            from sglang.srt.layers.sdma_mori import get_mori_hub
-
-            self._mori = get_mori_hub(cpu_group, device)
-            slot_bytes = self._world * self._local_capacity * self._row_bytes
-            # [slot, peer]: base address of the peer's receive slot.
-            self._mori_tables = torch.tensor(
-                [
-                    [
-                        self._peer_buf.get(p, 0) + slot * slot_bytes
-                        for p in range(self._world)
-                    ]
-                    for slot in range(2)
-                ],
-                dtype=torch.int64,
-                device=device,
-            )
-            self._copy_streams = {}
-        else:
-            self._copy_streams = {p: torch.cuda.Stream(device) for p in others}
+        self._mori = get_mori_hub(cpu_group, device)
+        slot_bytes = self._world * self._local_capacity * self._row_bytes
+        # [slot, peer]: base address of the peer's receive slot (0 for this rank).
+        self._dst_tables = torch.tensor(
+            [
+                [peer_buf.get(p, 0) + slot * slot_bytes for p in range(self._world)]
+                for slot in range(2)
+            ],
+            dtype=torch.int64,
+            device=device,
+        )
 
     _export = SdmaReduceScatter._export
     _import = SdmaReduceScatter._import
@@ -652,58 +501,29 @@ class SdmaAllGather:
         self, *, local: torch.Tensor, num_tokens: int, local_rows: int
     ) -> PendingAllGather:
         """Start gathering `local` ([local_rows, hidden], this rank's rows)."""
-        comp = torch.cuda.current_stream()
-        for stream in self._copy_streams.values():
-            comp.wait_stream(stream)
-        self._seq += 1
         slot = self._slot
         self._slot ^= 1
         local = local.contiguous()
         buf = self._buf[slot, : self._world * local_rows]
         r0 = self._rank * local_rows
         buf[r0 : r0 + local_rows].copy_(local)
-        wait_block = self._wait_block
-        if self._mori is not None:
-            # Push from the own slot, which stays untouched until the call after next.
-            self._mori.push_all(
-                dst_table=self._mori_tables[slot],
-                src_ptr=buf[r0].data_ptr(),
-                dst_off=r0 * self._row_bytes,
-                nbytes=local_rows * self._row_bytes,
-            )
-            self._mori.received += 1
-            wait_block = functools.partial(
-                self._mori_wait_block, expected=self._mori.received
-            )
-        for peer, stream in self._copy_streams.items():
-            stream.wait_stream(comp)
-            local.record_stream(stream)
-            dst = (
-                self._peer_buf[peer]
-                + (slot * self._world * self._local_capacity + r0) * self._row_bytes
-            )
-            _check(
-                self._hip.hipMemcpyAsync(
-                    dst,
-                    local.data_ptr(),
-                    local_rows * self._row_bytes,
-                    _HIP_MEMCPY_D2D_NO_CU,
-                    stream.cuda_stream,
-                ),
-                "hipMemcpyAsync",
-            )
-            with torch.cuda.stream(stream):
-                _signal_peer[(1,)](
-                    _RawPtr(self._peer_flags[peer] + 4 * self._rank, torch.int32),
-                    self._seq,
-                )
+        # Push from the own slot, which stays untouched until the call after next.
+        self._mori.push_all(
+            dst_table=self._dst_tables[slot],
+            src_ptr=buf[r0].data_ptr(),
+            dst_off=r0 * self._row_bytes,
+            nbytes=local_rows * self._row_bytes,
+        )
+        self._mori.received += 1
         return PendingAllGather(
             local=local,
             gathered=buf[:num_tokens],
             rank=self._rank,
             world_size=self._world,
             local_rows=local_rows,
-            wait_block=wait_block,
+            wait_block=functools.partial(
+                self._wait_block, expected=self._mori.received
+            ),
         )
 
     def begin(
@@ -711,87 +531,34 @@ class SdmaAllGather:
     ) -> "AllGatherWriter":
         """Start an all-gather whose local rows are pushed in `pushes` row ranges
         as the producer finishes them (the same count on every rank)."""
-        comp = torch.cuda.current_stream()
-        for stream in self._copy_streams.values():
-            comp.wait_stream(stream)
-        self._seq += 1
         slot = self._slot
         self._slot ^= 1
-        expected = 0
-        if self._mori is not None:
-            self._mori.received += pushes
-            expected = self._mori.received
+        self._mori.received += pushes
         return AllGatherWriter(
             ag=self,
             slot=slot,
             num_tokens=num_tokens,
             local_rows=local_rows,
             pushes=pushes,
-            mori_expected=expected,
+            expected=self._mori.received,
         )
 
     def _push_rows(self, *, slot: int, row0: int, rows: torch.Tensor) -> None:
         """Copy this rank's rows into its own slot at row0 and push them to every peer."""
         own = self._buf[slot, row0 : row0 + rows.shape[0]]
         own.copy_(rows)
-        nbytes = rows.shape[0] * self._row_bytes
-        if self._mori is not None:
-            self._mori.push_all(
-                dst_table=self._mori_tables[slot],
-                src_ptr=own.data_ptr(),
-                dst_off=row0 * self._row_bytes,
-                nbytes=nbytes,
-            )
-            return
-        comp = torch.cuda.current_stream()
-        for peer, stream in self._copy_streams.items():
-            stream.wait_stream(comp)
-            dst = (
-                self._peer_buf[peer]
-                + (slot * self._world * self._local_capacity + row0) * self._row_bytes
-            )
-            _check(
-                self._hip.hipMemcpyAsync(
-                    dst,
-                    own.data_ptr(),
-                    nbytes,
-                    _HIP_MEMCPY_D2D_NO_CU,
-                    stream.cuda_stream,
-                ),
-                "hipMemcpyAsync",
-            )
-
-    def _signal_all(self) -> None:
-        # Copies to a peer run in order on its copy stream, so one flag after the
-        # last range covers every range pushed before it.
-        for peer, stream in self._copy_streams.items():
-            with torch.cuda.stream(stream):
-                _signal_peer[(1,)](
-                    _RawPtr(self._peer_flags[peer] + 4 * self._rank, torch.int32),
-                    self._seq,
-                )
-
-    def _wait_all_landed(self, mori_expected: int) -> None:
-        if self._mori is not None:
-            self._mori.wait(expected=mori_expected)
-            return
-        for src in self._peer_buf:
-            self._wait_block(src)
-
-    def _mori_wait_block(self, src: int, *, expected: int) -> None:
-        self._mori.wait(expected=expected, only=src)
-
-    def _wait_block(self, src: int) -> None:
-        _check(
-            self._hip.hipStreamWaitValue32(
-                torch.cuda.current_stream().cuda_stream,
-                self._flags[src].data_ptr(),
-                self._seq,
-                _HIP_STREAM_WAIT_GEQ,
-                0xFFFFFFFF,
-            ),
-            "hipStreamWaitValue32",
+        self._mori.push_all(
+            dst_table=self._dst_tables[slot],
+            src_ptr=own.data_ptr(),
+            dst_off=row0 * self._row_bytes,
+            nbytes=rows.shape[0] * self._row_bytes,
         )
+
+    def _wait_all_landed(self, expected: int) -> None:
+        self._mori.wait(expected=expected)
+
+    def _wait_block(self, src: int, *, expected: int) -> None:
+        self._mori.wait(expected=expected, only=src)
 
 
 class AllGatherWriter:
@@ -807,7 +574,7 @@ class AllGatherWriter:
         num_tokens: int,
         local_rows: int,
         pushes: int,
-        mori_expected: int,
+        expected: int,
     ):
         self._ag = ag
         self._slot = slot
@@ -815,7 +582,7 @@ class AllGatherWriter:
         self._local_rows = local_rows
         self._pushes = pushes
         self._pushed = 0
-        self._mori_expected = mori_expected
+        self._expected = expected
 
     def push(self, r0: int, r1: int, rows: torch.Tensor) -> None:
         if self._pushed >= self._pushes:
@@ -824,13 +591,11 @@ class AllGatherWriter:
             slot=self._slot, row0=self._ag._rank * self._local_rows + r0, rows=rows
         )
         self._pushed += 1
-        if self._pushed == self._pushes:
-            self._ag._signal_all()
 
     def finish(self) -> torch.Tensor:
         if self._pushed != self._pushes:
             raise RuntimeError(f"pushed {self._pushed} of {self._pushes} ranges")
-        self._ag._wait_all_landed(self._mori_expected)
+        self._ag._wait_all_landed(self._expected)
         ag = self._ag
         return ag._buf[self._slot, : ag._world * self._local_rows][: self._num_tokens]
 
@@ -854,6 +619,5 @@ def get_sdma_all_gather(
             dtype=dtype,
             device=torch.device("cuda", torch.cuda.current_device()),
             cpu_group=cpu_group,
-            backend=resolve_sdma_backend(),
         )
     return _AG_INSTANCE

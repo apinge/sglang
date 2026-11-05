@@ -94,8 +94,8 @@ export SGLANG_QWEN4_SP_SDMA_RS="${SGLANG_QWEN4_SP_SDMA_RS:-1}"
 export SGLANG_QWEN4_SP_SDMA_AG="${SGLANG_QWEN4_SP_SDMA_AG:-1}"
 export SGLANG_QWEN4_SP_SDMA_AG_MOE="${SGLANG_QWEN4_SP_SDMA_AG_MOE:-1}"
 export SGLANG_QWEN4_SP_SDMA_RS_TRANSPORT="${SGLANG_QWEN4_SP_SDMA_RS_TRANSPORT:-bf16}"
-# mori posts the copies from the GPU; without a usable mori the hip backend is used.
-export SGLANG_QWEN4_SP_SDMA_BACKEND="${SGLANG_QWEN4_SP_SDMA_BACKEND:-mori}"
+# mori posts the copies from the GPU (benchmark/qwen4_seq_parallel/mori/install_mori.sh);
+# without a usable mori the aiter collectives run, with a warning.
 export MORI_ENABLE_SDMA="${MORI_ENABLE_SDMA:-1}"
 export MORI_SOCKET_IFNAME="${MORI_SOCKET_IFNAME:-lo}"
 # Read by a mori built with the MI308X engine-spread patch; ignored otherwise.

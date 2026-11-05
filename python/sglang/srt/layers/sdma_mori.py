@@ -17,11 +17,19 @@ LD_PRELOAD them), otherwise mori's KFD context fails to acquire the GPU VM and
 exits the process.
 """
 
+import functools
+import logging
 import os
 from typing import Optional
 
 import torch
 import torch.distributed as dist
+
+logger = logging.getLogger(__name__)
+
+# Tested pin; benchmark/qwen4_seq_parallel/mori/install_mori.sh builds it with the
+# MI308X engine-spread patch.
+MORI_TESTED_COMMIT = "752efd3"
 
 _WAVE = 64
 
@@ -45,6 +53,29 @@ def mori_unavailable_reason() -> Optional[str]:
     ):
         return "LD_PRELOAD lacks ROCm's librocm_sysdeps_drm(_amdgpu)"
     return None
+
+
+@functools.lru_cache(maxsize=None)
+def sdma_available() -> bool:
+    """Whether the SDMA overlap can run in this process; warns once when it cannot,
+    in which case callers keep the aiter reduce-scatter / all-gather."""
+    reason = mori_unavailable_reason()
+    if reason is not None:
+        logger.warning(
+            "SP SDMA overlap disabled (%s); using the aiter reduce-scatter / all-gather",
+            reason,
+        )
+        return False
+    import mori
+
+    version = mori.__version__
+    if MORI_TESTED_COMMIT not in version:
+        logger.info(
+            "mori %s; SP SDMA overlap was tested with mori %s + the MI308X engine-spread patch",
+            version,
+            MORI_TESTED_COMMIT,
+        )
+    return True
 
 
 def _build_kernels(rank: int, world: int):

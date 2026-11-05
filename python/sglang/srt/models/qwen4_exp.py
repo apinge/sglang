@@ -46,6 +46,7 @@ from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scat
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.layers.sdma_mori import sdma_available
 from sglang.srt.layers.sdma_reduce_scatter import (
     PendingAllGather,
     PendingReduceScatter,
@@ -1262,6 +1263,8 @@ class Qwen4ExpPLELayer(nn.Module):
 def _sdma_reduce_scatter_for(
     plan: SeqParallelPlan, *, hidden_size: int, dtype: torch.dtype
 ) -> Optional[SdmaReduceScatter]:
+    if not sdma_available():
+        return None
     rs = get_sdma_reduce_scatter(
         capacity_tokens=get_global_server_args().max_prefill_tokens,
         hidden_size=hidden_size,
@@ -1387,6 +1390,8 @@ def _install_sp_sdma_proj(layer: nn.Module, proj: nn.Module) -> None:
 def _sdma_all_gather_for(
     plan: SeqParallelPlan, *, hidden_size: int, dtype: torch.dtype
 ) -> Optional[SdmaAllGather]:
+    if not sdma_available():
+        return None
     ag = get_sdma_all_gather(
         capacity_tokens=get_global_server_args().max_prefill_tokens,
         hidden_size=hidden_size,

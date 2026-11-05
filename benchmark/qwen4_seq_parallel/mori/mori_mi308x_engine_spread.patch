@@ -1,0 +1,47 @@
+--- a/src/application/transport/sdma/anvil.cpp	2026-11-05 01:36:41.325287708 +0000
++++ b/src/application/transport/sdma/anvil.cpp	2026-11-05 01:36:54.957323162 +0000
+@@ -29,11 +29,13 @@
+ 
+ #include "mori/application/transport/sdma/anvil.hpp"
+ 
++#include <array>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <fstream>
+ #include <iostream>
++#include <map>
+ #include <mutex>
+ #include <stdexcept>
+ #include <unordered_map>
+@@ -405,6 +407,22 @@
+     engines.swap(evenEngines);
+   }
+ 
++  // MI308X: two single-engine links of one GPU can fold onto the same even engine
++  // (e.g. masks 0x40 and 0x80 -> engine 6), serialising its copies to both peers.
++  // With MORI_SDMA_SPREAD_MI308X=1, a link whose engine already serves another peer
++  // of this GPU takes the least-used even xGMI engine instead.
++  static std::map<int, std::array<int, 8>> engineUse;
++  const char* spreadEnv = std::getenv("MORI_SDMA_SPREAD_MI308X");
++  const bool spread = spreadEnv && spreadEnv[0] == '1';
++  if (spread && isMi308x(srcNode) && srcNode != dstNode && engines.size() == 1 &&
++      engineUse[srcNode][engines[0]] > 0) {
++    uint32_t best = engines[0];
++    for (uint32_t e : {2u, 4u, 6u}) {
++      if (engineUse[srcNode][e] < engineUse[srcNode][best]) best = e;
++    }
++    engines[0] = best;
++  }
++
+   int numEngines = static_cast<int>(engines.size());
+ 
+   // Queues live in this process-global singleton and are shared across every
+@@ -418,6 +436,7 @@
+     const uint32_t hsakmtNode = hsakmtNodeForKfdNode(srcNode);
+     for (int c = static_cast<int>(channels.size()); c < numChannels; ++c) {
+       uint32_t engineId = engines[c % numEngines];
++      if (srcNode != dstNode) engineUse[srcNode][engineId]++;
+       channels.emplace_back(std::make_unique<SdmaQueue>(hsakmtNode, engineId));
+     }
+   }
