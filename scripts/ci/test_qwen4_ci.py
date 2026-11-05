@@ -147,3 +147,18 @@ def test_accuracy_regression_fails_the_run_and_reports_remaining_cases(
         row["status"] == "failed" for row in report["cases"]
     )
     assert "90.00%" in (args.output / "summary.md").read_text()
+
+
+def test_gpu_selection_skips_busy_devices_and_maps_to_host_indices(monkeypatch):
+    seen = {}
+
+    def run(argv, env, **kwargs):
+        seen["visible"] = env["HIP_VISIBLE_DEVICES"]
+        return subprocess.CompletedProcess(argv, 0, stdout="[1, 3]\n", stderr="")
+
+    monkeypatch.setattr(ci.subprocess, "run", run)
+    assert ci.select_gpus({}, ["0", "2", "5", "7"], 2) == ["2", "7"]
+    assert seen["visible"] == "0,2,5,7"
+    assert ci.select_gpus({}, ["0", "2", "5", "7"], 1) == ["2"]
+    with pytest.raises(RuntimeError, match="Need 4 idle GPUs.*idle: 2,7"):
+        ci.select_gpus({}, ["0", "2", "5", "7"], 4)
