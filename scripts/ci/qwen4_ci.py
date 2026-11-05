@@ -317,29 +317,40 @@ def run_phase(script, directory, env, server, timeout):
             raise RuntimeError("Server exited during evaluation")
 
 
-def check_gpus(env, tp):
+def select_gpus(env, devices, tp):
+    """Return the first `tp` idle gfx942 GPUs among `devices`."""
     # A child owns all GPU inspection so the supervisor never reserves VRAM.
     result = subprocess.run(
         [
             sys.executable,
             "-c",
             """
-import torch
-assert torch.version.hip and torch.cuda.device_count() >= int(__import__('sys').argv[1]), 'Not enough ROCm GPUs'
-for i in range(int(__import__('sys').argv[1])):
+import json, torch
+assert torch.version.hip, 'ROCm PyTorch required'
+idle = []
+for i in range(torch.cuda.device_count()):
     assert torch.cuda.get_device_properties(i).gcnArchName.split(':')[0] == 'gfx942', 'MI308X/gfx942 required'
     free, total = torch.cuda.mem_get_info(i)
-    assert total - free < 1024**3, f'Visible GPU {i} is busy; select free devices with --gpus'
+    if total - free < 1024**3:
+        idle.append(i)
+print(json.dumps(idle))
 """,
-            str(tp),
         ],
-        env=env,
+        env={**env, "HIP_VISIBLE_DEVICES": ",".join(devices)},
         capture_output=True,
         text=True,
         timeout=120,
     )
     if result.returncode:
         raise RuntimeError(result.stderr.strip().splitlines()[-1])
+    # Child ordinals index into the HIP_VISIBLE_DEVICES list it was given.
+    idle = [devices[i] for i in json.loads(result.stdout.strip().splitlines()[-1])]
+    if len(idle) < tp:
+        raise RuntimeError(
+            f"Need {tp} idle GPUs among --gpus {','.join(devices)}; "
+            f"idle: {','.join(idle) or 'none'}"
+        )
+    return idle[:tp]
 
 
 def run_case(case, args, directory, row):
@@ -366,7 +377,6 @@ def run_case(case, args, directory, row):
         PORT=str(args.port),
         MODEL_PATH=str(model_path),
         SERVED_MODEL_NAME=served_name,
-        HIP_VISIBLE_DEVICES=",".join(devices[:tp]),
         GPU_ARCHS="gfx942",
         TP_SIZE=str(tp),
         MTP="1" if mode == "mtp" else "0",
@@ -379,7 +389,8 @@ def run_case(case, args, directory, row):
         )
         if not (Path(env["DRAFT_MODEL_PATH"]) / "config.json").is_file():
             raise ValueError(f"Missing draft model: {env['DRAFT_MODEL_PATH']}")
-    check_gpus(env, tp)
+    env["HIP_VISIBLE_DEVICES"] = ",".join(select_gpus(env, devices, tp))
+    print(f"{name}: using GPUs {env['HIP_VISIBLE_DEVICES']}", flush=True)
     with socket.socket() as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("127.0.0.1", args.port))
