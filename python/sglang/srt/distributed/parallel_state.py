@@ -46,6 +46,7 @@ from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_context import get_communication_phase
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -467,6 +468,14 @@ class GroupCoordinator:
 
         self.ca_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
+        self._fp8_prefill_policy = False
+        self._fp8_logged_routes = set()
+        if is_hip() and use_custom_allreduce and self.world_size > 1:
+            from sglang.srt.distributed.device_communicators.aiter_quick_all_reduce import (
+                aiter_fp8_requested,
+            )
+
+            self._fp8_prefill_policy = aiter_fp8_requested()
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
@@ -479,12 +488,32 @@ class GroupCoordinator:
                     device=self.device,
                 )
             except Exception as e:
+                if self._fp8_prefill_policy:
+                    raise RuntimeError(
+                        "FP8 prefill requires the existing AITER decode CA"
+                    ) from e
                 logger.warning(
                     f"Setup Custom allreduce failed with {e}. To silence this "
                     "warning, specify --disable-custom-all-reduce explicitly."
                 )
 
-            if is_hip():
+            if self._fp8_prefill_policy:
+                from aiter.dist.device_communicators.custom_all_reduce import (
+                    CustomAllreduce as AiterCA,
+                )
+
+                from sglang.srt.distributed.device_communicators.aiter_quick_all_reduce import (
+                    AiterFp8QuickAllReduce,
+                )
+
+                if not isinstance(self.ca_comm, AiterCA) or self.ca_comm.disabled:
+                    raise RuntimeError(
+                        "FP8 prefill requires an enabled AiterCustomAllreduce for decode"
+                    )
+                self.qr_comm = AiterFp8QuickAllReduce(
+                    group=self.cpu_group, device=self.device
+                )
+            elif is_hip():
                 try:
                     # Initialize a custom quick all-reduce implementation for AMD
                     # when rocm >= gfx942. Quick reduce is designed as a
@@ -691,6 +720,14 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
+        phase_method = self._phase_all_reduce_method(input_)
+        if phase_method is not None:
+            return outplace_all_reduce(
+                input_,
+                group_name=self.unique_name,
+                outplace_all_reduce_method=phase_method,
+            )
+
         if torch.compiler.is_compiling():
             if self._can_use_flashinfer_allreduce(input_):
                 return flashinfer_allreduce(input_, group_name=self.unique_name)
@@ -779,6 +816,12 @@ class GroupCoordinator:
         eps: float,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator. ROCm/HIP Only"""
+        if (
+            getattr(self, "_fp8_prefill_policy", False)
+            and get_communication_phase() == "prefill"
+        ):
+            # The caller falls back to ordinary FP8 all-reduce followed by norm.
+            return None
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None
@@ -862,6 +905,11 @@ class GroupCoordinator:
         if not (is_hip() and is_gfx95_supported()):
             return None
 
+        if (
+            getattr(self, "_fp8_prefill_policy", False)
+            and get_communication_phase() == "prefill"
+        ):
+            return None
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None
@@ -909,11 +957,29 @@ class GroupCoordinator:
         except Exception:
             return None
 
+    def _phase_all_reduce_method(self, input_):
+        if not getattr(self, "_fp8_prefill_policy", False):
+            return None
+        phase = get_communication_phase()
+        if phase is None or input_.dtype not in (torch.bfloat16, torch.float16):
+            # Initialization/auxiliary collectives keep their existing policy.
+            return None
+        if phase == "prefill":
+            return "qr"
+        if phase == "decode":
+            return "ca"
+        raise RuntimeError(
+            f"AITER FP8 prefill does not support communication phase {phase!r}"
+        )
+
     def _resolve_outplace_all_reduce_method(
         self,
         input_: torch.Tensor,
         should_use_pymscclpp_allreduce: Optional[bool] = None,
     ) -> Optional[str]:
+        phase_method = self._phase_all_reduce_method(input_)
+        if phase_method is not None:
+            return phase_method
         if should_use_pymscclpp_allreduce is None:
             should_use_pymscclpp_allreduce = (
                 self.pymscclpp_comm is not None
@@ -928,6 +994,7 @@ class GroupCoordinator:
             return "ca"
         if (
             self.qr_comm is not None
+            and not getattr(self, "_fp8_prefill_policy", False)
             and not self.qr_comm.disabled
             and self.qr_comm.should_quick_allreduce(input_)
         ):
@@ -995,6 +1062,29 @@ class GroupCoordinator:
         torch_symm_mem_comm = self.torch_symm_mem_comm
         pynccl_comm = self.pynccl_comm
         assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm])
+        if getattr(
+            self, "_fp8_prefill_policy", False
+        ) and outplace_all_reduce_method in ("ca", "qr"):
+            method = outplace_all_reduce_method
+            if method == "ca" and (
+                ca_comm.disabled or not ca_comm.should_custom_ar(input_)
+            ):
+                raise RuntimeError(
+                    f"AITER decode CA rejected group={self.unique_name} shape={tuple(input_.shape)} dtype={input_.dtype} bytes={input_.nbytes}"
+                )
+            phase = get_communication_phase()
+            route = (phase, method)
+            if route not in self._fp8_logged_routes:
+                logger.info(
+                    "[AR phase] group=%s phase=%s method=%s codec=%s shape=%s bytes=%s",
+                    self.unique_name,
+                    phase,
+                    method,
+                    "FP8" if method == "qr" else "unquantized",
+                    tuple(input_.shape),
+                    input_.nbytes,
+                )
+                self._fp8_logged_routes.add(route)
         if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(input_)
@@ -1841,6 +1931,10 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        qr_comm = getattr(self, "qr_comm", None)
+        if qr_comm is not None:
+            qr_comm.close()
+            self.qr_comm = None
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
