@@ -200,6 +200,7 @@ Target model: [sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16](https://huggin
 - CI runs each selected case in its own GitHub Actions matrix job using `evaluation/Dockerfile.ci` and the existing launch, benchmark, and `run_gsm8k.sh` scripts.
 - Non-draft fork PRs require the `run-qwen4-ci` label to run GPU cases. Adding the label triggers a new run through the `labeled` event.
 - Case jobs run serially on the shared host, each with its own image container, console logs, and result artifact. Docker builds reuse cached layers.
+- Each new CI run resolves AITER `qwen38-flash-next-dev` and pyhip `dev` to their latest commits. Cases and GPU-only retries use the same resolved SHAs, recorded in `build.json`. Explicit AITER refs from manual or reusable workflows are preserved.
 - Each GPU case job has a 60-minute timeout, including the image build. Cancellation stops its container, and the container also exits after 60 minutes from creation so its server workers cannot keep holding GPUs if the runner disconnects. Timed-out cases fail the final CI gate.
 - The final **Qwen4 CI** job calls `python3 scripts/ci/qwen4_ci.py summarize` to publish one combined table and the number of passing cases (for example, **6/6**).
 - The default case order is Qwen3.8 Flash TP2 base, Qwen3.8 Flash TP2 MTP, Qwen3.5 35B TP4 base, Qwen3.5 35B TP1 DFlash, Qwen3.5 397B TP8 base, then Qwen3.5 397B TP8 DFlash. Local runs and the Actions matrix use this order. Direct local runs can evaluate multiple cases in one container and share its normal kernel cache:
@@ -218,11 +219,15 @@ Performance uses 10 warmup requests and 128 random requests at concurrency one;
 Qwen3.5 uses 8,000 input / 500 output tokens, and Qwen3.8 uses 12,000 / 350.
 Accuracy scores 200 examples and enforces the recorded gate.
 
-Build the local image from the checkout once, or rebuild after local code changes:
+Resolve both development branches before building the local image. Passing their
+SHAs refreshes changed sources while preserving Docker's cache for unchanged layers:
 
 ```bash
 mkdir -p /tmp/qwen4-buildx
-BUILDX_CONFIG=/tmp/qwen4-buildx docker build --no-cache --network=host --progress=plain \
+aiter_sha=$(git ls-remote https://github.com/apinge/aiter.git refs/heads/qwen38-flash-next-dev | awk '{print $1}')
+pyhip_sha=$(git ls-remote https://github.com/tingqli/pyhip.git refs/heads/dev | awk '{print $1}')
+BUILDX_CONFIG=/tmp/qwen4-buildx docker build --network=host --progress=plain \
+  --build-arg "AITER_REF=$aiter_sha" --build-arg "PYHIP_REF=$pyhip_sha" \
   -f evaluation/Dockerfile.ci -t qwen4-ci:local .
 ```
 
