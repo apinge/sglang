@@ -94,15 +94,15 @@ All of them act only with `SGLANG_QWEN4_SEQ_PARALLEL=1`.
 | ROCm | 7.14.0 | |
 | torch | 2.12.0+rocm7.14.0 | |
 | FlyDSL | 0.3.2 | mori's device API compiles the push / wait kernels with it |
-| mori | ROCm/mori `752efd3` + `mori/mori_mi308x_engine_spread.patch` | SDMA queues and engine-side completion signals |
+| mori | ROCm/mori `752efd3` + `3rdparty/amd/mori/mori_mi308x_engine_spread.patch` | SDMA queues and engine-side completion signals |
 | libibverbs-dev | system package | mori's build checks for it |
 | PyHIP | `8027faa` | required by the base branch's QSA path, not by this feature |
 
 mori is pinned in `python/pyproject_other.toml` (`srt_hip`, next to PyHIP) as
 `amd_mori @ git+https://github.com/ROCm/mori.git@752efd3...`; a plain pip build uses mori's defaults
 (`BUILD_CCO_SDMA=ON`, local GPU arch, UMBP off when its deps are missing). That build works everywhere but
-lacks the MI308X engine-spread patch, so on MI308X with TP4 use `mori/install_mori.sh [TARGET_DIR]`
-instead: it clones the same commit, applies `mori/mori_mi308x_engine_spread.patch` and builds with
+lacks the MI308X engine-spread patch, so on MI308X with TP4 use `3rdparty/amd/mori/install_mori.sh [TARGET_DIR]`
+instead: it clones the same commit, applies `3rdparty/amd/mori/mori_mi308x_engine_spread.patch` and builds with
 `BUILD_CCO_SDMA=ON MORI_GPU_ARCHS=gfx942 BUILD_UMBP=OFF` (without `BUILD_CCO_SDMA=ON` every put silently
 moves no bytes). Runtime requirements, all set by the MI308X launch script:
 

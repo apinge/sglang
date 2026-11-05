@@ -27,7 +27,7 @@ import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
-# Tested pin; benchmark/qwen4_seq_parallel/mori/install_mori.sh builds it with the
+# Tested pin; 3rdparty/amd/mori/install_mori.sh builds it with the
 # MI308X engine-spread patch.
 MORI_TESTED_COMMIT = "752efd3"
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build mori for the Qwen4-Exp SP SDMA overlap (MI308X / gfx942).
 #
-#   bash benchmark/qwen4_seq_parallel/mori/install_mori.sh [TARGET_DIR]
+#   bash 3rdparty/amd/mori/install_mori.sh [TARGET_DIR]
 #
 # Clones ROCm/mori at the tested commit, applies the MI308X engine-spread patch and
 # builds it with SDMA enabled. With TARGET_DIR the package goes there (add it to
