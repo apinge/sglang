@@ -1,47 +1,45 @@
---- a/src/application/transport/sdma/anvil.cpp	2026-11-05 01:36:41.325287708 +0000
-+++ b/src/application/transport/sdma/anvil.cpp	2026-11-05 01:36:54.957323162 +0000
-@@ -29,11 +29,13 @@
+diff --git a/include/mori/application/transport/sdma/anvil.hpp b/include/mori/application/transport/sdma/anvil.hpp
+index a938440..c51e780 100644
+--- a/include/mori/application/transport/sdma/anvil.hpp
++++ b/include/mori/application/transport/sdma/anvil.hpp
+@@ -155,6 +155,9 @@ class AnvilLib {
+   std::once_flag init_flag;
+   std::mutex channels_mutex_;
+   std::unordered_map<std::pair<int, int>, SdmaQueueVector, PairHash> sdma_channels_;
++  // Per source node: peer-link channels created on each SDMA engine id. Guarded by
++  // channels_mutex_; read by the MI308X engine spread in connect().
++  std::unordered_map<int, std::array<int, 32>> peer_engine_use_;
+ };
  
- #include "mori/application/transport/sdma/anvil.hpp"
- 
-+#include <array>
- #include <cstdio>
- #include <cstdlib>
- #include <cstring>
- #include <fstream>
- #include <iostream>
-+#include <map>
- #include <mutex>
- #include <stdexcept>
- #include <unordered_map>
-@@ -405,6 +407,22 @@
-     engines.swap(evenEngines);
-   }
- 
-+  // MI308X: two single-engine links of one GPU can fold onto the same even engine
-+  // (e.g. masks 0x40 and 0x80 -> engine 6), serialising its copies to both peers.
-+  // With MORI_SDMA_SPREAD_MI308X=1, a link whose engine already serves another peer
-+  // of this GPU takes the least-used even xGMI engine instead.
-+  static std::map<int, std::array<int, 8>> engineUse;
-+  const char* spreadEnv = std::getenv("MORI_SDMA_SPREAD_MI308X");
-+  const bool spread = spreadEnv && spreadEnv[0] == '1';
-+  if (spread && isMi308x(srcNode) && srcNode != dstNode && engines.size() == 1 &&
-+      engineUse[srcNode][engines[0]] > 0) {
-+    uint32_t best = engines[0];
-+    for (uint32_t e : {2u, 4u, 6u}) {
-+      if (engineUse[srcNode][e] < engineUse[srcNode][best]) best = e;
+ extern AnvilLib& anvil;
+diff --git a/src/application/transport/sdma/anvil.cpp b/src/application/transport/sdma/anvil.cpp
+index be787a7..6a85b8b 100644
+--- a/src/application/transport/sdma/anvil.cpp
++++ b/src/application/transport/sdma/anvil.cpp
+@@ -415,9 +415,26 @@ bool AnvilLib::connect(int srcNode, int dstNode, int numChannels) {
+   // eventually exhaust the per-engine queue slots.
+   auto& channels = sdma_channels_[std::make_pair(srcNode, dstNode)];
+   if (static_cast<int>(channels.size()) < numChannels) {
++    auto& engineUse = peer_engine_use_[srcNode];
++    // The fold above can put two single-engine peer links of one MI308X on the same
++    // engine (masks 0x40 and 0x80 both land on engine 6), serialising this GPU's
++    // copies to both peers. With MORI_SDMA_SPREAD_MI308X=1, a new peer link whose
++    // engine already serves another peer moves to the least-used xGMI engine
++    // (2, 4 or 6; engine 0 is the general one).
++    const char* spreadEnv = std::getenv("MORI_SDMA_SPREAD_MI308X");
++    const bool spread = spreadEnv && spreadEnv[0] == '1';
++    if (spread && isMi308x(srcNode) && srcNode != dstNode && numEngines == 1 && channels.empty() &&
++        engineUse[engines[0]] > 0) {
++      uint32_t best = engines[0];
++      for (uint32_t e : {2u, 4u, 6u}) {
++        if (engineUse[e] < engineUse[best]) best = e;
++      }
++      engines[0] = best;
 +    }
-+    engines[0] = best;
-+  }
-+
-   int numEngines = static_cast<int>(engines.size());
- 
-   // Queues live in this process-global singleton and are shared across every
-@@ -418,6 +436,7 @@
      const uint32_t hsakmtNode = hsakmtNodeForKfdNode(srcNode);
      for (int c = static_cast<int>(channels.size()); c < numChannels; ++c) {
        uint32_t engineId = engines[c % numEngines];
-+      if (srcNode != dstNode) engineUse[srcNode][engineId]++;
++      if (srcNode != dstNode) engineUse[engineId]++;
        channels.emplace_back(std::make_unique<SdmaQueue>(hsakmtNode, engineId));
      }
    }
