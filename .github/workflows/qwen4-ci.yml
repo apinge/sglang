@@ -14,6 +14,9 @@ on:
       aiter_ref:
         description: 'AITER ref; empty uses qwen38-flash-next-dev'
         type: string
+      pyhip_ref:
+        description: 'pyhip ref; empty uses dev'
+        type: string
       smoke:
         description: 'Diagnostic two-request/two-example run; no accuracy gate'
         type: boolean
@@ -33,6 +36,10 @@ on:
         default: qwen4_v0.5.21
       aiter_ref:
         description: 'AITER ref to test'
+        type: string
+        default: ''
+      pyhip_ref:
+        description: 'pyhip ref to test'
         type: string
         default: ''
       smoke:
@@ -71,6 +78,7 @@ jobs:
       SGLANG_REPOSITORY: ${{ !inputs.sglang_ref && github.repository == 'apinge/sglang' && github.event.pull_request.head.repo.full_name || 'apinge/sglang' }}
       SGLANG_REF: ${{ inputs.sglang_ref || (github.repository == 'apinge/sglang' && (github.event.pull_request.head.sha || github.sha)) || 'qwen4_v0.5.21' }}
       AITER_REF: ${{ inputs.aiter_ref || (github.repository == 'apinge/aiter' && (github.event.pull_request.head.sha || github.sha)) || 'qwen38-flash-next-dev' }}
+      PYHIP_REF: ${{ inputs.pyhip_ref || (github.repository == 'tingqli/pyhip' && (github.event.pull_request.head.sha || github.sha)) || 'dev' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -102,7 +110,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: tingqli/pyhip
-          ref: dev
+          ref: ${{ env.PYHIP_REF }}
           path: pyhip-source
           persist-credentials: false
       - name: Select cases and preserve source revisions for retries
