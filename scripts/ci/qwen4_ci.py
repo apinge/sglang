@@ -584,21 +584,33 @@ def summarize_ci():
                 "--paginate",
                 "--slurp",
                 f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
-                f"{os.environ['GITHUB_RUN_ID']}/jobs?filter=latest&per_page=100",
+                f"{os.environ['GITHUB_RUN_ID']}/jobs?filter=all&per_page=100",
             ]
         )
     )
-    jobs = {
-        job["name"].rsplit(" / ", 1)[-1]: job for page in pages for job in page["jobs"]
-    }
+    jobs, attempts = {}, {}
+    for job in sorted(
+        (job for page in pages for job in page["jobs"]),
+        key=lambda job: job["run_attempt"],
+    ):
+        name = job["name"].rsplit(" / ", 1)[-1]
+        jobs[name] = job
+        # GitHub copies completed jobs into reruns with a new run_attempt.
+        # Their original start time identifies the attempt that uploaded results.
+        if job.get("started_at"):
+            attempts.setdefault((name, job["started_at"]), job["run_attempt"])
     rows = []
     for case in CASES:
         name, baseline = case[0], case[5]
         if selected and name not in selected:
             continue
         row = {"case": name, "baseline": baseline, "status": "not run", "errors": []}
-        job = jobs.get(f"Qwen4 ({name})", {})
-        artifact = root / f"qwen4-results-{name}-{job.get('run_attempt', 0)}"
+        job_name = f"Qwen4 ({name})"
+        job = jobs.get(job_name, {})
+        attempt = attempts.get(
+            (job_name, job.get("started_at")), job.get("run_attempt", 0)
+        )
+        artifact = root / f"qwen4-results-{name}-{attempt}"
         try:
             report = json.loads((artifact / "evaluation/summary.json").read_text())
             result = next(row for row in report["cases"] if row["case"] == name)
