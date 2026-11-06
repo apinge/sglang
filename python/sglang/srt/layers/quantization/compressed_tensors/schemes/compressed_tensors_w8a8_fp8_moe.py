@@ -136,6 +136,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         use_aiter_moe = will_use_aiter_moe()
         per_channel = self.weight_quant.strategy == QuantizationStrategy.CHANNEL
         if use_aiter_moe and per_channel:
+            # Validate alignment before allocating weights; padding happens after loading.
             _get_aiter_ptpc_padding_size()
         w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
