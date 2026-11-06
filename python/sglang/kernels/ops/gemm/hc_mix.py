@@ -13,6 +13,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils.common import is_gfx942_supported
+
 _FUSED_MIX_MAX_ROWS = 16
 
 _DEFAULT_MIX_CONFIG = dict(BLOCK_N=32, BLOCK_K=256, BLOCK_J=32, BLOCK_R=64, num_warps=8)
@@ -210,12 +212,10 @@ def fused_hc_mix(
     lowrank = w_down.shape[0]
     rows_pad = 16
     device = hyper_input_normed.device
-    props = torch.cuda.get_device_properties(device)
-    num_ctas = props.multi_processor_count
+    num_ctas = torch.cuda.get_device_properties(device).multi_processor_count
     launch_config = _DEFAULT_MIX_CONFIG
     if (
-        torch.version.hip is not None
-        and props.gcnArchName.split(":", 1)[0] == "gfx942"
+        is_gfx942_supported()
         and num_ctas == 80
         and hyper_input_normed.dtype == torch.bfloat16
         and (hc, hs, lowrank, k) == (4, 2560, 320, 10240)
