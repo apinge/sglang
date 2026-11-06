@@ -134,6 +134,7 @@ def test_unquantized_aiter_moe_pads_and_loads_tp_shards(monkeypatch):
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.quantization import unquant
 
+    monkeypatch.setenv("AITER_MOE_PADDING_SIZE", "64")
     monkeypatch.setattr(unquant, "will_use_aiter_moe", lambda: True)
     monkeypatch.setattr(
         "sglang.srt.layers.moe.fused_moe_triton.layer.will_use_aiter_moe",

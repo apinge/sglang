@@ -226,6 +226,11 @@ class TestFp8MoEWeightGating(CustomTestCase):
                         "get_moe_weight_sizes",
                         get_sizes,
                     ),
+                    patch.object(
+                        compressed_fp8_moe,
+                        "_get_aiter_ptpc_padding_size",
+                        return_value=64,
+                    ),
                 ):
                     scheme.create_weights(
                         layer=layer,
@@ -237,7 +242,7 @@ class TestFp8MoEWeightGating(CustomTestCase):
 
                 get_sizes.assert_called_once_with(
                     4,
-                    is_aiter_moe=False,
+                    is_aiter_moe=use_aiter_moe,
                     is_concat=True,
                     is_packed=False,
                 )

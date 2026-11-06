@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -15,6 +14,7 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
+    get_moe_padding_size,
     get_moe_runner_backend,
     get_moe_weight_sizes,
     will_use_aiter_moe,
@@ -50,9 +50,8 @@ def _get_aiter_shuffle_weight():
 
 
 def _get_aiter_ptpc_padding_size() -> int:
-    value = os.getenv("AITER_MOE_PADDING_SIZE", "64")
     try:
-        alignment = int(value)
+        alignment = get_moe_padding_size(True)
     except ValueError:
         raise ValueError("AITER_MOE_PADDING_SIZE must be 64 for PTPC MoE") from None
     if alignment != 64:
@@ -136,13 +135,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         use_aiter_moe = will_use_aiter_moe()
         per_channel = self.weight_quant.strategy == QuantizationStrategy.CHANNEL
         if use_aiter_moe and per_channel:
-            # Validate alignment before allocating weights; padding happens after loading.
+            # Validate the alignment used by the padded weight allocation below.
             _get_aiter_ptpc_padding_size()
         w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
-            # PTPC must load equal, unpadded TP slices before kernel padding.
-            # Other quantization strategies keep their existing allocation.
-            is_aiter_moe=use_aiter_moe and not per_channel,
+            is_aiter_moe=use_aiter_moe,
             is_concat=True,
             is_packed=False,
         )

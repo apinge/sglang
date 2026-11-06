@@ -46,7 +46,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
-    is_gfx942_supported,
     is_gfx95_supported,
     is_hip,
     is_npu,
@@ -682,22 +681,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 is_packed=False,
                 is_aiter_moe=True,
             )
-            if (
-                is_gfx942_supported()
-                and params_dtype == torch.bfloat16
-                and layer.moe_runner_config.is_gated
-                and getattr(layer.moe_runner_config, "activation", "silu") == "silu"
-                and not with_bias
-                and not getattr(
-                    layer.moe_runner_config, "apply_router_weight_on_input", False
-                )
-                and getattr(layer, "moe_ep_size", 1) == 1
-            ):
-                w2_down_dim = (intermediate_size_per_partition + 63) // 64 * 64
-                w13_up_dim = w2_down_dim * (
-                    2 if layer.moe_runner_config.is_gated else 1
-                )
-                weight_padded = w2_down_dim != intermediate_size_per_partition
             if not layer.moe_runner_config.is_gated:
                 w13_up_dim = w2_down_dim
             layer.hidden_pad = 0
