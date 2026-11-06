@@ -809,6 +809,7 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
         )
         indexer = SimpleNamespace(
             layer_id=0,
+            _log_indexer_backend=False,
             project_qk=lambda hidden, rope_positions, **kwargs: (
                 hidden.reshape(-1, 1, 2),
                 hidden.reshape(-1, 1, 2),
@@ -1280,6 +1281,7 @@ def test_qsa_indexer_decode_ignores_dp_attention_token_padding():
     indexer = SimpleNamespace(
         layer_id=0,
         index_n_heads=4,
+        _log_indexer_backend=False,
         _pending_ring_slots=lambda metadata, logical_positions, is_extend: (
             torch.zeros(logical_positions.numel(), dtype=torch.long)
         ),
@@ -1429,6 +1431,7 @@ class _DispatchIndexer:
     def __init__(self):
         self.selected = None
         self.logical_positions = None
+        self._log_indexer_backend = False
 
     @staticmethod
     def project_qk(hidden_states, positions, **kwargs):

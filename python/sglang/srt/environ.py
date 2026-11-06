@@ -299,6 +299,11 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # Qwen4 TP prefill path: keep the hyper-connection residual stream sharded by
+    # tokens (reduce-scatter / all-gather instead of all-reduce); 0 restores the all-reduce.
+    SGLANG_QWEN4_SEQ_PARALLEL = EnvBool(True)
+    # Arbitrary; smaller batches (decode, short prefill) keep the all-reduce.
+    SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS = EnvInt(2048)
     # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
     # path is ported, so setting this fails loudly instead of degrading.
     SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
@@ -306,6 +311,11 @@ class Envs:
     SGLANG_USE_PYHIP_QSA = EnvBool(False)
     # Numerical acceptance only; never enable for performance measurements.
     SGLANG_TEST_PYHIP_QSA = EnvBool(False)
+    # Log actual QSA indexer dispatch once per layer, forward mode and backend.
+    SGLANG_LOG_QSA_INDEXER_BACKEND = EnvBool(False)
+    # Split long PyHIP QSA prefill indexer rows across attention-TP ranks,
+    # then all-gather the selections.
+    SGLANG_OPT_PYHIP_QSA_SPLIT_INDEXER = EnvBool(False)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
@@ -841,6 +851,12 @@ class Envs:
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
+    # Decode JPEG inputs on the GPU with rocJPEG (needs torchvision built with
+    # rocJPEG and a working VA-API driver); PIL is used when the self-check fails.
+    SGLANG_ROCM_GPU_JPEG_DECODE = EnvBool(False)
+    # Force rocJPEG's BT.709-to-BT.601 color correction on or off (A/B tests);
+    # unset, the self-check decides.
+    SGLANG_ROCM_JPEG_COLOR_CORRECTION = EnvBool(None)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.

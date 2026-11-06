@@ -1,3 +1,4 @@
+import argparse
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, sentinel
@@ -14,6 +15,7 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     _validate_gdn_linear_attn_backends,
     flashinfer_gdn_prefill_default,
 )
+from sglang.srt.layers.attention.linear.kernels import gdn_aiter
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     maybe_build_flashinfer_checkpoint_plan,
 )
@@ -119,7 +121,7 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
                 self.assertEqual(self.apply_policy(runner), "flashinfer")
 
     def test_declines_when_the_prefill_backend_is_explicit(self):
-        for backend in ("triton", "flashinfer", "cutedsl"):
+        for backend in ("triton", "flashinfer", "cutedsl", "aiter"):
             with self.subTest(backend=backend):
                 runner = make_runner(self, linear_attn_prefill_backend=backend)
                 self.assertIsNone(self.apply_policy(runner))
@@ -229,7 +231,12 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
     def test_decode_tracking_without_h_source_skips_checkpoint_plan(self):
         backend = object.__new__(GDNAttnBackend)
         backend.device = "cpu"
-        backend.kernel_dispatcher = SimpleNamespace(extend_uses_state_checkpoints=True)
+        backend.kernel_dispatcher = SimpleNamespace(
+            extend_uses_state_checkpoints=True,
+            # The test only requires that extend_kernel is *not* an AiterGDNKernel;
+            # avoid constructing a real kernel object in a unit test.
+            extend_kernel=sentinel.extend_kernel,
+        )
         metadata = SimpleNamespace(has_mamba_track_mask=True, track_ssm_h_src=None)
         forward_batch = SimpleNamespace(
             mamba_track_mask=torch.tensor([True]),
@@ -288,6 +295,163 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "supports KDA only"):
                     GDNKernelDispatcher(decode_backend, prefill_backend)
+
+
+class TestAiterGDNPrefillBackendPolicy(CustomTestCase):
+    def test_cli_accepts_aiter_only_for_prefill(self):
+        from sglang.srt.server_args import ServerArgs
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args = parser.parse_args(
+            ["--model-path", "unused", "--linear-attn-prefill-backend", "aiter"]
+        )
+        self.assertEqual(args.linear_attn_prefill_backend, "aiter")
+        for flag in (
+            "--linear-attn-backend",
+            "--linear-attn-decode-backend",
+            "--linear-attn-verify-backend",
+        ):
+            with self.subTest(flag=flag), self.assertRaises(SystemExit):
+                parser.parse_args(["--model-path", "unused", flag, "aiter"])
+
+    def test_prefill_override_keeps_triton_decode_and_verify(self):
+        _publish(
+            self, linear_attn_backend="triton", linear_attn_prefill_backend="aiter"
+        )
+        backends = resolve_linear_attn_backends()
+        with (
+            patch.object(gdn_backend, "_is_hip", True),
+            patch.object(gdn_aiter, "_aiter_ops", return_value=None),
+        ):
+            dispatcher = GDNKernelDispatcher(
+                backends.decode, backends.prefill, backends.verify
+            )
+        self.assertIsInstance(dispatcher.extend_kernel, gdn_aiter.AiterGDNKernel)
+        self.assertIsInstance(dispatcher.decode_kernel, TritonGDNKernel)
+        self.assertIs(dispatcher.verify_kernel, dispatcher.decode_kernel)
+        self.assertIs(
+            dispatcher.extend_kernel.fallback_kernel, dispatcher.decode_kernel
+        )
+        self.assertEqual(
+            dispatcher.supports_packed_decode, TritonGDNKernel.supports_packed_decode
+        )
+        self.assertFalse(dispatcher.extend_uses_state_checkpoints)
+
+    def test_triton_selection_and_non_rocm_do_not_load_aiter(self):
+        with patch.object(gdn_aiter, "_aiter_ops") as load:
+            GDNKernelDispatcher(
+                LinearAttnKernelBackend.TRITON, LinearAttnKernelBackend.TRITON
+            )
+            with patch.object(gdn_backend, "_is_hip", False):
+                dispatcher = GDNKernelDispatcher(
+                    LinearAttnKernelBackend.TRITON, LinearAttnKernelBackend.AITER
+                )
+            self.assertIsInstance(dispatcher.extend_kernel, TritonGDNKernel)
+            load.assert_not_called()
+
+    def test_programmatic_decode_and_verify_selection_are_rejected(self):
+        cases = (
+            (LinearAttnKernelBackend.AITER, None),
+            (LinearAttnKernelBackend.TRITON, LinearAttnKernelBackend.AITER),
+        )
+        for decode, verify in cases:
+            with self.subTest(decode=decode, verify=verify):
+                with self.assertRaisesRegex(ValueError, "supports prefill only"):
+                    GDNKernelDispatcher(decode, LinearAttnKernelBackend.AITER, verify)
+
+    def test_missing_dependencies_use_fallback_without_launch(self):
+        fallback = MagicMock()
+        with patch.object(gdn_aiter, "_aiter_ops", return_value=None):
+            kernel = gdn_aiter.AiterGDNKernel(fallback)
+        self.assertIsNone(
+            kernel.build_prefill_metadata(sentinel.batch, sentinel.metadata)
+        )
+        args = dict(
+            q=sentinel.q,
+            k=sentinel.k,
+            v=sentinel.v,
+            g=sentinel.g,
+            beta=sentinel.beta,
+            ssm_states=sentinel.states,
+            cache_indices=sentinel.indices,
+            query_start_loc=sentinel.cu,
+            state_checkpoint_cu_starts=sentinel.checkpoints,
+        )
+        with patch.object(gdn_aiter, "_run_aiter_gdn_prefill") as launch:
+            self.assertIs(
+                kernel.extend(**args, aiter_gdn_prefill_metadata=sentinel.metadata),
+                fallback.extend.return_value,
+            )
+            fallback.extend.assert_called_once_with(**args)
+            launch.assert_not_called()
+
+    def test_aiter_is_not_a_kda_prefill_backend(self):
+        from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
+
+        with self.assertRaisesRegex(ValueError, "Unsupported KDA prefill backend"):
+            KDAKernelDispatcher(
+                LinearAttnKernelBackend.TRITON,
+                LinearAttnKernelBackend.AITER,
+                LinearAttnKernelBackend.TRITON,
+            )
+
+    def test_execution_failure_is_not_retried_after_state_mutation(self):
+        fallback = MagicMock()
+        with patch.object(gdn_aiter, "_aiter_ops", return_value=(None,) * 4):
+            kernel = gdn_aiter.AiterGDNKernel(fallback)
+        with (
+            patch.object(gdn_aiter, "aiter_gdn_prefill_supported", return_value=True),
+            patch.object(
+                gdn_aiter,
+                "_run_aiter_gdn_prefill",
+                side_effect=RuntimeError("launch failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "launch failed"),
+        ):
+            kernel.extend(
+                *([sentinel.tensor] * 5),
+                ssm_states=sentinel.states,
+                cache_indices=sentinel.indices,
+                query_start_loc=sentinel.cu,
+                aiter_gdn_prefill_metadata=sentinel.metadata,
+            )
+        fallback.extend.assert_not_called()
+
+    def test_metadata_does_not_survive_backend_or_mode_changes(self):
+        _publish(self, enable_page_major_kv_layout=False)
+        with patch.object(gdn_aiter, "_aiter_ops", return_value=None):
+            kernel = gdn_aiter.AiterGDNKernel(TritonGDNKernel())
+        backend = object.__new__(GDNAttnBackend)
+        backend.kernel_dispatcher = SimpleNamespace(extend_kernel=kernel)
+        backend.is_draft_worker = False
+        backend.enable_unified_memory = False
+        metadata = SimpleNamespace(
+            aiter_gdn_prefill_metadata=None, has_mamba_track_mask=False
+        )
+        backend.forward_metadata = metadata
+        with (
+            patch.object(gdn_backend, "_is_hip", True),
+            patch.object(MambaAttnBackendBase, "init_forward_metadata"),
+            patch.object(
+                kernel,
+                "build_prefill_metadata",
+                side_effect=[sentinel.first, sentinel.second],
+            ) as build,
+        ):
+            backend.init_forward_metadata(sentinel.batch1)
+            self.assertIs(metadata.aiter_gdn_prefill_metadata, sentinel.first)
+            backend.init_forward_metadata(sentinel.batch2)
+            self.assertIs(metadata.aiter_gdn_prefill_metadata, sentinel.second)
+            backend.is_draft_worker = True
+            backend.init_forward_metadata(sentinel.draft)
+            self.assertIsNone(metadata.aiter_gdn_prefill_metadata)
+            backend.is_draft_worker = False
+            backend.kernel_dispatcher.extend_kernel = kernel.fallback_kernel
+            metadata.aiter_gdn_prefill_metadata = sentinel.stale
+            backend.init_forward_metadata(sentinel.triton)
+            self.assertIsNone(metadata.aiter_gdn_prefill_metadata)
+            self.assertEqual(build.call_count, 2)
 
 
 if __name__ == "__main__":
