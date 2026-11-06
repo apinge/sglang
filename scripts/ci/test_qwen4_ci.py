@@ -149,6 +149,70 @@ def test_accuracy_regression_fails_the_run_and_reports_remaining_cases(
     assert "90.00%" in (args.output / "summary.md").read_text()
 
 
+@pytest.mark.parametrize(
+    "execution_attempt,conclusion,has_report",
+    [
+        (2, "success", True),
+        (6, "success", True),
+        (6, "failure", True),
+        (6, "failure", False),
+    ],
+)
+def test_summary_uses_actual_execution_and_keeps_latest_conclusion(
+    tmp_path, monkeypatch, execution_attempt, conclusion, has_report
+):
+    case, baseline = ci.CASES[0][0], ci.CASES[0][5]
+    original = {
+        "name": f"Qwen4 ({case})",
+        "run_attempt": 2,
+        "started_at": "2026-11-04T07:26:19Z",
+        "conclusion": "success",
+    }
+    execution = dict(original, run_attempt=execution_attempt, conclusion=conclusion)
+    if execution_attempt == 6:
+        execution["started_at"] = "2026-11-05T11:57:29Z"
+    copied = dict(execution, run_attempt=7)
+    # Return history out of order and across pages, as the API may do.
+    pages = [{"jobs": [copied]}, {"jobs": [execution, original]}]
+    monkeypatch.setattr(ci, "command", lambda *args, **kwargs: json.dumps(pages))
+    for key, value in {
+        "RUNNER_TEMP": str(tmp_path),
+        "GITHUB_REPOSITORY": "apinge/sglang",
+        "GITHUB_RUN_ID": "41785211796",
+        "GITHUB_STEP_SUMMARY": str(tmp_path / "step-summary.md"),
+        "CASE_MATRIX": json.dumps({"case": [case]}),
+        "VALIDATION_RESULT": "success",
+        "CASES_RESULT": "success",
+    }.items():
+        monkeypatch.setenv(key, value)
+    for attempt, score in [(2, 0.98)] + (
+        [(6, 0.99)] if execution_attempt == 6 and has_report else []
+    ):
+        directory = (
+            tmp_path
+            / "qwen4-case-results"
+            / f"qwen4-results-{case}-{attempt}"
+            / "evaluation"
+        )
+        directory.mkdir(parents=True)
+        row = dict(
+            case=case,
+            baseline=baseline,
+            status="passed",
+            errors=[],
+            accuracy={"score": score},
+        )
+        ci.summary(directory, [row], argparse.Namespace(smoke=False), [])
+    assert ci.summarize_ci() == (conclusion != "success")
+    row = json.loads((tmp_path / "qwen4-summary/summary.json").read_text())["cases"][0]
+    assert row["status"] == ("passed" if conclusion == "success" else "failed")
+    if has_report:
+        assert row["accuracy"]["score"] == (0.98 if execution_attempt == 2 else 0.99)
+    else:
+        assert "accuracy" not in row
+        assert "qwen4-results-" + case + "-6" in row["errors"][0]
+
+
 def test_gpu_selection_skips_busy_devices_and_maps_to_host_indices(monkeypatch):
     seen = {}
 
