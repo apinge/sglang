@@ -27,10 +27,6 @@ import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
-# Tested pin; 3rdparty/amd/mori/install_mori.sh builds it with the
-# MI308X engine-spread patch.
-MORI_TESTED_COMMIT = "752efd3"
-
 _WAVE = 64
 
 
@@ -66,15 +62,6 @@ def sdma_available() -> bool:
             reason,
         )
         return False
-    import mori
-
-    version = mori.__version__
-    if MORI_TESTED_COMMIT not in version:
-        logger.info(
-            "mori %s; SP SDMA overlap was tested with mori %s + the MI308X engine-spread patch",
-            version,
-            MORI_TESTED_COMMIT,
-        )
     return True
 
 

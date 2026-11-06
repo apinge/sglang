@@ -3,16 +3,15 @@
 #
 #   bash 3rdparty/amd/mori/install_mori.sh [TARGET_DIR]
 #
-# Clones ROCm/mori at the tested commit, applies the MI308X engine-spread patch and
-# builds it with SDMA enabled. With TARGET_DIR the package goes there (add it to
-# PYTHONPATH); without it, it is pip-installed into the current environment.
+# Clones the pinned mori branch and builds it with SDMA enabled. With TARGET_DIR the
+# package goes there (add it to PYTHONPATH); without it, it is pip-installed into the
+# current environment. MORI_REF also takes a commit or a pull ref.
 set -euo pipefail
 
-MORI_REPO="${MORI_REPO:-https://github.com/ROCm/mori.git}"
-MORI_COMMIT="${MORI_COMMIT:-752efd3703136a09ed5cda73563d98e42f16ac69}"
-MORI_SRC="${MORI_SRC:-${TMPDIR:-/tmp}/mori-${MORI_COMMIT:0:7}}"
+MORI_REPO="${MORI_REPO:-https://github.com/apinge/mori.git}"
+MORI_REF="${MORI_REF:-qwen3.8-flash-sdma}"
+MORI_SRC="${MORI_SRC:-${TMPDIR:-/tmp}/mori-src}"
 TARGET_DIR="${1:-}"
-HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # mori's setup.py refuses to build without the ibverbs headers.
 if ! ls /usr/include/infiniband/verbs.h >/dev/null 2>&1; then
@@ -28,15 +27,10 @@ if [[ ! -d "${MORI_SRC}/.git" ]]; then
   git clone --filter=blob:none "${MORI_REPO}" "${MORI_SRC}"
 fi
 cd "${MORI_SRC}"
-git fetch --quiet origin "${MORI_COMMIT}" 2>/dev/null || true
-git checkout --quiet --force "${MORI_COMMIT}"
+git fetch --quiet "${MORI_REPO}" "${MORI_REF}"
+git checkout --quiet --force FETCH_HEAD
+echo "mori ${MORI_REF} at $(git rev-parse --short HEAD)"
 git submodule update --init --depth 1 3rdparty/msgpack-c 3rdparty/spdlog
-if git apply --check "${HERE}/mori_mi308x_engine_spread.patch" 2>/dev/null; then
-  git apply "${HERE}/mori_mi308x_engine_spread.patch"
-elif ! git apply --reverse --check "${HERE}/mori_mi308x_engine_spread.patch" 2>/dev/null; then
-  echo "mori_mi308x_engine_spread.patch does not apply to ${MORI_COMMIT}" >&2
-  exit 1
-fi
 
 # BUILD_CCO_SDMA=ON is required: a library built without it has no SDMA queues and
 # every put silently moves no bytes. UMBP is not needed.
