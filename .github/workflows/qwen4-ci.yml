@@ -14,6 +14,9 @@ on:
       aiter_ref:
         description: 'AITER ref; empty uses qwen38-flash-next-dev'
         type: string
+      pyhip_ref:
+        description: 'pyhip ref; empty uses dev'
+        type: string
       smoke:
         description: 'Diagnostic two-request/two-example run; no accuracy gate'
         type: boolean
@@ -33,6 +36,10 @@ on:
         default: qwen4_v0.5.21
       aiter_ref:
         description: 'AITER ref to test'
+        type: string
+        default: ''
+      pyhip_ref:
+        description: 'pyhip ref to test'
         type: string
         default: ''
       smoke:
@@ -66,10 +73,12 @@ jobs:
       sglang_repository: ${{ steps.sources.outputs.sglang_repository }}
       sglang_sha: ${{ steps.sources.outputs.sglang_sha }}
       aiter_sha: ${{ steps.sources.outputs.aiter_sha }}
+      pyhip_sha: ${{ steps.sources.outputs.pyhip_sha }}
     env:
       SGLANG_REPOSITORY: ${{ !inputs.sglang_ref && github.repository == 'apinge/sglang' && github.event.pull_request.head.repo.full_name || 'apinge/sglang' }}
       SGLANG_REF: ${{ inputs.sglang_ref || (github.repository == 'apinge/sglang' && (github.event.pull_request.head.sha || github.sha)) || 'qwen4_v0.5.21' }}
       AITER_REF: ${{ inputs.aiter_ref || (github.repository == 'apinge/aiter' && (github.event.pull_request.head.sha || github.sha)) || 'qwen38-flash-next-dev' }}
+      PYHIP_REF: ${{ inputs.pyhip_ref || (github.repository == 'tingqli/pyhip' && (github.event.pull_request.head.sha || github.sha)) || 'dev' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -97,6 +106,13 @@ jobs:
           ref: ${{ env.AITER_REF }}
           path: aiter-source
           persist-credentials: false
+      - name: Checkout pyhip to freeze its revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: tingqli/pyhip
+          ref: ${{ env.PYHIP_REF }}
+          path: pyhip-source
+          persist-credentials: false
       - name: Select cases and preserve source revisions for retries
         id: sources
         env:
@@ -119,7 +135,7 @@ jobs:
               raise SystemExit(f"Unknown cases: {', '.join(sorted(unknown))}")
           revisions = {
               name: subprocess.check_output(["git", "-C", path, "rev-parse", "HEAD"], text=True).strip()
-              for name, path in (("harness_sha", "."), ("sglang_sha", "candidate"), ("aiter_sha", "aiter-source"))
+              for name, path in (("harness_sha", "."), ("sglang_sha", "candidate"), ("aiter_sha", "aiter-source"), ("pyhip_sha", "pyhip-source"))
           }
           outputs = {
               **revisions,
@@ -184,9 +200,11 @@ jobs:
       - name: Build case image using the pinned sources and Docker cache
         env:
           AITER_REF: ${{ needs.validate.outputs.aiter_sha }}
+          PYHIP_REF: ${{ needs.validate.outputs.pyhip_sha }}
           BASE_IMAGE: ${{ vars.QWEN4_BASE_IMAGE || 'rocm/ali-private:ubuntu22.04_rocm7.14.0_cp310_torch2.12.0_sglang_d0a5b96_aiter_b7aed05_20261020' }}
         run: |
           docker build --network=host --progress=plain --build-arg "AITER_REF=$AITER_REF" \
+            --build-arg "PYHIP_REF=$PYHIP_REF" \
             --build-arg "BASE_IMAGE=$BASE_IMAGE" --build-arg SGLANG_SOURCE=candidate \
             -f evaluation/Dockerfile.ci -t "$IMAGE" . \
             2>&1 | tee "$RESULTS/build.log"
