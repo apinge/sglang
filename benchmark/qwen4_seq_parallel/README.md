@@ -101,9 +101,9 @@ All of them act only with `SGLANG_QWEN4_SEQ_PARALLEL=1`.
 mori is pinned in `python/pyproject_other.toml` (`srt_hip`, next to PyHIP) as
 `amd_mori @ git+https://github.com/apinge/mori.git@qwen3.8-flash-sdma`. The branch includes the MI308X
 SDMA engine spread (without it, two of a GPU's xGMI links can share one SDMA engine at TP4). A plain pip
-build uses mori's defaults (`BUILD_CCO_SDMA=ON`, local GPU arch); `3rdparty/amd/mori/install_mori.sh
-[TARGET_DIR]` builds the same branch with `BUILD_CCO_SDMA=ON MORI_GPU_ARCHS=gfx942 BUILD_UMBP=OFF` (without
-`BUILD_CCO_SDMA=ON` every put silently moves no bytes). Runtime requirements, all set by the MI308X launch script:
+install uses mori's defaults (`BUILD_CCO_SDMA=ON`, local GPU arch); to install elsewhere, use
+`pip install --no-deps --target DIR "amd_mori @ git+https://github.com/apinge/mori.git@qwen3.8-flash-sdma"` and
+add `DIR` to `PYTHONPATH`. Runtime requirements, all set by the MI308X launch script:
 
 - `MORI_ENABLE_SDMA=1`, `MORI_SOCKET_IFNAME=lo`.
 - `LD_PRELOAD` of ROCm's `rocm_sysdeps/lib/librocm_sysdeps_drm{,_amdgpu}`: mori links the system libdrm,

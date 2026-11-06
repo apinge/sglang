@@ -117,7 +117,7 @@ export SGLANG_QWEN4_SP_SDMA_RS="${SGLANG_QWEN4_SP_SDMA_RS:-1}"
 export SGLANG_QWEN4_SP_SDMA_AG="${SGLANG_QWEN4_SP_SDMA_AG:-1}"
 export SGLANG_QWEN4_SP_SDMA_AG_MOE="${SGLANG_QWEN4_SP_SDMA_AG_MOE:-1}"
 export SGLANG_QWEN4_SP_SDMA_RS_TRANSPORT="${SGLANG_QWEN4_SP_SDMA_RS_TRANSPORT:-bf16}"
-# mori posts the copies from the GPU (3rdparty/amd/mori/install_mori.sh);
+# mori posts the copies from the GPU (amd_mori, pinned in python/pyproject_other.toml);
 # without a usable mori the aiter collectives run, with a warning.
 export MORI_ENABLE_SDMA="${MORI_ENABLE_SDMA:-1}"
 export MORI_SOCKET_IFNAME="${MORI_SOCKET_IFNAME:-lo}"
