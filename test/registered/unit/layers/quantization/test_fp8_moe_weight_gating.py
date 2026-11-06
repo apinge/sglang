@@ -111,13 +111,17 @@ class TestFp8MoEWeightGating(CustomTestCase):
             return weight, weight_scale, input_scale
 
         for use_fnuz in (False, True):
-            for padding_size in (0, 16):
-                with self.subTest(use_fnuz=use_fnuz, padding_size=padding_size):
+            for intermediate in (4, 64):
+                with self.subTest(use_fnuz=use_fnuz, intermediate=intermediate):
                     normalizer = MagicMock(side_effect=fake_normalize)
                     layer = SimpleNamespace(
-                        w13_weight=torch.nn.Parameter(torch.randn(2, 8, 4)),
-                        w2_weight=torch.nn.Parameter(torch.randn(2, 4, 4)),
-                        w13_weight_scale=torch.nn.Parameter(torch.ones(2, 8, 1)),
+                        w13_weight=torch.nn.Parameter(
+                            torch.randn(2, 2 * intermediate, 4)
+                        ),
+                        w2_weight=torch.nn.Parameter(torch.randn(2, 4, intermediate)),
+                        w13_weight_scale=torch.nn.Parameter(
+                            torch.ones(2, 2 * intermediate, 1)
+                        ),
                         w2_weight_scale=torch.nn.Parameter(torch.ones(2, 4, 1)),
                         w13_input_scale=None,
                         w2_input_scale=None,
@@ -140,8 +144,8 @@ class TestFp8MoEWeightGating(CustomTestCase):
                         ),
                         patch.object(
                             compressed_fp8_moe,
-                            "get_int_env_var",
-                            return_value=padding_size,
+                            "_get_aiter_ptpc_padding_size",
+                            return_value=64,
                         ),
                         patch.object(
                             compressed_fp8_moe,
@@ -233,7 +237,7 @@ class TestFp8MoEWeightGating(CustomTestCase):
 
                 get_sizes.assert_called_once_with(
                     4,
-                    is_aiter_moe=use_aiter_moe,
+                    is_aiter_moe=False,
                     is_concat=True,
                     is_packed=False,
                 )

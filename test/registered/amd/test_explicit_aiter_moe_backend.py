@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx942_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small-amd")
@@ -125,7 +125,10 @@ def test_unquantized_aiter_moe_marks_unaligned_weights_shuffled(monkeypatch):
     assert layer.w2_weight.is_shuffled
 
 
-@pytest.mark.skipif(not is_hip(), reason="AITER routing is ROCm-only")
+@pytest.mark.skipif(
+    not is_hip() or not is_gfx942_supported(),
+    reason="Qwen3.8 64-aligned BF16 kernels require gfx942",
+)
 def test_unquantized_aiter_moe_pads_and_loads_tp_shards(monkeypatch):
     """AITER padding must not change the logical TP checkpoint offsets."""
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -142,9 +145,9 @@ def test_unquantized_aiter_moe_pads_and_loads_tp_shards(monkeypatch):
     torch.nn.Module.__init__(layer)
     layer.moe_runner_config = SimpleNamespace(is_gated=True)
     layer.quant_method = method
-    layer.moe_tp_size = 2
+    layer.moe_tp_size = 4
     layer.moe_tp_rank = 1
-    layer.intermediate_size_per_partition = 320
+    layer.intermediate_size_per_partition = 160
     layer.use_presharded_weights = False
     layer.use_triton_kernels = False
     layer.use_flashinfer_trtllm_moe = False
@@ -154,15 +157,15 @@ def test_unquantized_aiter_moe_pads_and_loads_tp_shards(monkeypatch):
         layer=layer,
         num_experts=1,
         hidden_size=16,
-        intermediate_size_per_partition=320,
+        intermediate_size_per_partition=160,
         params_dtype=torch.bfloat16,
     )
 
-    assert layer.w13_weight.shape == (1, 768, 16)
-    assert layer.w2_weight.shape == (1, 16, 384)
+    assert layer.w13_weight.shape == (1, 384, 16)
+    assert layer.w2_weight.shape == (1, 16, 192)
     assert layer.w13_weight.weight_padded
     assert layer.w2_weight.weight_padded
-    assert layer.intermediate_pad == 64
+    assert layer.intermediate_pad == 32
 
     w1 = torch.arange(640 * 16, dtype=torch.float32).reshape(640, 16)
     w3 = w1 + 100_000
@@ -172,17 +175,17 @@ def test_unquantized_aiter_moe_pads_and_loads_tp_shards(monkeypatch):
     layer._load_w2(layer.w2_weight.data[0], 1, "w2", w2, tp_rank=1)
 
     torch.testing.assert_close(
-        layer.w13_weight.data[0, :320], w1[320:].to(torch.bfloat16)
+        layer.w13_weight.data[0, :160], w1[160:320].to(torch.bfloat16)
     )
     torch.testing.assert_close(
-        layer.w13_weight.data[0, 384:704], w3[320:].to(torch.bfloat16)
+        layer.w13_weight.data[0, 192:352], w3[160:320].to(torch.bfloat16)
     )
     torch.testing.assert_close(
-        layer.w2_weight.data[0, :, :320], w2[:, 320:].to(torch.bfloat16)
+        layer.w2_weight.data[0, :, :160], w2[:, 160:320].to(torch.bfloat16)
     )
-    assert torch.count_nonzero(layer.w13_weight.data[0, 320:384]) == 0
-    assert torch.count_nonzero(layer.w13_weight.data[0, 704:768]) == 0
-    assert torch.count_nonzero(layer.w2_weight.data[0, :, 320:384]) == 0
+    assert torch.count_nonzero(layer.w13_weight.data[0, 160:192]) == 0
+    assert torch.count_nonzero(layer.w13_weight.data[0, 352:384]) == 0
+    assert torch.count_nonzero(layer.w2_weight.data[0, :, 160:192]) == 0
 
 
 @pytest.mark.skipif(not is_hip(), reason="AITER routing is ROCm-only")

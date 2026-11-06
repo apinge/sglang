@@ -31,7 +31,8 @@ fi
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-32}"
 CUDA_GRAPH_MAX_BS_DECODE="${CUDA_GRAPH_MAX_BS_DECODE:-32}"
-AITER_MOE_PADDING_SIZE="${AITER_MOE_PADDING_SIZE:-64}"
+# PTPC padding is applied after TP slicing; pass the alignment to the server.
+export AITER_MOE_PADDING_SIZE="${AITER_MOE_PADDING_SIZE:-64}"
 
 if [[ ! -f "${MODEL_PATH}/config.json" ]]; then
   echo "Model config not found: ${MODEL_PATH}/config.json" >&2
@@ -102,7 +103,7 @@ command=(
 if [[ "$MTP" == 1 ]]; then
   command+=(--speculative-algorithm EAGLE --speculative-num-steps 3
             --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
-            --speculative-moe-runner-backend triton)
+            --speculative-moe-runner-backend aiter)
 fi
 
 # Use an explicit negative flag for the control run so the A/B result cannot be
