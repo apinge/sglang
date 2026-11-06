@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.environ import envs
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -397,6 +398,20 @@ def fused_sigmoid_gating_delta_rule_update(
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    if (
+        envs.SGLANG_GFX942_GDN_VERIFY_TILES.get()
+        and torch.version.hip is not None
+        and disable_state_update
+        and not is_kda
+        and retrieve_parent_token is None
+        and not cache_ring
+        and N <= 16
+        and K == V == 128
+        and torch.cuda.get_device_properties(q.device).gcnArchName.startswith("gfx942")
+    ):
+        # Keep the original one-warp K reductions and FP32 state arithmetic.
+        # Narrow V tiles reduce live state registers in chain MTP verification.
+        BV = 8 if N <= 2 else 16
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3

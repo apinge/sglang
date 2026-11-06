@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()
@@ -419,6 +420,15 @@ def fused_qkv_split_gdn_prefill(
     qkv_dim = num_q_heads * head_q + num_k_heads * head_k + num_v_heads * head_v
     if _is_hip and seq_len == 0:
         return q, k, v
+    gfx942_split = (
+        _is_hip
+        and envs.SGLANG_GFX942_GDN_QKV_SPLIT.get()
+        and (num_q_heads, num_k_heads, num_v_heads) == (8, 8, 24)
+        and head_q == head_k == head_v == 128
+        and torch.cuda.get_device_properties(mixed_qkv.device).gcnArchName.startswith(
+            "gfx942"
+        )
+    )
     fused_qkv_split_gdn_prefill_kernel[(seq_len,)](
         q,
         k,
@@ -433,7 +443,7 @@ def fused_qkv_split_gdn_prefill(
         head_k,
         head_v,
         BLOCK_SIZE=triton.next_power_of_2(qkv_dim),
-        num_warps=8,
+        num_warps=1 if gfx942_split else 8,
         num_stages=3,
     )
     return q, k, v

@@ -10,6 +10,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.utils import check_shared_mem, input_guard
+from sglang.srt.environ import envs
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
@@ -179,6 +180,14 @@ def chunk_local_cumsum_scalar(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
     grid = (NT, B * H)
+    gfx942_cumsum = (
+        envs.SGLANG_GFX942_GDN_CUMSUM.get()
+        and torch.version.hip is not None
+        and BT == 64
+        and H == 24
+        and not head_first
+        and torch.cuda.get_device_properties(g.device).gcnArchName.startswith("gfx942")
+    )
     chunk_local_cumsum_scalar_kernel[grid](
         s=g_org,
         o=g,
@@ -193,7 +202,7 @@ def chunk_local_cumsum_scalar(
         REVERSE=reverse,
         HAS_SCALE=scale is not None,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=8,
+        num_warps=1 if gfx942_cumsum else 8,
         num_stages=3,
     )
     return g

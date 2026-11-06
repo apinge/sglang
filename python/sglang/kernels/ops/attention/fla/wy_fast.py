@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
+from sglang.srt.environ import envs
 
 
 # @triton.autotune(
@@ -124,8 +125,14 @@ def recompute_w_u_fwd(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    BK = 64
-    BV = 64
+    gfx942_tiles = (
+        envs.SGLANG_GFX942_GDN_PREFILL_TILES.get()
+        and torch.version.hip is not None
+        and K == V == 128
+        and torch.cuda.get_device_properties(k.device).gcnArchName.startswith("gfx942")
+    )
+    BK = 128 if gfx942_tiles else 64
+    BV = 128 if gfx942_tiles else 64
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
     recompute_w_u_fwd_kernel[(NT, B * H)](
