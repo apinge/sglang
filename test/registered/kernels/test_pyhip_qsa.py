@@ -1,0 +1,888 @@
+"""Direct PyHIP wiring: cache ownership, ragged prefill, graph decode and graph verify."""
+
+import importlib.util
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import torch
+
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.qsa.metadata import (
+    QSAIndexerMetadata,
+    build_group_ring_slots,
+    build_pending_ring_slots,
+    qsa_ring_slots_per_request,
+)
+from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
+from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
+from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
+from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd")
+
+
+def _config():
+    return SimpleNamespace(
+        indexer_n_heads=4,
+        indexer_kv_heads=1,
+        indexer_head_dim=128,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+        hidden_size=2560,
+        rms_norm_eps=1e-6,
+    )
+
+
+def _pool(device, compressed_slots=2112):
+    ring = 3 * qsa_ring_slots_per_request(4)
+    pool = QSATokenToKVPool.__new__(QSATokenToKVPool)
+    pool.full_attention_layer_id_mapping = {3: 0}
+    pool.qsa_key_state_buffer_pool = [
+        torch.zeros((ring, 1, 128), dtype=torch.bfloat16, device=device)
+    ]
+    pool.qsa_compressed_k_buffer_pool = [
+        torch.randn((compressed_slots, 1, 128), dtype=torch.bfloat16, device=device)
+    ]
+    pool.qsa_rope_position_buffer = torch.zeros(
+        (ring, 3), dtype=torch.int64, device=device
+    )
+    pool.qsa_compress_ratio = 4
+    pool.qsa_index_head_dim = 128
+    pool.qsa_index_kv_heads = 1
+    pool.qsa_compressed_page_size = 16
+    pool.qsa_block_topk = 512
+    pool.qsa_token_topk = 2048
+    return pool
+
+
+def _indexer(device, rotary=None):
+    if rotary is None:
+        rotary = MRotaryEmbedding(
+            head_size=256,
+            rotary_dim=64,
+            max_position_embeddings=8192,
+            base=1000000,
+            is_neox_style=True,
+            dtype=torch.bfloat16,
+            mrope_section=[11, 11, 10],
+            mrope_interleaved=True,
+        )
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        module = QSAIndexer(_config(), layer_id=3, rotary_emb=rotary).to(device)
+    finally:
+        torch.set_default_dtype(previous)
+    with torch.no_grad():
+        module.index_qk_proj.weight.normal_(std=0.02)
+        module.q_layernorm.weight.normal_(std=0.1)
+        module.k_layernorm.weight.normal_(std=0.1)
+    return module
+
+
+def _prefill_case(device):
+    """Two extend requests, one with a 2048-token prefix, and their indexer metadata."""
+    pool = _pool(device)
+    lengths, extends = (2055, 15), (7, 15)
+    prefix = torch.tensor([2048, 0], device=device)
+    seq = torch.tensor(lengths, dtype=torch.int32, device=device)
+    ext = torch.tensor(extends, device=device)
+    table = torch.stack(
+        [
+            64 + torch.arange(4096, dtype=torch.int32, device=device),
+            4224 + torch.arange(4096, dtype=torch.int32, device=device),
+        ]
+    )
+    logical = torch.cat(
+        [torch.arange(2048, 2055, device=device), torch.arange(15, device=device)]
+    )
+    positions = torch.stack([logical, logical + 3, logical + 7])
+    writes, ends, sequences, members = QwenSparseAttnBackend._qsa_write_plan(
+        token_slot_table=table,
+        start_blocks=prefix // 4,
+        end_blocks=seq.long() // 4,
+        capacity=sum(extends) // 4 + 2,
+        compress_ratio=4,
+        row_token_starts=torch.cumsum(ext, 0) - ext,
+        prefix_lens=prefix,
+    )
+    metadata = QSAIndexerMetadata(
+        sequence_lengths=seq,
+        token_to_batch_idx=torch.repeat_interleave(
+            torch.arange(2, device=device).int(), ext
+        ),
+        token_slot_table=table,
+        out_cache_loc=torch.zeros(sum(extends), dtype=torch.int64, device=device),
+        token_to_kv_pool=pool,
+        compress_ratio=4,
+        block_topk=512,
+        req_pool_indices=torch.tensor([1, 2], device=device),
+        write_locs=writes,
+        compress_group_positions=ends,
+        compress_sequence_ids=sequences,
+        compress_member_rows=members,
+    )
+    hidden = torch.randn((sum(extends), 2560), device=device, dtype=torch.bfloat16)
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        positions=logical,
+        seq_lens_cpu=torch.tensor(lengths),
+        extend_seq_lens_cpu=extends,
+    )
+    return SimpleNamespace(
+        pool=pool,
+        table=table,
+        lengths=lengths,
+        hidden=hidden,
+        positions=positions,
+        batch=batch,
+        metadata=metadata,
+    )
+
+
+class _FakeAttnTPGroup:
+    """One attention-TP rank in this process; its gather fills every share so far."""
+
+    def __init__(self, world_size, rank_in_group, shares):
+        self.world_size = world_size
+        self.rank_in_group = rank_in_group
+        self.shares = shares
+
+    def all_gather_into_tensor(self, output, input):
+        self.shares[self.rank_in_group] = input.clone()
+        for rank, share in self.shares.items():
+            output[rank * len(share) : (rank + 1) * len(share)] = share
+
+
+def _ring_slots(requests, logical):
+    """Graph rows' pending-ring store slots and group member slots, as SGLang builds them."""
+    rows = torch.arange(len(logical), device=logical.device)
+    slots = build_pending_ring_slots(
+        token_to_batch_idx=rows,
+        req_pool_indices=requests,
+        sequence_lengths=logical + 1,
+        logical_positions=logical,
+        compress_ratio=4,
+        is_extend=False,
+    )
+    groups = build_group_ring_slots(
+        req_pool_indices=requests,
+        group_end_positions=logical.long(),
+        sequence_ids=rows,
+        compress_ratio=4,
+    )
+    return slots, groups.int()
+
+
+class _AttentionPool:
+    def __init__(self, keys, values):
+        self.keys = keys
+        self.values = values
+        self.write_calls = 0
+        self.read_calls = 0
+
+    def set_kv_buffer(self, layer, locations, keys, values):
+        self.keys.index_copy_(0, locations.long(), keys)
+        self.values.index_copy_(0, locations.long(), values)
+        self.write_calls += 1
+
+    def get_key_buffer(self, layer_id):
+        self.read_calls += 1
+        return self.keys
+
+    def get_value_buffer(self, layer_id):
+        self.read_calls += 1
+        return self.values
+
+
+class TestPyHIPDispatchBoundaries(CustomTestCase):
+    def test_speculative_indexer_modes_without_mtp_optimizations(self):
+        from sglang.srt.layers.attention.qsa.pyhip_backend import PyHIPIndexer
+
+        wrapper = PyHIPIndexer.__new__(PyHIPIndexer)
+        with (
+            patch.object(wrapper, "can_use_for_forward", return_value=True),
+            patch.object(wrapper, "_decode", return_value="pyhip") as decode,
+        ):
+            for mode, graph, expected in (
+                (ForwardMode.DRAFT_EXTEND_V2, False, None),
+                (ForwardMode.DRAFT_EXTEND_V2, True, None),
+                (ForwardMode.TARGET_VERIFY, False, None),
+                (ForwardMode.TARGET_VERIFY, True, "pyhip"),
+                (ForwardMode.DECODE, False, "pyhip"),
+                (ForwardMode.DECODE, True, "pyhip"),
+            ):
+                with self.subTest(mode=mode, graph=graph):
+                    decode.reset_mock()
+                    actual = wrapper.forward(
+                        indexer=None,
+                        hidden=None,
+                        positions=None,
+                        logical=None,
+                        batch=SimpleNamespace(forward_mode=mode),
+                        metadata=SimpleNamespace(is_cuda_graph=graph),
+                        state_slots=None,
+                    )
+                    self.assertEqual(actual, expected)
+                    if expected is None:
+                        decode.assert_not_called()
+                    else:
+                        self.assertEqual(
+                            decode.call_args.kwargs["verify"],
+                            mode == ForwardMode.TARGET_VERIFY,
+                        )
+
+    def test_draft_worker_retains_native_prefill_attention(self):
+        runner = SimpleNamespace(
+            device="cuda",
+            token_to_kv_pool=None,
+            req_to_token_pool=None,
+            model_config=SimpleNamespace(hf_text_config=_config(), context_len=8192),
+            is_draft_worker=False,
+            kv_cache_dtype=torch.bfloat16,
+            attn_cp_size=1,
+            attn_dcp_size=1,
+        )
+        with (
+            patch(
+                "sglang.srt.layers.attention.qwen_sparse_attn_backend._USE_PYHIP_QSA_ATTENTION",
+                True,
+            ),
+            patch(
+                "sglang.srt.layers.attention.qsa.pyhip_backend.PyHIPAttention"
+            ) as attention,
+        ):
+            self.assertIsNotNone(QwenSparseAttnBackend(runner)._pyhip_attention)
+            attention.assert_called_once()
+            attention.reset_mock()
+            runner.is_draft_worker = True
+            self.assertIsNone(QwenSparseAttnBackend(runner)._pyhip_attention)
+            attention.assert_not_called()
+            runner.is_draft_worker = False
+            runner.device = "cpu"
+            self.assertIsNone(QwenSparseAttnBackend(runner)._pyhip_attention)
+            attention.assert_not_called()
+
+
+@unittest.skipUnless(torch.version.hip is not None, "ROCm only")
+class TestPyHIPQSA(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        if not torch.cuda.get_device_properties().gcnArchName.startswith("gfx942"):
+            raise unittest.SkipTest("PyHIP QSA requires gfx942")
+        if any(importlib.util.find_spec(name) is None for name in ("pyhip", "flydsl")):
+            raise unittest.SkipTest("Install the qsa_pyhip optional dependencies")
+        if not envs.SGLANG_USE_AITER.get():
+            raise unittest.SkipTest("PyHIP indexer prep requires SGLANG_USE_AITER=1")
+        __import__("pyhip.ops.qsa.flydsl.attention")
+        publish(ServerArgs(model_path="dummy", attention_backend="aiter"), role="test")
+        cls.device = torch.device("cuda", torch.cuda.current_device())
+
+    @classmethod
+    def tearDownClass(cls):
+        reset_context()
+        super().tearDownClass()
+
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(42)
+
+    @torch.no_grad()
+    def test_attention_cache_and_padding(self):
+        from pyhip.testing.qsa_reference import reference
+
+        for heads in (12, 6):
+            for queries, prefixes in (((33,), (0,)), ((7, 0, 9), (2048, 0, 12))):
+                with self.subTest(heads=heads, queries=queries, prefixes=prefixes):
+                    rows = sum(queries)
+                    lengths = tuple(
+                        count + prefix for count, prefix in zip(queries, prefixes)
+                    )
+                    width = max(lengths) + 64
+                    table = (
+                        torch.arange(len(queries) * width, device=self.device)
+                        .int()
+                        .reshape(len(queries), width)
+                    )
+                    table = table.roll(64, dims=1)
+                    shape = (len(queries) * width + 2, 1, 256)
+                    pool = _AttentionPool(
+                        torch.randn(shape, dtype=torch.bfloat16, device=self.device),
+                        torch.randn(shape, dtype=torch.bfloat16, device=self.device),
+                    )
+                    req_pool = SimpleNamespace(req_to_token=table)
+                    runner = SimpleNamespace(
+                        device=self.device,
+                        token_to_kv_pool=pool,
+                        req_to_token_pool=req_pool,
+                        model_config=SimpleNamespace(
+                            hf_text_config=_config(), context_len=8192
+                        ),
+                        is_draft_worker=False,
+                        kv_cache_dtype=torch.bfloat16,
+                        attn_cp_size=1,
+                        attn_dcp_size=1,
+                    )
+                    with envs.SGLANG_USE_PYHIP_QSA.override(
+                        True
+                    ), envs.SGLANG_TEST_PYHIP_QSA.override(True):
+                        backend = QwenSparseAttnBackend(runner)
+                    self.assertIsNotNone(backend._pyhip_attention)
+                    slot_reads = []
+                    forward = backend._pyhip_attention.forward
+
+                    def record(**kwargs):
+                        slot_reads.append(kwargs.get("kv_slots") is not None)
+                        return forward(**kwargs)
+
+                    backend._pyhip_attention.forward = record
+                    locations = torch.cat(
+                        [
+                            table[request, prefix : prefix + count]
+                            for request, (count, prefix) in enumerate(
+                                zip(queries, prefixes)
+                            )
+                        ]
+                        + [
+                            torch.arange(
+                                shape[0] - 2, shape[0], device=self.device
+                            ).int()
+                        ]
+                    )
+                    query = torch.randn(
+                        (rows + 2, heads, 256), dtype=torch.bfloat16, device=self.device
+                    )
+                    keys = torch.randn(
+                        (rows + 2, 1, 256), dtype=torch.bfloat16, device=self.device
+                    )
+                    values = torch.randn_like(keys)
+                    indices = torch.full(
+                        (rows, 2051), -1, dtype=torch.int32, device=self.device
+                    )
+                    row = 0
+                    for count, prefix in zip(queries, prefixes):
+                        for position in range(prefix, prefix + count):
+                            visible = position + 1
+                            complete = min(visible // 4, 512) * 4
+                            indices[row, :complete] = torch.arange(
+                                complete, device=self.device
+                            )
+                            indices[row, complete : complete + visible % 4] = (
+                                torch.arange(
+                                    visible // 4 * 4, visible, device=self.device
+                                )
+                            )
+                            row += 1
+                    batch = SimpleNamespace(
+                        forward_mode=ForwardMode.EXTEND,
+                        out_cache_loc=locations,
+                        extend_seq_lens_cpu=queries,
+                        seq_lens_cpu=lengths,
+                        extend_seq_lens=torch.tensor(queries, device=self.device),
+                        req_pool_indices=torch.arange(len(queries), device=self.device),
+                    )
+                    layer = SimpleNamespace(
+                        tp_q_head_num=heads,
+                        tp_k_head_num=1,
+                        tp_v_head_num=1,
+                        head_dim=256,
+                        v_head_dim=256,
+                        scaling=1 / 16,
+                        layer_id=3,
+                        logit_cap=0,
+                        sliding_window_size=-1,
+                        is_cross_attention=False,
+                        pos_encoding_mode="NONE",
+                    )
+                    # Supply the full-context slot plan that serving metadata
+                    # prepares before attention; the fixture has no indexer pool.
+                    backend.forward_metadata = SimpleNamespace(
+                        packed_kv_slots=torch.cat(
+                            [
+                                table[request, :length]
+                                for request, length in enumerate(lengths)
+                            ]
+                        )
+                    )
+                    output = backend.forward_extend(
+                        query, keys, values, layer, batch, topk_indices=indices
+                    )
+                    self.assertEqual(pool.write_calls, 1)
+                    self.assertEqual(pool.read_calls, 2 if any(prefixes) else 0)
+                    packed_keys = torch.cat(
+                        [
+                            pool.keys[table[request, :length].long()]
+                            for request, length in enumerate(lengths)
+                        ]
+                    )
+                    packed_values = torch.cat(
+                        [
+                            pool.values[table[request, :length].long()]
+                            for request, length in enumerate(lengths)
+                        ]
+                    )
+                    expected = reference(
+                        query[:rows],
+                        packed_keys,
+                        packed_values,
+                        indices,
+                        query_lens=queries,
+                        prefix_lens=prefixes,
+                        scale=1 / 16,
+                    )
+                    torch.testing.assert_close(
+                        output[:rows].reshape_as(query[:rows]).float(),
+                        expected,
+                        rtol=0.02,
+                        atol=0.02,
+                    )
+                    self.assertEqual(output.shape, (rows + 2, heads * 256))
+                    self.assertTrue(bool((output[rows:] == 0).all()))
+                    self.assertEqual(len(backend._pyhip_attention.checked_layouts), 1)
+                    # Prefixed chunks read the pool in place through the slot table; the
+                    # gather fallback (a pool PyHIP cannot read in place) gives the same output.
+                    self.assertEqual(slot_reads, [any(prefixes)])
+                    if any(prefixes):
+                        with patch.object(
+                            backend._pyhip_attention,
+                            "can_read_kv_slots",
+                            return_value=False,
+                        ):
+                            packed = backend.forward_extend(
+                                query, keys, values, layer, batch, topk_indices=indices
+                            )
+                        self.assertEqual(slot_reads, [True, False])
+                        self.assertTrue(torch.equal(packed, output))
+                    self.assertFalse(
+                        backend._pyhip_attention.can_use_for_forward(
+                            q=query[:rows],
+                            k=keys[:rows],
+                            v=values[:rows],
+                            indices=indices,
+                            layer=layer,
+                            forward_mode=ForwardMode.TARGET_VERIFY,
+                            kwargs={},
+                        )
+                    )
+
+    def test_selection_validator_rejects_invalid_output(self):
+        from sglang.test.qsa_validation import _selection_valid
+
+        logits = torch.arange(520, 0, -1, device=self.device).float()[None]
+        lengths = torch.tensor([520], dtype=torch.int32, device=self.device)
+        tokens = torch.cat(
+            [
+                torch.arange(2048, device=self.device),
+                torch.arange(2080, 2083, device=self.device),
+            ]
+        ).int()[None]
+        real = torch.ones(1, dtype=torch.bool, device=self.device)
+
+        def valid(actual, scores=logits):
+            return bool(
+                _selection_valid(
+                    logits=scores,
+                    lengths=lengths,
+                    actual=actual,
+                    expected=tokens,
+                    real=real,
+                )
+            )
+
+        self.assertTrue(valid(tokens))
+        repeated = tokens.clone()
+        repeated[0, 1] = 0
+        self.assertFalse(valid(repeated))
+        suboptimal = tokens.clone()
+        suboptimal[0, :4] = torch.arange(2076, 2080, device=self.device)
+        self.assertFalse(valid(suboptimal))
+        self.assertTrue(
+            bool(
+                _selection_valid(
+                    logits=logits,
+                    lengths=lengths,
+                    actual=tokens,
+                    expected=suboptimal,
+                    real=real,
+                )
+            )
+        )
+        nonfinite = logits.clone()
+        nonfinite[0, 0] = float("nan")
+        self.assertFalse(valid(tokens, nonfinite))
+
+    def test_prefill_and_graph_decode(self):
+        self._check_prefill_and_graph_decode(rotary=None)
+
+    def test_prefill_and_graph_decode_with_yarn_rope(self):
+        """The 1M-context launch overrides RoPE to YaRN, which get_rope builds as an
+        MRotaryEmbedding subclass; PyHIP rejected it and silently ran the native indexer.
+        YaRN only rescales the cos/sin cache, so PyHIP must run and match native."""
+        rotary = get_rope(
+            head_size=256,
+            rotary_dim=256,
+            max_position=8192,
+            base=1000000,
+            rope_scaling={
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 8192,
+                "mrope_section": [11, 11, 10],
+                "mrope_interleaved": True,
+            },
+            dtype=torch.bfloat16,
+            partial_rotary_factor=0.25,
+        )
+        self._check_prefill_and_graph_decode(rotary=rotary)
+
+    @torch.no_grad()
+    def _check_prefill_and_graph_decode(self, *, rotary):
+        with envs.SGLANG_USE_PYHIP_QSA.override(
+            True
+        ), envs.SGLANG_TEST_PYHIP_QSA.override(True):
+            module = _indexer(self.device, rotary)
+        self.assertIsNotNone(module._pyhip_indexer)
+        case = _prefill_case(self.device)
+        output = module.forward_cuda(
+            case.hidden, case.positions, case.batch, case.metadata
+        )
+        self.assertEqual(output.shape, (len(case.hidden), 2051))
+        self.assertEqual(module._pyhip_indexer.validation.prefill_checks, 1)
+        self._check_graph_decode(module, case.pool, case.table, case.lengths)
+        self._check_graph_verify(
+            module,
+            case.pool,
+            case.table,
+            (case.lengths[0] + 2, case.lengths[1] + 2),
+        )
+
+    @torch.no_grad()
+    def test_prefill_rows_split_across_ranks(self):
+        """With SGLANG_OPT_PYHIP_QSA_SPLIT_INDEXER, each attention-TP rank selects an
+        equal share of the prefill rows into a shared frame and all-gathers it in place;
+        the gathered selection must equal the unsplit one bit for bit, and a batch
+        under the work threshold must not gather at all.
+        """
+        with envs.SGLANG_USE_PYHIP_QSA.override(True):
+            module = _indexer(self.device)
+        backend = module._pyhip_indexer
+        case = _prefill_case(self.device)
+        caches = (
+            case.pool.get_qsa_key_state_buffer(3),
+            case.pool.qsa_rope_position_buffer,
+            case.pool.get_qsa_compressed_k_buffer(3),
+        )
+        initial = [cache.clone() for cache in caches]
+
+        def select(group):
+            for cache, value in zip(caches, initial):
+                cache.copy_(value)
+            backend.split_group = group
+            return module.forward_cuda(
+                case.hidden, case.positions, case.batch, case.metadata
+            )
+
+        expected = select(None)
+        shares = {}
+        self.assertTrue(torch.equal(select(_FakeAttnTPGroup(2, 0, shares)), expected))
+        self.assertEqual(shares, {})
+        target = "sglang.srt.layers.attention.qsa.pyhip_backend"
+        with patch(f"{target}._SPLIT_MIN_ROWS", 0), patch(
+            f"{target}._SPLIT_MIN_KEYS_PER_ROW", 0
+        ):
+            for world_size in (2, 3):
+                shares = {}
+                for rank in range(world_size):
+                    gathered = select(_FakeAttnTPGroup(world_size, rank, shares))
+                self.assertEqual(len(shares), world_size)
+                self.assertTrue(torch.equal(gathered, expected))
+
+    def test_graph_decode_with_1m_context_page_table(self):
+        """A 1M-token context sizes the graph page table to 16384 pages (262144 keys);
+        graph decode must still run PyHIP instead of silently falling back to native."""
+        with envs.SGLANG_USE_PYHIP_QSA.override(
+            True
+        ), envs.SGLANG_TEST_PYHIP_QSA.override(True):
+            module = _indexer(self.device)
+        table = torch.stack(
+            [
+                64 + torch.arange(4096, dtype=torch.int32, device=self.device),
+                4224 + torch.arange(4096, dtype=torch.int32, device=self.device),
+            ]
+        )
+        self._check_graph_decode(
+            module, _pool(self.device), table, (2055, 15), pages=16384
+        )
+
+    @torch.no_grad()
+    def test_graph_decode_selection_beyond_65536_compressed_keys(self):
+        """Score real long histories, including a 1M-token row, against Torch.
+
+        Valid tail keys must beat the first 65536 keys. Poisoned invalid keys
+        must stay masked, then become selectable when replay grows the lengths.
+        """
+        from sglang.srt.layers.attention.qsa.kernel import (
+            torch_expand_qsa_block_indices,
+        )
+        from sglang.srt.layers.attention.qsa.mqa import torch_qsa_mqa_decode
+        from sglang.test.qsa_validation import _selection_valid
+
+        old_limit = 65536
+        counts = (old_limit + 513, 250001)
+        pages = (max(counts) + 1 + 15) // 16
+        rotary = get_rope(
+            head_size=256,
+            rotary_dim=256,
+            max_position=262144,
+            base=10000000,
+            rope_scaling={
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 262144,
+                "mrope_section": [11, 11, 10],
+                "mrope_interleaved": True,
+            },
+            dtype=torch.bfloat16,
+            partial_rotary_factor=0.25,
+        )
+        with envs.SGLANG_USE_PYHIP_QSA.override(
+            True
+        ), envs.SGLANG_TEST_PYHIP_QSA.override(True):
+            module = _indexer(self.device, rotary)
+        self.assertIsNotNone(module._pyhip_indexer)
+        # Only a non-rotary coordinate is nonzero, giving deterministic positive
+        # Q/K regardless of the large three-axis positions or top-k tie ordering.
+        module.index_qk_proj.weight.zero_()
+        module.index_qk_proj.weight[127::128, 0] = 1
+        module.q_layernorm.weight.fill_(1)
+        module.k_layernorm.weight.fill_(1)
+        pool = _pool(self.device, compressed_slots=(2 * pages + 1) * 16)
+        compressed = pool.get_qsa_compressed_k_buffer(3)
+        compressed.zero_()
+        compressed[:16, 0, 127] = 256  # Page zero is graph-table padding.
+        page_ids = (
+            torch.arange(1, 2 * pages + 1, dtype=torch.int32, device=self.device)
+            .reshape(2, pages)
+            .flip(1)
+            .contiguous()
+        )
+        key_offsets = torch.arange(16, device=self.device)
+        key_indices = torch.arange(pages * 16, device=self.device)
+        # 512 distinct BF16 values from 2 to 31.875, avoiding top-k cutoff ties.
+        ranks = torch.arange(512, device=self.device)
+        tail_values = (2.0 ** (ranks // 128 + 1)) * (1 + ranks % 128 / 128)
+        for row, count in enumerate(counts):
+            slots = (page_ids[row].long()[:, None] * 16 + key_offsets).flatten()
+            values = torch.full((pages * 16,), 0.01, device=self.device)
+            values[count - 512 : count] = tail_values
+            values = torch.where(key_indices >= count, 256, values)
+            compressed[slots, 0, 127] = values.to(torch.bfloat16)
+        table = (
+            (page_ids.long()[:, :, None] * 64 + torch.arange(64, device=self.device))
+            .reshape(2, -1)
+            .int()
+        )
+        page_table = torch.nn.functional.pad(page_ids, (0, 16384 - pages))
+        lengths = torch.tensor(counts, dtype=torch.int32, device=self.device)
+        seq = lengths * 4 + 1
+        logical = (seq - 1).long()
+        requests = torch.tensor([1, 2], dtype=torch.int64, device=self.device)
+        slots, groups = _ring_slots(requests, logical)
+        positions = torch.stack([logical, logical + 3, logical + 7])
+        hidden = torch.zeros((2, 2560), dtype=torch.bfloat16, device=self.device)
+        hidden[:, 0] = 1
+        metadata = QSAIndexerMetadata(
+            sequence_lengths=seq,
+            token_to_batch_idx=torch.arange(2, dtype=torch.int32, device=self.device),
+            token_slot_table=table,
+            out_cache_loc=torch.zeros(2, dtype=torch.int64, device=self.device),
+            token_to_kv_pool=pool,
+            compress_ratio=4,
+            block_topk=512,
+            req_pool_indices=requests,
+            is_cuda_graph=True,
+            graph_write_locs=torch.zeros(2, dtype=torch.int32, device=self.device),
+            graph_compressed_page_table=page_table,
+            graph_compressed_lengths=lengths,
+            decode_logical_positions=logical,
+            pending_ring_slots=slots,
+            graph_ring_group_locs=groups,
+        )
+        batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+
+        def check_reference(output):
+            q_ref, _, _ = module.project_qk(hidden, positions)
+            cache, table_ref, lengths_ref, width = metadata.get_decode_mqa_inputs(3)
+            logits = torch_qsa_mqa_decode(q_ref, cache, table_ref, lengths_ref, width)
+            blocks = torch.topk(logits, 512, dim=1).indices.int()
+            expected = torch_expand_qsa_block_indices(blocks, logical, seq, 4, 2048)
+            selected = output[:, :2048].reshape(2, 512, 4)[:, :, 0] // 4
+            valid = _selection_valid(
+                logits=logits,
+                lengths=lengths_ref,
+                actual=output,
+                expected=expected,
+                real=torch.ones(2, dtype=torch.bool, device=self.device),
+            )
+            self.assertTrue(bool(valid))
+            self.assertTrue(bool((selected >= old_limit).all()))
+            return selected
+
+        output = module.forward_cuda(hidden, positions, batch, metadata)
+        torch.cuda.synchronize()
+        check_reference(output)
+        graph = torch.cuda.CUDAGraph()
+        with model_capture_mode(), torch.cuda.graph(graph):
+            output = module.forward_cuda(hidden, positions, batch, metadata)
+        graph.replay()
+        torch.cuda.synchronize()
+        check_reference(output)
+        # One previously masked, higher-scoring key becomes valid in each row.
+        lengths.add_(1)
+        seq.add_(4)
+        logical.add_(4)
+        positions.add_(4)
+        for buffer, value in zip((slots, groups), _ring_slots(requests, logical)):
+            buffer.copy_(value)
+        graph.replay()
+        torch.cuda.synchronize()
+        selected = check_reference(output)
+        newly_visible = torch.tensor(counts, device=self.device)[:, None]
+        self.assertTrue(bool((selected == newly_visible).any(1).all()))
+        self.assertEqual(int(module._pyhip_indexer.validation.decode_checks.item()), 3)
+
+    def _check_graph_decode(self, module, pool, table, lengths, pages=None):
+        seq = torch.tensor(
+            [n + 1 for n in lengths], dtype=torch.int32, device=self.device
+        )
+        logical = seq - 1
+        requests = torch.tensor([1, 2], dtype=torch.int64, device=self.device)
+        slots, groups = _ring_slots(requests, logical.long())
+        writes = (table[torch.arange(2, device=self.device), logical.long()] // 4).int()
+        page_table = table[:, ::64] // 64
+        if pages is not None:
+            page_table = torch.nn.functional.pad(
+                page_table, (0, pages - page_table.shape[1])
+            )
+        metadata = QSAIndexerMetadata(
+            sequence_lengths=seq,
+            token_to_batch_idx=torch.arange(2, dtype=torch.int32, device=self.device),
+            token_slot_table=table,
+            out_cache_loc=torch.zeros(2, dtype=torch.int64, device=self.device),
+            token_to_kv_pool=pool,
+            compress_ratio=4,
+            block_topk=512,
+            req_pool_indices=requests,
+            is_cuda_graph=True,
+            graph_write_locs=writes,
+            graph_compressed_page_table=page_table.contiguous(),
+            graph_compressed_lengths=seq // 4,
+            decode_logical_positions=logical,
+            pending_ring_slots=slots,
+            graph_ring_group_locs=groups,
+        )
+        hidden = torch.randn((2, 2560), device=self.device, dtype=torch.bfloat16)
+        positions = torch.stack(
+            [logical.long(), logical.long() + 3, logical.long() + 7]
+        )
+        batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        module.forward_cuda(hidden, positions, batch, metadata)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with model_capture_mode(), torch.cuda.graph(graph):
+            output = module.forward_cuda(hidden, positions, batch, metadata)
+        seq.add_(1)
+        logical.add_(1)
+        for buffer, value in zip(
+            (slots, groups), _ring_slots(requests, logical.long())
+        ):
+            buffer.copy_(value)
+        writes.zero_()
+        positions.add_(1)
+        hidden.neg_()
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(output.shape, (2, 2051))
+        self.assertGreater(
+            int(module._pyhip_indexer.validation.decode_checks.item()), 1
+        )
+
+    def _check_graph_verify(self, module, pool, table, bases):
+        """Four-row TARGET_VERIFY windows that cross a compression boundary must match
+        native prep, ring writes, compression and selection, eager and in a graph."""
+        rows = 8
+        owner = torch.arange(2, device=self.device).repeat_interleave(4)
+        requests = owner + 1
+        offsets = torch.arange(4, device=self.device).repeat(2)
+        seq = torch.empty(rows, dtype=torch.int32, device=self.device)
+        logical = torch.empty(rows, dtype=torch.int64, device=self.device)
+        slots = torch.empty(rows, dtype=torch.int64, device=self.device)
+        groups = torch.empty((rows, 4), dtype=torch.int32, device=self.device)
+        writes = torch.empty(rows, dtype=torch.int32, device=self.device)
+        compressed = torch.empty(rows, dtype=torch.int32, device=self.device)
+        positions = torch.empty((3, rows), dtype=torch.int64, device=self.device)
+        hidden = torch.empty((rows, 2560), device=self.device, dtype=torch.bfloat16)
+
+        def step(window_bases):
+            seq.copy_(
+                torch.tensor(window_bases, device=self.device).repeat_interleave(4)
+                + 1
+                + offsets
+            )
+            logical.copy_(seq - 1)
+            for buffer, value in zip((slots, groups), _ring_slots(requests, logical)):
+                buffer.copy_(value)
+            boundary = table[owner, logical] // 4
+            writes.copy_(torch.where(seq % 4 == 0, boundary, 0))
+            compressed.copy_(seq // 4)
+            positions.copy_(torch.stack([logical, logical + 3, logical + 7]))
+            hidden.normal_()
+
+        step(bases)
+        metadata = QSAIndexerMetadata(
+            sequence_lengths=seq,
+            token_to_batch_idx=torch.arange(
+                rows, dtype=torch.int32, device=self.device
+            ),
+            token_slot_table=table[owner].contiguous(),
+            out_cache_loc=torch.zeros(rows, dtype=torch.int64, device=self.device),
+            token_to_kv_pool=pool,
+            compress_ratio=4,
+            block_topk=512,
+            req_pool_indices=requests,
+            is_cuda_graph=True,
+            graph_write_locs=writes,
+            graph_compressed_page_table=(table[owner, ::64] // 64).contiguous(),
+            graph_compressed_lengths=compressed,
+            decode_logical_positions=logical,
+            pending_ring_slots=slots,
+            graph_ring_group_locs=groups,
+        )
+        batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+        checks = int(module._pyhip_indexer.validation.decode_checks.item())
+        module.forward_cuda(hidden, positions, batch, metadata)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with model_capture_mode(), torch.cuda.graph(graph):
+            output = module.forward_cuda(hidden, positions, batch, metadata)
+        # One request accepts its whole window, the other rewrites its rejected tail.
+        step((bases[0] + 4, bases[1] + 1))
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(output.shape, (rows, 2051))
+        self.assertEqual(
+            int(module._pyhip_indexer.validation.decode_checks.item()), checks + 2
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
