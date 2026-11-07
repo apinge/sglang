@@ -239,11 +239,12 @@ class QwenSparseAttnBackend(AttentionBackend):
         if (
             _USE_PYHIP_QSA_ATTENTION
             and runner is not None
+            and self.device is not None
+            and torch.device(self.device).type == "cuda"
             and not runner.is_draft_worker
-            and runner.ps.attn_cp_size == runner.ps.attn_dcp_size == 1
+            and runner.attn_cp_size == runner.attn_dcp_size == 1
             and runner.kv_cache_dtype == torch.bfloat16
             and profile is not None
-            and profile.variant == QSA_VARIANT_COMPRESSED
             and (profile.compress_ratio, profile.block_topk, profile.budget)
             == (4, 512, 2048)
         ):

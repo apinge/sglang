@@ -3,6 +3,7 @@
 import importlib.util
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -202,6 +203,75 @@ class _AttentionPool:
         return self.values
 
 
+class TestPyHIPDispatchBoundaries(CustomTestCase):
+    def test_speculative_indexer_modes_without_mtp_optimizations(self):
+        from sglang.srt.layers.attention.qsa.pyhip_backend import PyHIPIndexer
+
+        wrapper = PyHIPIndexer.__new__(PyHIPIndexer)
+        with (
+            patch.object(wrapper, "can_use_for_forward", return_value=True),
+            patch.object(wrapper, "_decode", return_value="pyhip") as decode,
+        ):
+            for mode, graph, expected in (
+                (ForwardMode.DRAFT_EXTEND_V2, False, None),
+                (ForwardMode.DRAFT_EXTEND_V2, True, None),
+                (ForwardMode.TARGET_VERIFY, False, None),
+                (ForwardMode.TARGET_VERIFY, True, "pyhip"),
+                (ForwardMode.DECODE, False, "pyhip"),
+                (ForwardMode.DECODE, True, "pyhip"),
+            ):
+                with self.subTest(mode=mode, graph=graph):
+                    decode.reset_mock()
+                    actual = wrapper.forward(
+                        indexer=None,
+                        hidden=None,
+                        positions=None,
+                        logical=None,
+                        batch=SimpleNamespace(forward_mode=mode),
+                        metadata=SimpleNamespace(is_cuda_graph=graph),
+                        state_slots=None,
+                    )
+                    self.assertEqual(actual, expected)
+                    if expected is None:
+                        decode.assert_not_called()
+                    else:
+                        self.assertEqual(
+                            decode.call_args.kwargs["verify"],
+                            mode == ForwardMode.TARGET_VERIFY,
+                        )
+
+    def test_draft_worker_retains_native_prefill_attention(self):
+        runner = SimpleNamespace(
+            device="cuda",
+            token_to_kv_pool=None,
+            req_to_token_pool=None,
+            model_config=SimpleNamespace(hf_text_config=_config(), context_len=8192),
+            is_draft_worker=False,
+            kv_cache_dtype=torch.bfloat16,
+            attn_cp_size=1,
+            attn_dcp_size=1,
+        )
+        with (
+            patch(
+                "sglang.srt.layers.attention.qwen_sparse_attn_backend._USE_PYHIP_QSA_ATTENTION",
+                True,
+            ),
+            patch(
+                "sglang.srt.layers.attention.qsa.pyhip_backend.PyHIPAttention"
+            ) as attention,
+        ):
+            self.assertIsNotNone(QwenSparseAttnBackend(runner)._pyhip_attention)
+            attention.assert_called_once()
+            attention.reset_mock()
+            runner.is_draft_worker = True
+            self.assertIsNone(QwenSparseAttnBackend(runner)._pyhip_attention)
+            attention.assert_not_called()
+            runner.is_draft_worker = False
+            runner.device = "cpu"
+            self.assertIsNone(QwenSparseAttnBackend(runner)._pyhip_attention)
+            attention.assert_not_called()
+
+
 @unittest.skipUnless(torch.version.hip is not None, "ROCm only")
 class TestPyHIPQSA(CustomTestCase):
     @classmethod
@@ -259,7 +329,8 @@ class TestPyHIPQSA(CustomTestCase):
                         ),
                         is_draft_worker=False,
                         kv_cache_dtype=torch.bfloat16,
-                        ps=SimpleNamespace(attn_cp_size=1, attn_dcp_size=1),
+                        attn_cp_size=1,
+                        attn_dcp_size=1,
                     )
                     with envs.SGLANG_USE_PYHIP_QSA.override(
                         True
@@ -332,6 +403,16 @@ class TestPyHIPQSA(CustomTestCase):
                         is_cross_attention=False,
                         pos_encoding_mode="NONE",
                     )
+                    # Supply the full-context slot plan that serving metadata
+                    # prepares before attention; the fixture has no indexer pool.
+                    backend.forward_metadata = SimpleNamespace(
+                        packed_kv_slots=torch.cat(
+                            [
+                                table[request, :length]
+                                for request, length in enumerate(lengths)
+                            ]
+                        )
+                    )
                     output = backend.forward_extend(
                         query, keys, values, layer, batch, topk_indices=indices
                     )
@@ -382,7 +463,7 @@ class TestPyHIPQSA(CustomTestCase):
                         self.assertEqual(slot_reads, [True, False])
                         self.assertTrue(torch.equal(packed, output))
                     self.assertFalse(
-                        backend._pyhip_attention.supports(
+                        backend._pyhip_attention.can_use_for_forward(
                             q=query[:rows],
                             k=keys[:rows],
                             v=values[:rows],

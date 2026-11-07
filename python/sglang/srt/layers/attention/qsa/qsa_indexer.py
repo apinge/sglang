@@ -25,7 +25,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.utils import is_gfx942_supported, is_hip
+from sglang.srt.utils import is_gfx942_supported
 
 logger = logging.getLogger(__name__)
 
