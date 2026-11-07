@@ -51,7 +51,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         )
 
         with (
-            patch.object(topk_module, "_use_aiter", use_aiter),
+            patch.object(topk_module, "will_use_aiter_moe", return_value=use_aiter),
             patch.object(
                 topk_module,
                 "get_parallel",
@@ -97,7 +97,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         with (
             patch.object(topk_module, "_is_cuda", False),
             patch.object(topk_module, "_is_hip", False),
-            patch.object(topk_module, "_use_aiter", False),
+            patch.object(topk_module, "will_use_aiter_moe", return_value=False),
             patch.object(
                 topk_module, "has_per_rank_fused_shared_slots", return_value=False
             ),
@@ -138,7 +138,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
             routed_scaling_factor=self.ROUTED_SCALING_FACTOR,
         )
         with (
-            patch.object(topk_module, "_use_aiter", True),
+            patch.object(topk_module, "will_use_aiter_moe", return_value=True),
             patch.object(
                 topk_module,
                 "get_parallel",

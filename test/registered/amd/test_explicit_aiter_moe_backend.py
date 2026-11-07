@@ -1,0 +1,230 @@
+"""ROCm regression tests for explicit AITER MoE backend selection."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from sglang.srt.utils import is_gfx942_supported, is_hip
+from sglang.test.ci.ci_register import register_amd_ci
+
+register_amd_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small-amd")
+
+
+@pytest.mark.skipif(not is_hip(), reason="AITER routing is ROCm-only")
+def test_explicit_aiter_runner_selects_aiter_topk(monkeypatch):
+    """The explicit MoE backend must not fall back to the non-AITER router."""
+    from sglang.srt.layers.moe import topk as moe_topk
+
+    expected_weights = torch.full((2, 10), 0.1, device="cuda")
+    expected_ids = torch.arange(10, dtype=torch.int32, device="cuda").repeat(2, 1)
+    calls = []
+
+    def fake_aiter_fused_topk(*args, **kwargs):
+        calls.append((args, kwargs))
+        return expected_weights, expected_ids
+
+    monkeypatch.setattr(moe_topk, "will_use_aiter_moe", lambda: True)
+    monkeypatch.setattr(
+        moe_topk,
+        "_get_aiter_topk_ops",
+        lambda: (None, fake_aiter_fused_topk),
+    )
+
+    hidden_states = torch.randn((2, 32), dtype=torch.bfloat16, device="cuda")
+    gating_output = torch.randn((2, 512), dtype=torch.bfloat16, device="cuda")
+    weights, ids = moe_topk.fused_topk(
+        hidden_states,
+        gating_output,
+        topk=10,
+        renormalize=True,
+    )
+
+    assert len(calls) == 1
+    assert weights is expected_weights
+    assert ids is expected_ids
+
+
+@pytest.mark.skipif(not is_hip(), reason="AITER routing is ROCm-only")
+def test_explicit_aiter_runner_selects_unquantized_aiter_moe(monkeypatch):
+    """Explicit AITER must allow BF16 FlyDSL shapes that are not 128-aligned."""
+    from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+    from sglang.srt.layers.quantization import unquant
+
+    created = []
+
+    class FakeRunner:
+        def __init__(self, backend, config):
+            self.runner_backend = backend
+            created.append((backend, config))
+
+    method = object.__new__(unquant.UnquantizedFusedMoEMethod)
+    method.use_flashinfer_trtllm_moe = False
+    method.use_flashinfer_cutlass = False
+    method.use_deep_gemm = False
+    method.use_triton_kernels = False
+
+    monkeypatch.setattr(unquant, "MoeRunner", FakeRunner)
+    monkeypatch.setattr(unquant, "will_use_aiter_moe", lambda: True)
+    monkeypatch.setattr(unquant, "get_moe_a2a_backend", lambda: MoeA2ABackend.NONE)
+
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+
+    config = MoeRunnerConfig()
+    layer = SimpleNamespace(
+        intermediate_size_per_partition=320,
+        intermediate_pad=0,
+        moe_runner_config=config,
+    )
+    method.create_moe_runner(layer, config)
+
+    assert method.runner.runner_backend is MoeRunnerBackend.TRITON
+    assert method._aiter_runner.runner_backend is MoeRunnerBackend.AITER
+    assert [backend for backend, _ in created] == [
+        MoeRunnerBackend.TRITON,
+        MoeRunnerBackend.AITER,
+    ]
+
+
+@pytest.mark.skipif(not is_hip(), reason="AITER routing is ROCm-only")
+def test_unquantized_aiter_moe_marks_unaligned_weights_shuffled(monkeypatch):
+    """FlyDSL dispatch must recognize shuffled BF16 weights at inter-dim 320."""
+    from sglang.srt.layers.quantization import unquant
+
+    method = unquant.UnquantizedFusedMoEMethod()
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "w13_weight",
+        torch.nn.Parameter(torch.empty((1, 640, 16), device="cuda")),
+    )
+    layer.register_parameter(
+        "w2_weight",
+        torch.nn.Parameter(torch.empty((1, 16, 320), device="cuda")),
+    )
+    layer._skip_aiter_moe_shuffle = False
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+
+    layer.moe_runner_config = MoeRunnerConfig()
+
+    shuffled = []
+
+    def fake_shuffle(weight, layout):
+        shuffled.append((weight.shape, layout))
+        return weight.clone()
+
+    monkeypatch.setattr(unquant, "will_use_aiter_moe", lambda: True)
+    monkeypatch.setattr(unquant, "_get_aiter_shuffle_weight", lambda: fake_shuffle)
+
+    method.process_weights_after_loading(layer)
+
+    assert shuffled == [
+        (torch.Size([1, 640, 16]), (16, 16)),
+        (torch.Size([1, 16, 320]), (16, 16)),
+    ]
+    assert layer.w13_weight.is_shuffled
+    assert layer.w2_weight.is_shuffled
+
+
+@pytest.mark.skipif(
+    not is_hip() or not is_gfx942_supported(),
+    reason="Qwen3.8 64-aligned BF16 kernels require gfx942",
+)
+def test_unquantized_aiter_moe_pads_and_loads_tp_shards(monkeypatch):
+    """AITER padding must not change the logical TP checkpoint offsets."""
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.quantization import unquant
+
+    monkeypatch.setenv("AITER_MOE_PADDING_SIZE", "64")
+    monkeypatch.setattr(unquant, "will_use_aiter_moe", lambda: True)
+    monkeypatch.setattr(
+        "sglang.srt.layers.moe.fused_moe_triton.layer.will_use_aiter_moe",
+        lambda: True,
+    )
+
+    method = unquant.UnquantizedFusedMoEMethod()
+    layer = FusedMoE.__new__(FusedMoE)
+    torch.nn.Module.__init__(layer)
+    layer.moe_runner_config = SimpleNamespace(is_gated=True)
+    layer.quant_method = method
+    layer.moe_tp_size = 4
+    layer.moe_tp_rank = 1
+    layer.intermediate_size_per_partition = 160
+    layer.use_presharded_weights = False
+    layer.use_triton_kernels = False
+    layer.use_flashinfer_trtllm_moe = False
+    layer.quant_config = None
+
+    method.create_weights(
+        layer=layer,
+        num_experts=1,
+        hidden_size=16,
+        intermediate_size_per_partition=160,
+        params_dtype=torch.bfloat16,
+    )
+
+    assert layer.w13_weight.shape == (1, 384, 16)
+    assert layer.w2_weight.shape == (1, 16, 192)
+    assert layer.w13_weight.weight_padded
+    assert layer.w2_weight.weight_padded
+    assert layer.intermediate_pad == 32
+
+    w1 = torch.arange(640 * 16, dtype=torch.float32).reshape(640, 16)
+    w3 = w1 + 100_000
+    w2 = torch.arange(16 * 640, dtype=torch.float32).reshape(16, 640)
+    layer._load_w13(layer.w13_weight.data[0], 0, "w1", w1, tp_rank=1)
+    layer._load_w13(layer.w13_weight.data[0], 0, "w3", w3, tp_rank=1)
+    layer._load_w2(layer.w2_weight.data[0], 1, "w2", w2, tp_rank=1)
+
+    torch.testing.assert_close(
+        layer.w13_weight.data[0, :160], w1[160:320].to(torch.bfloat16)
+    )
+    torch.testing.assert_close(
+        layer.w13_weight.data[0, 192:352], w3[160:320].to(torch.bfloat16)
+    )
+    torch.testing.assert_close(
+        layer.w2_weight.data[0, :, :160], w2[:, 160:320].to(torch.bfloat16)
+    )
+    assert torch.count_nonzero(layer.w13_weight.data[0, 160:192]) == 0
+    assert torch.count_nonzero(layer.w13_weight.data[0, 352:384]) == 0
+    assert torch.count_nonzero(layer.w2_weight.data[0, :, 160:192]) == 0
+
+
+@pytest.mark.skipif(not is_hip(), reason="AITER routing is ROCm-only")
+def test_unquantized_aiter_quant_info_uses_physical_intermediate_size(monkeypatch):
+    """AITER receives padded BF16 weights as their physical dimensions."""
+    from sglang.srt.layers.moe.utils import MoeRunnerBackend
+    from sglang.srt.layers.quantization import unquant
+
+    captured = []
+
+    class FakeAiterRunner:
+        def run(self, dispatch_output, quant_info):
+            captured.append(quant_info)
+            return quant_info
+
+    method = object.__new__(unquant.UnquantizedFusedMoEMethod)
+    method.runner = SimpleNamespace(runner_backend=MoeRunnerBackend.TRITON)
+    method._aiter_runner = FakeAiterRunner()
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+
+    method.moe_runner_config = MoeRunnerConfig()
+    method.use_flashinfer_cutlass = False
+    method.use_flashinfer_trtllm_moe = False
+    method.use_deep_gemm = False
+    method.use_triton_kernels = False
+
+    layer = SimpleNamespace(
+        w13_weight=torch.empty(1),
+        w2_weight=torch.empty(1),
+        dispatcher=SimpleNamespace(),
+        hidden_pad=0,
+        intermediate_pad=64,
+    )
+    dispatch_output = SimpleNamespace(hidden_states=torch.empty(1))
+
+    method.forward_cuda(layer, dispatch_output)
+
+    assert len(captured) == 1
+    assert captured[0].expert_mask is None
+    assert captured[0].hidden_pad == 0
+    assert captured[0].intermediate_pad == 0

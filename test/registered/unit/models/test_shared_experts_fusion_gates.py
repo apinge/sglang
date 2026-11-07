@@ -154,9 +154,10 @@ class TestDeepseekV2Gate(_FusionGateCase):
         from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 
         self._seed()
-        self.assertTrue(
-            self._reason(DeepseekV2ForCausalLM, self._config(), moe_ep_size=2)
-        )
+        with unittest.mock.patch("sglang.srt.models.deepseek_v2._is_hip", False):
+            self.assertTrue(
+                self._reason(DeepseekV2ForCausalLM, self._config(), moe_ep_size=2)
+            )
 
     def test_mixed_precision_quant_vetoes_even_when_enforced(self):
         """A precision mismatch causes crash when shared expert fusion is enabled,

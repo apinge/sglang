@@ -4,6 +4,7 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 from compressed_tensors.quantization import QuantizationStrategy
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
@@ -13,9 +14,10 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
-    get_moe_a2a_backend,
+    get_moe_padding_size,
     get_moe_runner_backend,
     get_moe_weight_sizes,
+    will_use_aiter_moe,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
@@ -27,7 +29,7 @@ from sglang.srt.layers.quantization.utils import (
     swap_w13_to_w31,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -38,14 +40,23 @@ if TYPE_CHECKING:
 
 __all__ = ["CompressedTensorsW8A8Fp8MoE"]
 
-_is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+logger = logging.getLogger(__name__)
 
-if _use_aiter:
+
+def _get_aiter_shuffle_weight():
     from aiter.ops.shuffle import shuffle_weight
 
+    return shuffle_weight
 
-logger = logging.getLogger(__name__)
+
+def _get_aiter_ptpc_padding_size() -> int:
+    try:
+        alignment = get_moe_padding_size(True)
+    except ValueError:
+        raise ValueError("AITER_MOE_PADDING_SIZE must be 64 for PTPC MoE") from None
+    if alignment != 64:
+        raise ValueError("AITER_MOE_PADDING_SIZE must be 64 for PTPC MoE")
+    return alignment
 
 
 class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
@@ -121,9 +132,14 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     f"weight quantization block_k = {block_k}."
                 )
 
+        use_aiter_moe = will_use_aiter_moe()
+        per_channel = self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+        if use_aiter_moe and per_channel:
+            # Validate the alignment used by the padded weight allocation below.
+            _get_aiter_ptpc_padding_size()
         w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
-            is_aiter_moe=_use_aiter,
+            is_aiter_moe=use_aiter_moe,
             is_concat=True,
             is_packed=False,
         )
@@ -314,24 +330,90 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
         if (
             self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-            and _use_aiter
-            and self.runner.runner_backend.is_aiter()
+            and will_use_aiter_moe()
         ):
+            shuffle_weight = _get_aiter_shuffle_weight()
+            padding_size = _get_aiter_ptpc_padding_size()
+            N = layer.w2_weight.shape[-1]
+            if padding_size:
+                pad_size = (padding_size - (N % padding_size)) % padding_size
+            else:
+                pad_size = 0
+
             with torch.no_grad():
-                # Parameter wrapping drops the shuffle result's layout tag.
-                # Restore it so AITER does not read shuffled data as canonical.
-                layer.w13_weight = torch.nn.Parameter(
-                    shuffle_weight(layer.w13_weight.data, (16, 16)),
-                    requires_grad=False,
-                )
+                if pad_size:
+                    part1_s = layer.w13_weight_scale.data[:, :N, :]
+                    part2_s = layer.w13_weight_scale.data[:, N:, :]
+                    part1_sp = F.pad(
+                        part1_s,
+                        (0, 0, 0, pad_size, 0, 0),
+                        mode="constant",
+                        value=0,
+                    )
+                    part2_sp = F.pad(
+                        part2_s,
+                        (0, 0, 0, pad_size, 0, 0),
+                        mode="constant",
+                        value=0,
+                    )
+                    layer.w13_weight_scale = torch.nn.Parameter(
+                        torch.cat([part1_sp, part2_sp], dim=1),
+                        requires_grad=False,
+                    )
+                    del part1_s, part2_s, part1_sp, part2_sp
+                    torch.cuda.empty_cache()
+
+                    part1_w = layer.w13_weight.data[:, :N, :]
+                    part2_w = layer.w13_weight.data[:, N:, :]
+                    part1_wp = F.pad(
+                        part1_w, (0, 0, 0, pad_size, 0, 0), mode="constant", value=0
+                    )
+                    part2_wp = F.pad(
+                        part2_w, (0, 0, 0, pad_size, 0, 0), mode="constant", value=0
+                    )
+                    padded_w13 = torch.cat([part1_wp, part2_wp], dim=1)
+                    del part1_w, part2_w, part1_wp, part2_wp
+                    layer.w13_weight = torch.nn.Parameter(
+                        shuffle_weight(padded_w13, (16, 16)),
+                        requires_grad=False,
+                    )
+                    del padded_w13
+                    torch.cuda.empty_cache()
+
+                    padded_w2 = F.pad(
+                        layer.w2_weight.data,
+                        (0, pad_size, 0, 0, 0, 0),
+                        "constant",
+                        0,
+                    )
+                    layer.w2_weight = torch.nn.Parameter(
+                        shuffle_weight(padded_w2, (16, 16)),
+                        requires_grad=False,
+                    )
+                    del padded_w2
+                    torch.cuda.empty_cache()
+                    logger.info(
+                        "AITER PTPC padding: intermediate=%d -> %d, alignment=%d",
+                        N,
+                        N + pad_size,
+                        padding_size,
+                    )
+                else:
+                    layer.w13_weight = torch.nn.Parameter(
+                        shuffle_weight(layer.w13_weight.data, (16, 16)),
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
+                    layer.w2_weight = torch.nn.Parameter(
+                        shuffle_weight(layer.w2_weight.data, (16, 16)),
+                        requires_grad=False,
+                    )
+                    torch.cuda.empty_cache()
+
+                # torch.nn.Parameter does not preserve custom tensor attributes.
+                # Restore the marker consumed by AITER whole-graph MoE dispatch.
                 layer.w13_weight.is_shuffled = True
-                torch.cuda.empty_cache()
-                layer.w2_weight = torch.nn.Parameter(
-                    shuffle_weight(layer.w2_weight.data, (16, 16)),
-                    requires_grad=False,
-                )
                 layer.w2_weight.is_shuffled = True
-                torch.cuda.empty_cache()
 
         if (
             self.weight_quant.strategy == QuantizationStrategy.BLOCK
@@ -353,9 +435,8 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto():
             if (
-                _use_aiter
+                will_use_aiter_moe()
                 and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-                and get_moe_a2a_backend().supports_aiter()
             ):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
