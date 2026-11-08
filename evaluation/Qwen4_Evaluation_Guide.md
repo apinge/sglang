@@ -193,6 +193,40 @@ Target model: [sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16](https://huggin
 ./run_qwen38_pure_text_profile.sh
 ```
 
+### TP1 startup
+
+Run from `evaluation/`. TP1 enables PLE offload and disables PyHIP QSA by default, without MTP:
+
+```bash
+CUDA_VISIBLE_DEVICES=6 HIP_VISIBLE_DEVICES=6 ./launch_qwen38_flash_next_fp8_mi308x_pure_tp1.sh
+```
+
+### 1M context
+
+The long-context script defaults to TP2 and `CONTEXT_LEN=1048576`. It sets `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1` to allow a context length beyond the checkpoint's configured limit. `ROPE_TYPE=default` keeps the checkpoint RoPE; `ROPE_TYPE=yarn` applies YaRN with factor 4.0 and original context 262144 through a runtime override.
+
+Start the server from `evaluation/`:
+
+```bash
+GPU_DEVICES=6,7 ROPE_TYPE=yarn ./launch_qwen38_flash_next_fp8_mi308x_long_server_1m.sh
+```
+
+Send one 1,000,000-token input with 350 output tokens:
+
+```bash
+python3 -m sglang.benchmark.serving \
+  --backend sglang \
+  --model /models/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16 \
+  --host 127.0.0.1 --port 7080 \
+  --dataset-name random --tokenize-prompt \
+  --random-input-len 1000000 \
+  --random-output-len 350 \
+  --random-range-ratio 1.0 \
+  --num-prompts 1 --max-concurrency 1 \
+  --warmup-requests 0 --flush-cache \
+  --cache-report
+```
+
 
 <details>
 <summary>Qwen 3.5 & Qwen 3.8 CI Overview</summary>
