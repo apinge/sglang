@@ -77,6 +77,9 @@ PY
 # selected below while this disables the unreleased global paged-QSA path.
 #unset SGLANG_USE_AITER
 export SGLANG_USE_AITER=1
+export SGLANG_ROCM_GPU_JPEG_DECODE=1
+export LIBVA_DRIVERS_PATH=/opt/rocm-7.14/lib/rocm_sysdeps/lib
+export LIBVA_DRIVER_NAME=radeonsi
 export SGLANG_GR_READ_FLYDSL="${SGLANG_GR_READ_FLYDSL:-1}"
 printf 'GR read: installed PyHIP enabled=%s; TP=%s; AITER_MOE_PADDING_SIZE=%s\n' \
   "${SGLANG_GR_READ_FLYDSL}" "${TP_SIZE}" "${AITER_MOE_PADDING_SIZE}"

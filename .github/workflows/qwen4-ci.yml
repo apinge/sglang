@@ -201,7 +201,7 @@ jobs:
         env:
           AITER_REF: ${{ needs.validate.outputs.aiter_sha }}
           PYHIP_REF: ${{ needs.validate.outputs.pyhip_sha }}
-          BASE_IMAGE: ${{ vars.QWEN4_BASE_IMAGE || 'rocm/ali-private:ubuntu22.04_rocm7.14.0_cp310_torch2.12.0_sglang_d0a5b96_aiter_b7aed05_20261020' }}
+          BASE_IMAGE: ${{ vars.QWEN4_BASE_IMAGE || 'rocm/ali-private:ubuntu22.04_rocm7.14.0_cp310_torch2.12.0_sglang_4d63dea_aiter_514c166_20261105_v2' }}
         run: |
           docker build --network=host --progress=plain --build-arg "AITER_REF=$AITER_REF" \
             --build-arg "PYHIP_REF=$PYHIP_REF" \

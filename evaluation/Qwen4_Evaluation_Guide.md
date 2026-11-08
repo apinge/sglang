@@ -197,7 +197,8 @@ Target model: [sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16](https://huggin
 <details>
 <summary>Qwen 3.5 & Qwen 3.8 CI Overview</summary>
 ### PR test:
-- CI runs each selected case in its own GitHub Actions matrix job using `evaluation/Dockerfile.ci` and the existing launch, benchmark, and `run_gsm8k.sh` scripts.
+- CI runs each selected case in its own GitHub Actions matrix job using `evaluation/Dockerfile.ci` and the existing launch, benchmark, `run_gsm8k.sh`, and `run_multimodal_test.sh` scripts.
+- The default image is `rocm/ali-private:ubuntu22.04_rocm7.14.0_cp310_torch2.12.0_sglang_4d63dea_aiter_514c166_20261105_v2`. All Qwen3.5/Qwen3.8 launchers select `--mm-feature-transport cuda_ipc`. CI enables rocJPEG and supplies the ROCm libva driver settings.
 - Non-draft fork PRs require the `run-qwen4-ci` label to run GPU cases. Adding the label triggers a new run through the `labeled` event.
 - Case jobs run serially on the shared host, each with its own image container, console logs, and result artifact. Docker builds reuse cached layers.
 - Each new CI run resolves AITER `qwen38-flash-next-dev` and pyhip `dev` to their latest commits. Cases and GPU-only retries use the same resolved SHAs, recorded in `build.json`. Manual and reusable workflows accept `aiter_ref` and `pyhip_ref` overrides; companion-repository callers default to their PR or workflow commit.
@@ -210,11 +211,8 @@ python3 scripts/ci/qwen4_ci.py --models-root /raid/models \
   --client-root /path/to/pinned-client --output /tmp/qwen4-results-new
 ```
 
-The default command runs **performance first, then GSM8K accuracy** against the
+The default command runs **performance, GSM8K accuracy, then a multimodal smoke test** against the
 same server. Use it without `--accuracy-only` or `--smoke` for the full workload.
-CI captures one complete log per phase: `server.log`,
-`run_qwen*_pure_text_bench.sh.log`, and `run_gsm8k.sh.log`. These logs stream to
-the console and are saved in the result artifact.
 Performance uses 10 warmup requests and 128 random requests at concurrency one;
 Qwen3.5 uses 8,000 input / 500 output tokens, and Qwen3.8 uses 12,000 / 350.
 Accuracy scores 200 examples and enforces the recorded gate.
@@ -291,6 +289,6 @@ and two examples and reports diagnostic results with the accuracy gate disabled.
 ### Daily Pressure Test
 - The daily run starts at **04:00 China time** and runs only pressure tests for all six cases.
 - Pressure uses `benchmark_example-20261013-363695ea/concurrency/run.sh` with `LLM_AUTO_SEQ_SIGMA=4`. Qwen3.8 uses `tk_in:12000,tk_out:350,conc:1-2-4-8-12-16-32`; Qwen3.5 uses `tk_in:8000,tk_out:500,conc:1-2-4-8-12-16-32`. Fixed concurrency levels use 8, 8, 8, 16, 32, 32, and 64 main requests respectively, with repost warmups disabled.
-- CI checks the complete server log for error, core-dump, segmentation-fault, and GPU memory-access-fault markers. Matches fail the case; The daily summary shows only each case's pass/fail status and any failure messages. The original `server.log` and pressure console log are retained for debugging.
+- CI checks the complete server log for error, core-dump, segmentation-fault, and GPU memory-access-fault markers. Matches fail the case. The daily summary shows each case's status, multimodal status, and any failure messages. The original `server.log`, pressure console log, and multimodal response are retained for debugging.
 - To run one pressure case locally, add `--pressure` to the driver command. `--smoke --pressure` runs two requests at concurrency one. The CI image adds the pinned concurrency-client packages without upgrading the serving runtime;
 </details>

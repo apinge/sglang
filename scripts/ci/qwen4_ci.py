@@ -184,8 +184,11 @@ def wait_ready(server, url, case, model_path, served_name, timeout):
             or args.get("speculative_algorithm")
             != {"base": None, "dflash": "DFLASH", "mtp": "EAGLE"}[case[3]]
             or bool(args.get("disable_radix_cache")) != (case[3] != "dflash")
+            or args.get("mm_feature_transport") != "cuda_ipc"
         ):
-            raise ValueError("Endpoint does not match the requested model, TP, or mode")
+            raise ValueError(
+                "Endpoint does not match the requested model, TP, mode, or CUDA IPC transport"
+            )
         return info
     raise TimeoutError(f"Server was not ready after {timeout}s; see server.log")
 
@@ -222,6 +225,60 @@ def check_accuracy_gate(score, baseline, smoke=False):
             f"GSM8K regression: {score:.2%} < {minimum:.2%} "
             f"(reference {baseline:.2%}, maximum relative drop "
             f"{GSM8K_MAX_RELATIVE_DROP:.0%})"
+        )
+
+
+def validate_multimodal(path, model):
+    data = json.loads(Path(path).read_text())
+    if not isinstance(data, dict):
+        raise ValueError("Multimodal response must be a JSON object")
+    choices = data.get("choices")
+    if (
+        data.get("error")
+        or data.get("model") != model
+        or not isinstance(choices, list)
+        or len(choices) != 1
+    ):
+        raise ValueError(
+            "Multimodal response must contain one completion from the requested model"
+        )
+    choice = choices[0]
+    if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+        raise ValueError("Multimodal response must contain an assistant message")
+    message = choice.get("message", {})
+    answer = message.get("content")
+    tokens = data.get("usage", {}).get("completion_tokens")
+    image_tokens = (
+        data.get("usage", {}).get("prompt_tokens_details", {}).get("image_tokens")
+    )
+    if (
+        message.get("role") != "assistant"
+        or not isinstance(answer, str)
+        or not answer.strip()
+        or message.get("refusal")
+        or choice.get("finish_reason") not in ("stop", "length")
+        or type(tokens) is not int
+        or tokens <= 0
+        or type(image_tokens) is not int
+        or image_tokens <= 0
+    ):
+        raise ValueError(
+            "Multimodal response has no valid assistant text or token usage"
+        )
+    return {
+        "status": "passed",
+        "completion_tokens": tokens,
+        "image_tokens": image_tokens,
+        "answer": answer,
+    }
+
+
+def check_rocjpeg_log(path):
+    text = Path(path).read_text(errors="replace")
+    if not re.search(r"rocJPEG GPU JPEG decoding: on\b", text):
+        raise ValueError(
+            "rocJPEG GPU decoding was not confirmed: expected "
+            "'rocJPEG GPU JPEG decoding: on' in server.log"
         )
 
 
@@ -279,12 +336,19 @@ def check_server_log(path):
         r"hipError\w*|HSA_STATUS_ERROR\w*)\b",
         re.IGNORECASE,
     )
-    errors = [
-        line
-        for line in Path(path).read_text(errors="replace").splitlines()
-        if not any(prefix in line.lower() for prefix in ignored_imports)
-        and fault.search(line)
-    ]
+    errors = []
+    for line in Path(path).read_text(errors="replace").splitlines():
+        if any(prefix in line.lower() for prefix in ignored_imports):
+            continue
+        checked = line
+        if "rocJPEG GPU JPEG decoding: on," in line:
+            # The successful self-check reports a pixel-error metric. Ignore
+            # that phrase only; any actual error/fault on the line still fails.
+            checked = line.replace(
+                "mean abs error vs PIL", "mean abs difference vs PIL"
+            )
+        if fault.search(checked):
+            errors.append(line)
     if errors:
         raise RuntimeError(
             "Server log contains errors or GPU faults:\n" + "\n".join(errors[:10])
@@ -382,6 +446,10 @@ def run_case(case, args, directory, row):
         MTP="1" if mode == "mtp" else "0",
         PLE_OFFLOAD_EMBEDDING="0",
         LOG_FILE=os.devnull,  # managed_process captures the complete server log.
+        SGLANG_ROCM_GPU_JPEG_DECODE="1",
+        LIBVA_DRIVERS_PATH=os.environ.get("LIBVA_DRIVERS_PATH")
+        or f"{os.environ.get('ROCM_PATH') or '/opt/rocm'}/lib/rocm_sysdeps/lib",
+        LIBVA_DRIVER_NAME=os.environ.get("LIBVA_DRIVER_NAME") or "radeonsi",
     )
     if mode == "dflash":
         env["DRAFT_MODEL_PATH"] = str(
@@ -427,6 +495,8 @@ def run_case(case, args, directory, row):
             BENCH_LOG_FILE=os.devnull,  # Avoid a second copy of the phase log.
             GSM8K_DATA_PATH=str(datasets / "gsm8k/test.jsonl"),
             GSM8K_OUTPUT_DIR=str(directory),
+            MM_OUTPUT_FILE=str(directory / "multimodal.json"),
+            MM_IMAGE_URL=os.environ.get("MM_IMAGE_URL", ""),
         )
         if args.smoke:
             env.update(NUM_PROMPTS="2", WARMUP_REQUESTS="1", GSM8K_NUM_EXAMPLES="2")
@@ -468,12 +538,20 @@ def run_case(case, args, directory, row):
                     )
                 )
             phases.append(("accuracy", "run_gsm8k.sh", 7200))
+        # Reuse the same model process, after the existing text workloads.
+        phases.append(("multimodal", "run_multimodal_test.sh", 240))
         for phase, script, timeout in phases:
+            if phase == "multimodal":
+                row[phase] = {"status": "failed"}
             try:
                 run_phase(script, directory, env, server, timeout)
                 if phase == "accuracy":
                     row[phase] = validate_accuracy(directory / "gsm8k.json", args.smoke)
                     check_accuracy_gate(row[phase]["score"], baseline, args.smoke)
+                elif phase == "multimodal":
+                    row[phase] = validate_multimodal(
+                        directory / "multimodal.json", served_name
+                    )
                 elif phase == "pressure":
                     log = (directory / "run.sh.log").read_text(errors="replace")
                     failures = [
@@ -507,6 +585,15 @@ def run_case(case, args, directory, row):
                     )
             except Exception as exc:
                 row["errors"].append(f"{phase}: {exc}")
+    # managed_process has stopped the server and drained its log relay here.
+    # A successful image response alone could have used the PIL fallback.
+    if row.get("multimodal", {}).get("status") == "passed":
+        try:
+            check_rocjpeg_log(directory / "server.log")
+            row["multimodal"]["rocjpeg"] = "on"
+        except (OSError, ValueError) as exc:
+            row["multimodal"]["status"] = "failed"
+            row["errors"].append(f"multimodal: {exc}")
     if pressure:
         # Inspect the complete log after shutdown, including teardown failures.
         check_server_log(directory / "server.log")
@@ -519,14 +606,16 @@ def summary(output, rows, args, errors):
     text = f"## {title} — {'Failed' if failed else 'Passed'}\n\n"
     text += f"Cases passed: **{sum(row['status'] == 'passed' for row in rows)}/{len(rows)}**. "
     text += f"Coverage: {len(rows)}/6 selected cases. "
+    text += "Multimodal: assistant text and rocJPEG activation in server.log are required.\n\n"
     if pressure_only:
-        text += "Pressure only: request completion and final server-log checks are required.\n\n"
+        text += "Pressure: request completion, multimodal response, and final server-log checks are required.\n\n"
         if args.smoke:
             text += "Smoke is diagnostic: one two-request pressure round.\n\n"
-        text += "| Case | Status |\n|---|---|\n"
+        text += "| Case | Status | Multimodal |\n|---|---|---|\n"
         for row in rows:
             status = "passed" if row["status"] == "passed" else "failed"
-            text += f"| {row['case']} | {status} |\n"
+            mm_status = row.get("multimodal", {}).get("status", "not run")
+            text += f"| {row['case']} | {status} | {mm_status} |\n"
     else:
         text += (
             "Smoke is diagnostic: two examples; accuracy gate is disabled.\n\n"
@@ -538,8 +627,8 @@ def summary(output, rows, args, errors):
         )
     if not pressure_only:
         text += "Performance thresholds are advisory.\n\n"
-        text += "| Case | Status | GSM8K | Reference / minimum | Output tokens/s | QPS | TTFT (ms) | TPOT (ms) | Accept length |\n"
-        text += "|---|---|---:|---:|---:|---:|---:|---:|---:|\n"
+        text += "| Case | Status | GSM8K | Reference / minimum | Output tokens/s | QPS | TTFT (ms) | TPOT (ms) | Accept length | Multimodal |\n"
+        text += "|---|---|---:|---:|---:|---:|---:|---:|---:|---|\n"
         for row in rows:
             accuracy, perf = row.get("accuracy", {}), row.get("performance", {})
             score = f"{accuracy['score']:.2%}" if accuracy else "—"
@@ -557,7 +646,7 @@ def summary(output, rows, args, errors):
             text += (
                 f"| {row['case']} | {row['status']} | {score} | {row['baseline']:.2%} / {minimum:.2%} | "
                 + " | ".join(metrics)
-                + " |\n"
+                + f" | {row.get('multimodal', {}).get('status', 'not run')} |\n"
             )
     for error in errors + [
         f"{row['case']}: {e}" for row in rows for e in row["errors"]
@@ -629,6 +718,12 @@ def summarize_ci():
             result["errors"].extend(report["errors"])
             if report["failed"]:
                 result["status"] = "failed"
+            if result.get("multimodal", {}).get("status") != "passed":
+                result["status"] = "failed"
+                result["errors"].append("Missing or failed multimodal result")
+            elif result["multimodal"].get("rocjpeg") != "on":
+                result["status"] = "failed"
+                result["errors"].append("Missing rocJPEG activation confirmation")
             row = result
         except Exception as exc:
             row["status"] = "failed"
@@ -919,12 +1014,12 @@ def main():
     mode.add_argument(
         "--accuracy-only",
         action="store_true",
-        help="Run the GSM8K gate without the performance benchmark",
+        help="Run GSM8K and multimodal checks without the performance benchmark",
     )
     mode.add_argument(
         "--pressure",
         action="store_true",
-        help="Run only the daily concurrency pressure test and check the final server log",
+        help="Run daily pressure and multimodal checks, then check the final server log",
     )
     args = parser.parse_args()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit("Terminated"))

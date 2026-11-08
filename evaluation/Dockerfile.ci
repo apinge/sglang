@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=rocm/ali-private:ubuntu22.04_rocm7.14.0_cp310_torch2.12.0_sglang_d0a5b96_aiter_b7aed05_20261020
+ARG BASE_IMAGE=rocm/ali-private:ubuntu22.04_rocm7.14.0_cp310_torch2.12.0_sglang_4d63dea_aiter_514c166_20261105_v2
 FROM ${BASE_IMAGE}
 
 # Standalone concurrency client; add its missing packages without resolving or
