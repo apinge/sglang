@@ -32,7 +32,6 @@ import triton.language as tl
 from sglang.srt.layers.sdma_mori import get_mori_hub
 
 _HIP_IPC_LAZY_PEER = 0x1
-_MAX_CHUNKS = 64
 _TRANSPORTS = ("bf16", "fp8")
 _QUANT_GROUP = 32
 _GROUPS_PER_PROGRAM = 16
@@ -254,8 +253,8 @@ class SdmaReduceScatter:
     ) -> PendingReduceScatter:
         """Reduce-scatter `rows(r0, r1)` (this rank's partial sums of rows
         [r0, r1) < num_tokens) over the padded [world * local_rows] rows."""
-        if not 1 <= chunks <= _MAX_CHUNKS:
-            raise ValueError(f"chunks must be in [1, {_MAX_CHUNKS}], got {chunks}")
+        if chunks < 1:
+            raise ValueError(f"chunks must be >= 1, got {chunks}")
         self._sources[self._slot] = []
         bounds = [local_rows * j // chunks for j in range(chunks + 1)]
         local_chunks: List[Optional[torch.Tensor]] = [None] * chunks
