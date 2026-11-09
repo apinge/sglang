@@ -9,23 +9,24 @@
 # moves the weights over P2P/XGMI as it does within one container.
 #
 # Example (TP2, seed on GPU0-1 at port 7090, new instance on GPU2-3 at port 7091):
-#   IMAGE=<same image as the seed container> HOST_WORKSPACE=/raid/users/me \
+#   IMAGE=<same image as the seed container> \
 #   HIP_VISIBLE_DEVICES=2,3 TP_SIZE=2 PORT=7091 SEED_PORT=7090 \
 #     bash evaluation/launch_qwen38_flash_next_fp8_mi308x_rfork_cross_container.sh
 set -euo pipefail
 
 IMAGE="${IMAGE:?set IMAGE to the seed container image}"
-# Host directory mounted at /root/workspace in both containers; it holds this repo.
-HOST_WORKSPACE="${HOST_WORKSPACE:?set HOST_WORKSPACE to the host dir mounted at /root/workspace}"
 HOST_MODELS="${HOST_MODELS:-/models}"
 CONTAINER_NAME="${CONTAINER_NAME:-rfork-fork}"
-REPO_DIR="${REPO_DIR:-/root/workspace/sglang-rfork}"
+# SGLang checkout inside the new container; defaults to the image's own install.
+REPO_DIR="${REPO_DIR:-/opt/sglang}"
 # Packages the image lacks but the seed container has (e.g. a PyHIP source tree and
 # its dist-info dir); appended to PYTHONPATH.
 EXTRA_PYTHONPATH="${EXTRA_PYTHONPATH:-}"
 # Optional one-time setup inside the new container, run before the server starts
 # (e.g. restoring kernel caches or prebuilt aiter JIT modules the image does not ship).
 SETUP_CMD="${SETUP_CMD:-true}"
+# Extra docker run arguments, e.g. "-v <host checkout>:/src" together with REPO_DIR=/src.
+read -r -a docker_args <<< "${DOCKER_ARGS:-}"
 
 TP_SIZE="${TP_SIZE:-2}"
 PORT="${PORT:-7091}"
@@ -39,7 +40,7 @@ docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
 docker run -d --name="${CONTAINER_NAME}" \
   --privileged --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
   --network=host --ipc=host --device /dev/kfd --device /dev/dri \
-  -v "${HOST_MODELS}:/models" -v "${HOST_WORKSPACE}:/root/workspace" \
+  -v "${HOST_MODELS}:/models" "${docker_args[@]}" \
   -e PYTHONPATH="${pythonpath}" \
   -e MODE=rfork -e HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES}" \
   -e TP_SIZE="${TP_SIZE}" -e PORT="${PORT}" \
