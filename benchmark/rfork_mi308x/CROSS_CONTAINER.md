@@ -9,7 +9,7 @@ container; only the container setup differs.
 | Requirement | Setting | Why |
 |---|---|---|
 | Both containers on the host network | `--network=host` | Group setup and weight transfer requests go over TCP. With the same hostname, RCCL treats both sides as one node and uses P2P/XGMI instead of sockets |
-| Shared IPC namespace | `--ipc=host` | RCCL intra-node P2P and Mooncake's HIP transport exchange shared-memory/IPC handles |
+| Shared IPC namespace | `--ipc=host` | RCCL intra-node P2P exchanges shared-memory/IPC handles |
 | GPU access | `--privileged --device /dev/kfd --device /dev/dri` | Each container sees all GPUs; placement is done with `HIP_VISIBLE_DEVICES` or `--base-gpu-id` |
 | Same software in both containers | see below | The new container must run the same code and have the same caches as the seed container |
 
@@ -27,7 +27,7 @@ The new container must match the seed container's environment. Anything installe
 Seed, inside the existing container (TP2 on GPU0-1):
 ```bash
 HIP_VISIBLE_DEVICES=0,1 TP_SIZE=2 PORT=7090 MODE=seed \
-  bash scripts/launch_qwen38_flash_next_fp8_mi308x_fast_startup.sh
+  bash scripts/launch_qwen38_flash_next_fp8_mi308x_rfork.sh
 ```
 
 New instance, from the host (TP2 on GPU2-3). The script starts a container with the settings above and runs `MODE=rfork`:
@@ -36,7 +36,6 @@ IMAGE=<seed container image> HOST_WORKSPACE=<host dir mounted at /root/workspace
 HIP_VISIBLE_DEVICES=2,3 TP_SIZE=2 PORT=7091 SEED_PORT=7090 \
   bash scripts/launch_qwen38_flash_next_fp8_mi308x_rfork_cross_container.sh
 ```
-- Mooncake: set `RFORK_BACKEND=mooncake BASE_GPU_ID=2` instead of `HIP_VISIBLE_DEVICES`, and start the seed with `RFORK_BACKEND=mooncake BASE_GPU_ID=0`.
 - Packages the image lacks go in `EXTRA_PYTHONPATH`. One-time setup goes in `SETUP_CMD`, for example `tar -C /root -xf <kernel cache tar>; cp -n <dir>/*.so /opt/aiter/aiter/jit/`.
 
 Check that the transfer used P2P by starting the new instance with `NCCL_DEBUG=INFO`. The log should show `via P2P/IPC` and no `via NET`. To verify the weights, set `SGLANG_DEBUG_WEIGHT_CHECKSUM_DIR` on both instances and diff the per-rank files.
@@ -55,7 +54,7 @@ Single node, 8x MI308X. The seed ran in container A, which was already up. The n
 
 - The transfer itself took as long as within one container.
 - The extra ~4 s in load_weight came after the transfer. That run had `NCCL_DEBUG=INFO` enabled (5x more log lines) and the same-container runs did not; whether the debug logging explains the difference was not checked.
-- This is a single run. Mooncake across containers and the isolated case (bridge network, no `--ipc=host`) were not measured.
+- This is a single run. The isolated case (bridge network, no `--ipc=host`) was not measured.
 
 ## Caveat
 

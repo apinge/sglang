@@ -1,8 +1,8 @@
 """R-Fork correctness check for one TP size.
 
-Starts a disk-loaded seed (also a Mooncake seed), then an RCCL client and a Mooncake
-client in turn; compares every rank's per-tensor checksums (name, shape, dtype, byte
-checksum of all params and buffers) against the seed and runs full GSM8K on all three.
+Starts a disk-loaded seed, then an R-Fork instance that pulls its weights from the seed
+over RCCL; compares every rank's per-tensor checksums (name, shape, dtype, byte checksum
+of all params and buffers) against the seed and runs full GSM8K on both.
 Writes results.json, server logs and gsm8k logs under --out.
 
     python benchmark/rfork_mi308x/verify_rfork.py --tp 4 --seed-gpus 0,1,2,3 \
@@ -108,11 +108,7 @@ def main():
             gpus=g,
             port=port,
             args=extra,
-            env={
-                "MOONCAKE_PROTOCOL": "hip",
-                "SGLANG_DEBUG_WEIGHT_CHECKSUM_DIR": str(out / f"ck_{name}"),
-            },
-            all_visible=True,
+            env={"SGLANG_DEBUG_WEIGHT_CHECKSUM_DIR": str(out / f"ck_{name}")},
         )
         active.append(s)
         if s.ready_epoch is None:
@@ -121,15 +117,10 @@ def main():
         return s
 
     try:
-        launch(
-            "disk",
-            seed_gpus,
-            7090,
-            ["--remote-instance-weight-loader-start-seed-via-transfer-engine"],
-        )
+        launch("disk", seed_gpus, 7090, [])
         results["disk"] = {"gsm8k": gsm8k("disk", 7090, out)}
         save()
-        for name in ["rfork_nccl", "rfork_mooncake"]:
+        for name in ["rfork_nccl"]:
             extra = [
                 x.replace("{seed_port}", "7090").replace("{group_ports}", ports)
                 for x in CONFIGS[name][1]

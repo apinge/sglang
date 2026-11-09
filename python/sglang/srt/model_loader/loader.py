@@ -3254,7 +3254,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 model = _initialize_model(model_config, self.load_config, quant_config)
                 if (
                     load_config.remote_instance_weight_loader_backend
-                    != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
+                    == RemoteInstanceWeightLoaderBackend.NCCL
                 ):
                     # The seed sends post-processed tensors (repacked, requantized),
                     # so match its layout before the raw byte copy, as ShardedStateLoader does.
@@ -3448,7 +3448,6 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             logger.error(f"batch transfer failed, error: {ret}")
             return False
 
-        self._restore_derived_state(model)
         _post_load_weights(model)
 
         return True

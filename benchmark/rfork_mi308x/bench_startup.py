@@ -1,20 +1,22 @@
-"""Startup-time benchmark: launch the server under each optimization on/off combination
-and report per-phase timings (results.csv, summary.md, logs/ under --out).
+"""Startup-time benchmark for R-Fork scale-out: launch a new instance that loads from disk
+or pulls its weights from a running seed over RCCL, and report per-phase timings
+(results.csv, summary.md, logs/ under --out).
 
-The TP size is len(--gpus). R-Fork configs first start one seed on --seed-gpus and keep
-it until they are done; seed and client ranges must be contiguous, same size, disjoint.
+Configs: "disk" (default checkpoint loading) and "rfork_nccl" (R-Fork over RCCL). The TP
+size is len(--gpus). R-Fork runs first start one seed on --seed-gpus and keep it until
+they are done; seed and client GPU lists must have the same size and not overlap.
 
-    # TP4, everything, kernel cache warm, page cache warm and cold, 2 repeats
-    python benchmark/rfork_mi308x/bench_startup.py --prime --kernel-cache warm \
-        --repeat 2 --gpus 4,5,6,7 --seed-gpus 0,1,2,3 --out /tmp/startup_tp4
-    # TP2, selected configs
-    python benchmark/rfork_mi308x/bench_startup.py --configs disk,rfork_nccl \
-        --kernel-cache warm --page-cache warm --gpus 6,7 --seed-gpus 4,5 --out /tmp/tp2
+    # TP4, both configs, page cache warm and cold, 2 repeats
+    python benchmark/rfork_mi308x/bench_startup.py --prime --repeat 2 \
+        --gpus 4,5,6,7 --seed-gpus 0,1,2,3 --out /tmp/startup_tp4
+    # TP2, page cache warm only
+    python benchmark/rfork_mi308x/bench_startup.py --prime --page-cache warm \
+        --gpus 6,7 --seed-gpus 4,5 --out /tmp/tp2
     # rebuild summary.md from existing logs
     python benchmark/rfork_mi308x/bench_startup.py --reparse --out /tmp/startup_tp4
 
-Kernel cache: "warm" uses $HOME as is (run once beforehand to populate it, or pass
---prime); "cold" gives each run an empty HOME, so FlyDSL/comgr/triton caches start empty.
+Compiled-kernel caches in $HOME are used as is; run once beforehand or pass --prime so
+the first measured run does not pay for compilation.
 Page cache: before each run the model files are read in ("warm", >=99% resident) or
 dropped with posix_fadvise ("cold", <=1%); the run aborts if that state is not reached.
 R-Fork clients copy weights from the seed and read only config/tokenizer files, so
@@ -32,7 +34,6 @@ import signal
 import statistics
 import subprocess
 import sys
-import tempfile
 import time
 
 BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -47,21 +48,6 @@ from evict_model_cache import evict, resident_bytes  # noqa: E402
 # "{group_ports}" are filled in at launch time.
 CONFIGS = {
     "disk": ({}, [], "default loader (multi-thread safetensors, mmap)"),
-    "fastsafetensors": (
-        {},
-        [
-            "--load-format",
-            "fastsafetensors",
-            "--model-loader-extra-config",
-            '{"enable_gds": false}',
-        ],
-        "fastsafetensors, GDS off",
-    ),
-    "runai": (
-        {"RUNAI_STREAMER_FS_STRATEGY": "libaio_direct"},
-        ["--load-format", "runai_streamer"],
-        "runai streamer, libaio_direct",
-    ),
     "rfork_nccl": (
         {},
         [
@@ -77,20 +63,6 @@ CONFIGS = {
             "{group_ports}",
         ],
         "R-Fork from seed, RCCL",
-    ),
-    "rfork_mooncake": (
-        {"MOONCAKE_PROTOCOL": "hip"},
-        [
-            "--load-format",
-            "remote_instance",
-            "--remote-instance-weight-loader-backend",
-            "transfer_engine",
-            "--remote-instance-weight-loader-seed-instance-ip",
-            "127.0.0.1",
-            "--remote-instance-weight-loader-seed-instance-service-port",
-            "{seed_port}",
-        ],
-        "R-Fork from seed, Mooncake (hip)",
     ),
 }
 BASELINE = "disk"
@@ -145,9 +117,7 @@ def parse_phases(log_path, start_epoch, ready_epoch):
 
 
 class Server:
-    def __init__(
-        self, *, log_path, gpus, port, args, env, home=None, all_visible, timeout=1200
-    ):
+    def __init__(self, *, log_path, gpus, port, args, env, timeout=1200):
         assert_gpus_free(gpus)
         self.log_path = log_path
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -164,15 +134,8 @@ class Server:
             PORT=str(port),
             PYTHONPATH=os.path.join(REPO_DIR, "python"),
         )
-        if home is not None:
-            run_env["HOME"] = home
-        if all_visible:
-            # Mooncake HIP IPC needs the peer device visible; place by base id.
-            cmd = ["bash", LAUNCH_SCRIPT, "--base-gpu-id", str(gpus[0]), *args]
-        else:
-            # fastsafetensors puts rank r on cuda:r, ignoring --base-gpu-id.
-            run_env["HIP_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
-            cmd = ["bash", LAUNCH_SCRIPT, *args]
+        run_env["HIP_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
+        cmd = ["bash", LAUNCH_SCRIPT, *args]
         self.cmd = cmd
         self.start = time.time()
         self.proc = subprocess.Popen(
@@ -246,7 +209,7 @@ def prepare_page_cache(model_path, state):
         for f in files:
             evict(f)
     elif before < 0.999:
-        # O_DIRECT loaders (fastsafetensors, runai) leave the cache cold; read it back.
+        # Read the files in so the run starts with them resident.
         buf = bytearray(16 << 20)
         for f in files:
             with open(f, "rb", buffering=0) as fh:
@@ -265,7 +228,6 @@ def main():
     p.add_argument(
         "--configs", default=",".join(CONFIGS), help=f"subset of {list(CONFIGS)}"
     )
-    p.add_argument("--kernel-cache", default="warm,cold", help="warm,cold")
     p.add_argument("--page-cache", default="warm,cold", help="warm,cold")
     p.add_argument("--repeat", type=int, default=1)
     p.add_argument("--gpus", default="4,5,6,7")
@@ -305,21 +267,16 @@ def main():
     os.makedirs(a.out, exist_ok=True)
 
     if any(c.startswith("rfork") for c in configs):
-        # R-Fork places by --base-gpu-id with all GPUs visible, so ranges must be
-        # contiguous; ranks pair up one to one.
-        for g in (gpus, seed_gpus):
-            if g != list(range(g[0], g[0] + len(g))):
-                p.error(f"R-Fork needs contiguous GPU ids, got {g}")
+        # Seed and client ranks pair up one to one.
         if len(gpus) != len(seed_gpus) or set(gpus) & set(seed_gpus):
             p.error("--gpus and --seed-gpus must have the same size and not overlap")
 
     runs = []
     # Repeats outermost, so repeats of one config are not back to back.
     for r in range(a.repeat):
-        for kc in a.kernel_cache.split(","):
-            for pc in a.page_cache.split(","):
-                for name in configs:
-                    runs.append((name, kc, pc, r))
+        for pc in a.page_cache.split(","):
+            for name in configs:
+                runs.append((name, pc, r))
     # Seed-dependent runs last, so the seed occupies its GPUs only while needed.
     runs.sort(key=lambda x: x[0].startswith("rfork"))
 
@@ -328,7 +285,7 @@ def main():
         return
 
     if a.dry_run:
-        for name, kc, pc, r in runs:
+        for name, pc, r in runs:
             env, args, _ = CONFIGS[name]
             args = [
                 x.replace("{seed_port}", str(a.seed_port)).replace(
@@ -336,9 +293,7 @@ def main():
                 )
                 for x in args
             ]
-            print(
-                f"{name:16s} kernel={kc:4s} page={pc:4s} #{r}: {env} {' '.join(args)}"
-            )
+            print(f"{name:12s} page={pc:4s} #{r}: {env} {' '.join(args)}")
         return
 
     if a.prime:
@@ -349,7 +304,6 @@ def main():
             port=a.port,
             args=[],
             env={},
-            all_visible=False,
         )
         s.stop()
 
@@ -357,22 +311,16 @@ def main():
     results = []
     csv_path = os.path.join(a.out, "results.csv")
     try:
-        for name, kc, pc, r in runs:
+        for name, pc, r in runs:
             env, args, _ = CONFIGS[name]
             if name.startswith("rfork") and seed is None:
-                seed_args = []
-                if "rfork_mooncake" in configs:
-                    seed_args = [
-                        "--remote-instance-weight-loader-start-seed-via-transfer-engine"
-                    ]
                 print("starting seed ...", flush=True)
                 seed = Server(
                     log_path=f"{a.out}/logs/seed.log",
                     gpus=seed_gpus,
                     port=a.seed_port,
-                    args=seed_args,
-                    env={"MOONCAKE_PROTOCOL": "hip"},
-                    all_visible=True,
+                    args=[],
+                    env={},
                 )
                 if seed.ready_epoch is None:
                     print("seed failed to start, see seed.log; skipping R-Fork configs")
@@ -384,15 +332,10 @@ def main():
                 )
                 for x in args
             ]
-            tag = f"{name}_kc-{kc}_pc-{pc}_r{r}"
+            tag = f"{name}_pc-{pc}_r{r}"
             # For R-Fork this runs after the seed has loaded, so "cold" also drops the
             # pages the seed's load brought in.
             resident = prepare_page_cache(a.model_path, pc)
-            home = (
-                tempfile.mkdtemp(prefix="sglang_home_", dir=a.out)
-                if kc == "cold"
-                else None
-            )
             print(f"[{len(results) + 1}/{len(runs)}] {tag} ...", end=" ", flush=True)
             s = Server(
                 log_path=f"{a.out}/logs/{tag}.log",
@@ -400,12 +343,9 @@ def main():
                 port=a.port,
                 args=args,
                 env=env,
-                home=home,
-                all_visible=name.startswith("rfork"),
             )
             row = {
                 "config": name,
-                "kernel_cache": kc,
                 "page_cache": pc,
                 "repeat": r,
                 "ok": s.ready_epoch is not None,
@@ -452,7 +392,7 @@ def reparse(out):
         row["repeat"] = int(row["repeat"])
         if not row["ok"]:
             continue
-        tag = f"{row['config']}_kc-{row['kernel_cache']}_pc-{row['page_cache']}_r{row['repeat']}"
+        tag = f"{row['config']}_pc-{row['page_cache']}_r{row['repeat']}"
         log = os.path.join(out, "logs", f"{tag}.log")
         lines = open(log, errors="ignore").read().splitlines()
         first = next(t for l in lines if (t := _ts(l)) is not None).timestamp()
@@ -471,26 +411,24 @@ def write_summary(results, path):
     groups = {}
     for row in results:
         if row["ok"]:
-            groups.setdefault(
-                (row["config"], row["kernel_cache"], row["page_cache"]), []
-            ).append(row)
+            groups.setdefault((row["config"], row["page_cache"]), []).append(row)
     base = {
-        (kc, pc): statistics.mean(r["wall"] for r in rows)
-        for (c, kc, pc), rows in groups.items()
+        pc: statistics.mean(r["wall"] for r in rows)
+        for (c, pc), rows in groups.items()
         if c == BASELINE
     }
     lines = [
-        "| config | kernel cache | page cache | n | "
+        "| config | page cache | n | "
         + " | ".join(label for _, label in PHASES)
-        + " | vs disk (same caches) |",
-        "|" + "---|" * (len(PHASES) + 5),
+        + " | vs disk (same page cache) |",
+        "|" + "---|" * (len(PHASES) + 4),
     ]
-    for (c, kc, pc), rows in groups.items():
+    for (c, pc), rows in groups.items():
         means = [statistics.mean(r[k] for r in rows) for k, _ in PHASES]
-        ref = base.get((kc, pc))
+        ref = base.get(pc)
         delta = f"{means[0] - ref:+.1f} s" if ref is not None and c != BASELINE else "-"
         lines.append(
-            f"| {c} | {kc} | {pc} | {len(rows)} | "
+            f"| {c} | {pc} | {len(rows)} | "
             + " | ".join(f"{m:.1f}" for m in means)
             + f" | {delta} |"
         )
@@ -499,9 +437,7 @@ def write_summary(results, path):
         lines.append("")
         lines.append(
             "Failed runs: "
-            + ", ".join(
-                f"{r['config']}/{r['kernel_cache']}/{r['page_cache']}" for r in failed
-            )
+            + ", ".join(f"{r['config']}/{r['page_cache']}" for r in failed)
         )
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
