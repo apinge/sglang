@@ -8,12 +8,14 @@
 #               of reading the checkpoint; TP_SIZE and model must match the seed
 #
 # Examples (TP4, seed on GPU0-3, new instance on GPU4-7):
-#   HIP_VISIBLE_DEVICES=0,1,2,3 TP_SIZE=4 PORT=7090 MODE=seed bash <this script>
-#   HIP_VISIBLE_DEVICES=4,5,6,7 TP_SIZE=4 PORT=7091 MODE=rfork SEED_PORT=7090 bash <this script>
+#   HIP_VISIBLE_DEVICES=0,1,2,3 TP_SIZE=4 PORT=7090 MODE=seed bash evaluation/launch_qwen38_flash_next_fp8_mi308x_rfork.sh
+#   HIP_VISIBLE_DEVICES=4,5,6,7 TP_SIZE=4 PORT=7091 MODE=rfork SEED_PORT=7090 bash evaluation/launch_qwen38_flash_next_fp8_mi308x_rfork.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 MODE="${MODE:-seed}"
+# R-Fork is validated without the MTP draft model; the base launch script defaults MTP=1.
+export MTP="${MTP:-0}"
 TP_SIZE="${TP_SIZE:-2}"
 SEED_HOST="${SEED_HOST:-127.0.0.1}"
 SEED_PORT="${SEED_PORT:-7080}"

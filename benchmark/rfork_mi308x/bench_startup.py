@@ -39,7 +39,7 @@ import time
 BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.dirname(os.path.dirname(BENCH_DIR))
 LAUNCH_SCRIPT = os.path.join(
-    REPO_DIR, "scripts", "launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2.sh"
+    REPO_DIR, "evaluation", "launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2.sh"
 )
 sys.path.insert(0, BENCH_DIR)
 from evict_model_cache import evict, resident_bytes  # noqa: E402
@@ -134,6 +134,8 @@ class Server:
             PORT=str(port),
             PYTHONPATH=os.path.join(REPO_DIR, "python"),
         )
+        # R-Fork is validated without the MTP draft model; the launch script defaults MTP=1.
+        run_env.setdefault("MTP", "0")
         run_env["HIP_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
         cmd = ["bash", LAUNCH_SCRIPT, *args]
         self.cmd = cmd

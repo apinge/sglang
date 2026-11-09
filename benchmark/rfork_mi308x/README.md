@@ -1,5 +1,8 @@
 # R-Fork scale-out on MI308X (Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16)
 
+> Cherry-picked from PR #67 on `qwen38-flash-next-amd-current-fix-install`; the results below were measured on that
+> branch. On `qwen4_v0.5.21` the same-container TP2 path is covered by the Qwen4 CI case `Qwen3.8-Flash-TP2-RFork`.
+
 R-Fork (`--load-format remote_instance`) starts a new instance by copying the processed weights from a running
 instance (the seed) over RCCL, instead of reading and processing the checkpoint. This directory holds the scripts used
 to measure it, and the results on a single node with 8x MI308X (XGMI, ROCm 7.14).
@@ -46,9 +49,9 @@ Deployment requirements:
 ```bash
 export PYTHONPATH=<this repo>/python
 # seed (GPU0-3): an ordinary instance
-HIP_VISIBLE_DEVICES=0,1,2,3 TP_SIZE=4 PORT=7090 MODE=seed bash scripts/launch_qwen38_flash_next_fp8_mi308x_rfork.sh
+HIP_VISIBLE_DEVICES=0,1,2,3 TP_SIZE=4 PORT=7090 MODE=seed bash evaluation/launch_qwen38_flash_next_fp8_mi308x_rfork.sh
 # new instance (GPU4-7): pulls its weights from the seed
-HIP_VISIBLE_DEVICES=4,5,6,7 TP_SIZE=4 PORT=7091 MODE=rfork SEED_PORT=7090 bash scripts/launch_qwen38_flash_next_fp8_mi308x_rfork.sh
+HIP_VISIBLE_DEVICES=4,5,6,7 TP_SIZE=4 PORT=7091 MODE=rfork SEED_PORT=7090 bash evaluation/launch_qwen38_flash_next_fp8_mi308x_rfork.sh
 ```
 
 `MODE=rfork` adds these arguments to the regular launch command:
@@ -59,7 +62,7 @@ HIP_VISIBLE_DEVICES=4,5,6,7 TP_SIZE=4 PORT=7091 MODE=rfork SEED_PORT=7090 bash s
 ```
 
 For a new instance in its own container on the same node, see [CROSS_CONTAINER.md](CROSS_CONTAINER.md) and
-`scripts/launch_qwen38_flash_next_fp8_mi308x_rfork_cross_container.sh`.
+`evaluation/launch_qwen38_flash_next_fp8_mi308x_rfork_cross_container.sh`.
 
 The seed and the new instance are independent servers with their own ports. Put a load balancer or router in front if
 clients should see one address.

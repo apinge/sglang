@@ -4,14 +4,14 @@
 #
 # The seed is a normal instance started in its own container, e.g.
 #   HIP_VISIBLE_DEVICES=0,1 TP_SIZE=2 PORT=7090 MODE=seed \
-#     bash scripts/launch_qwen38_flash_next_fp8_mi308x_rfork.sh
+#     bash evaluation/launch_qwen38_flash_next_fp8_mi308x_rfork.sh
 # Both containers need --network=host --ipc=host and the GPU devices; with those, RCCL
 # moves the weights over P2P/XGMI as it does within one container.
 #
 # Example (TP2, seed on GPU0-1 at port 7090, new instance on GPU2-3 at port 7091):
 #   IMAGE=<same image as the seed container> HOST_WORKSPACE=/raid/users/me \
 #   HIP_VISIBLE_DEVICES=2,3 TP_SIZE=2 PORT=7091 SEED_PORT=7090 \
-#     bash scripts/launch_qwen38_flash_next_fp8_mi308x_rfork_cross_container.sh
+#     bash evaluation/launch_qwen38_flash_next_fp8_mi308x_rfork_cross_container.sh
 set -euo pipefail
 
 IMAGE="${IMAGE:?set IMAGE to the seed container image}"
@@ -32,7 +32,7 @@ PORT="${PORT:-7091}"
 SEED_HOST="${SEED_HOST:-127.0.0.1}"
 SEED_PORT="${SEED_PORT:-7090}"
 HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:?set HIP_VISIBLE_DEVICES to the new instance GPUs}"
-LOG_FILE="${LOG_FILE:-${REPO_DIR}/scripts/logs/rfork_cross_container_$(date -u +%Y%m%dT%H%M%SZ).log}"
+LOG_FILE="${LOG_FILE:-${REPO_DIR}/evaluation/logs/rfork_cross_container_$(date -u +%Y%m%dT%H%M%SZ).log}"
 
 pythonpath="${REPO_DIR}/python${EXTRA_PYTHONPATH:+:${EXTRA_PYTHONPATH}}"
 docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
@@ -46,7 +46,7 @@ docker run -d --name="${CONTAINER_NAME}" \
   -e SEED_HOST="${SEED_HOST}" -e SEED_PORT="${SEED_PORT}" \
   -e LOG_FILE="${LOG_FILE}" \
   --entrypoint /bin/bash "${IMAGE}" \
-  -c "set -e; ${SETUP_CMD}; cd ${REPO_DIR}; exec bash scripts/launch_qwen38_flash_next_fp8_mi308x_rfork.sh"
+  -c "set -e; ${SETUP_CMD}; cd ${REPO_DIR}; exec bash evaluation/launch_qwen38_flash_next_fp8_mi308x_rfork.sh"
 
 echo "Started ${CONTAINER_NAME}; server log: ${LOG_FILE} (inside the container)"
 echo "Follow with: docker logs -f ${CONTAINER_NAME}"

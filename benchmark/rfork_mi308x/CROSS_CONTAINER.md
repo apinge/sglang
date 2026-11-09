@@ -27,14 +27,14 @@ The new container must match the seed container's environment. Anything installe
 Seed, inside the existing container (TP2 on GPU0-1):
 ```bash
 HIP_VISIBLE_DEVICES=0,1 TP_SIZE=2 PORT=7090 MODE=seed \
-  bash scripts/launch_qwen38_flash_next_fp8_mi308x_rfork.sh
+  bash evaluation/launch_qwen38_flash_next_fp8_mi308x_rfork.sh
 ```
 
 New instance, from the host (TP2 on GPU2-3). The script starts a container with the settings above and runs `MODE=rfork`:
 ```bash
 IMAGE=<seed container image> HOST_WORKSPACE=<host dir mounted at /root/workspace> HOST_MODELS=<host model dir> \
 HIP_VISIBLE_DEVICES=2,3 TP_SIZE=2 PORT=7091 SEED_PORT=7090 \
-  bash scripts/launch_qwen38_flash_next_fp8_mi308x_rfork_cross_container.sh
+  bash evaluation/launch_qwen38_flash_next_fp8_mi308x_rfork_cross_container.sh
 ```
 - Packages the image lacks go in `EXTRA_PYTHONPATH`. One-time setup goes in `SETUP_CMD`, for example `tar -C /root -xf <kernel cache tar>; cp -n <dir>/*.so /opt/aiter/aiter/jit/`.
 
