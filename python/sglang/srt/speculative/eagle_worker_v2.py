@@ -21,7 +21,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGra
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
-from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+from sglang.srt.layers.attention.qsa.config import is_qwen_qsa, parse_qsa_profile
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QSAMTPSharedSparseIndices,
     QwenSparseAttnBackend,
@@ -820,13 +820,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         )
                         topk_p = torch.ones_like(topk_index, dtype=torch.float32)
                         forward_batch.positions.add_(1)
-                elif self.topk == 1:
-                    # ROCm keeps max()'s tie-break (#26358) without the vocab softmax.
-                    topk_index = torch.max(
-                        logits_output.next_token_logits, dim=-1, keepdim=True
-                    ).indices
-                    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
-                    forward_batch.positions.add_(1)
                 else:
                     probs = renorm_draft_probs(
                         logits_output.next_token_logits,
@@ -945,6 +938,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     rotated_mm[pt : pt + extend_len - 1].copy_(
                         mm_input_embeds[pt + 1 : pt + extend_len]
                     )
+                    # The draft overwrites each tail with its actual token embedding.
+                    # Initialize tails before publishing the shifted buffer.
+                    rotated_mm[pt + extend_len - 1 : pt + extend_len].zero_()
                 pt += extend_len
             assert pt == batch.input_ids.numel()
             batch.input_ids = new_input_ids
@@ -976,18 +972,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
-            if forward_batch.contains_mm_inputs():
-                forward_batch.mm_input_embeds = mm_input_embeds
-            elif mm_input_embeds.shape[0] == forward_batch.input_ids.shape[0]:
-                # Text-only target prompt embeddings (Qwen4Exp): move them onto
-                # the shifted draft ids; the draft model re-embeds the last row
-                # of every request (its tail token).
-                shifted = torch.empty_like(mm_input_embeds)
-                shifted[:-1].copy_(mm_input_embeds[1:])
-                # Initialize the final row before publishing; the draft replaces
-                # each request's tail with its actual token embedding.
-                shifted[-1:].zero_()
-                forward_batch.mm_input_embeds = shifted
+            forward_batch.mm_input_embeds = mm_input_embeds
 
         # Seed the first draft-decode loop from each request's last prefill
         # position. Gather last-per-req before the copy (prefill can be long).
@@ -1026,7 +1011,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-        if self.topk == 1 and _is_hip and not use_rejection_sampling:
+        if (
+            self.topk == 1
+            and _is_hip
+            and not use_rejection_sampling
+            and is_qwen_qsa(self.draft_runner.model_config.hf_config)
+        ):
             # ROCm keeps max()'s tie-break (#26358) without the vocab softmax.
             probs = None
             topk_index = torch.max(
@@ -1195,13 +1185,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_topk_index = torch.argmax(
                 draft_logits_output.next_token_logits, dim=-1, keepdim=True
             )
-            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
-            ret_draft_probs = None
-        elif self.topk == 1:
-            # ROCm keeps max()'s tie-break (#26358) without the vocab softmax.
-            ret_topk_index = torch.max(
-                draft_logits_output.next_token_logits, dim=-1, keepdim=True
-            ).indices
             ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
         else:

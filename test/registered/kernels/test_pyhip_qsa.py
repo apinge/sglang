@@ -208,7 +208,7 @@ class _AttentionPool:
 
 
 class TestPyHIPDispatchBoundaries(CustomTestCase):
-    def test_speculative_indexer_modes_without_mtp_optimizations(self):
+    def test_speculative_indexer_modes(self):
         from sglang.srt.layers.attention.qsa.pyhip_backend import PyHIPIndexer
 
         wrapper = PyHIPIndexer.__new__(PyHIPIndexer)
@@ -217,8 +217,8 @@ class TestPyHIPDispatchBoundaries(CustomTestCase):
             patch.object(wrapper, "_decode", return_value="pyhip") as decode,
         ):
             for mode, graph, expected in (
-                (ForwardMode.DRAFT_EXTEND_V2, False, None),
-                (ForwardMode.DRAFT_EXTEND_V2, True, None),
+                (ForwardMode.DRAFT_EXTEND_V2, False, "pyhip"),
+                (ForwardMode.DRAFT_EXTEND_V2, True, "pyhip"),
                 (ForwardMode.TARGET_VERIFY, False, None),
                 (ForwardMode.TARGET_VERIFY, True, "pyhip"),
                 (ForwardMode.DECODE, False, "pyhip"),
@@ -241,10 +241,36 @@ class TestPyHIPDispatchBoundaries(CustomTestCase):
                     else:
                         self.assertEqual(
                             decode.call_args.kwargs["verify"],
-                            mode == ForwardMode.TARGET_VERIFY,
+                            mode in (
+                                ForwardMode.TARGET_VERIFY,
+                                ForwardMode.DRAFT_EXTEND_V2,
+                            ),
                         )
 
-    def test_draft_worker_retains_native_prefill_attention(self):
+    def test_widened_draft_window_retains_native_indexer(self):
+        from sglang.srt.layers.attention.qsa.pyhip_backend import PyHIPIndexer
+
+        wrapper = PyHIPIndexer.__new__(PyHIPIndexer)
+        with patch.object(wrapper, "can_use_for_forward", return_value=True), patch.object(
+            wrapper, "_decode"
+        ) as decode:
+            for graph in (False, True):
+                result = wrapper.forward(
+                    indexer=None,
+                    hidden=None,
+                    positions=None,
+                    logical=None,
+                    batch=SimpleNamespace(
+                        forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+                        spec_info=SimpleNamespace(num_front_tokens=1),
+                    ),
+                    metadata=SimpleNamespace(is_cuda_graph=graph),
+                    state_slots=None,
+                )
+                self.assertIsNone(result)
+            decode.assert_not_called()
+
+    def test_draft_worker_uses_pyhip_prefill_attention(self):
         runner = SimpleNamespace(
             device="cuda",
             token_to_kv_pool=None,
@@ -268,8 +294,9 @@ class TestPyHIPDispatchBoundaries(CustomTestCase):
             attention.assert_called_once()
             attention.reset_mock()
             runner.is_draft_worker = True
-            self.assertIsNone(QwenSparseAttnBackend(runner)._pyhip_attention)
-            attention.assert_not_called()
+            self.assertIsNotNone(QwenSparseAttnBackend(runner)._pyhip_attention)
+            attention.assert_called_once()
+            attention.reset_mock()
             runner.is_draft_worker = False
             runner.device = "cpu"
             self.assertIsNone(QwenSparseAttnBackend(runner)._pyhip_attention)
@@ -970,7 +997,8 @@ class TestPyHIPQSA(CustomTestCase):
                         model_config=SimpleNamespace(
                             hf_text_config=_config(), context_len=4096
                         ),
-                        ps=SimpleNamespace(attn_cp_size=1, attn_dcp_size=1),
+                        attn_cp_size=1,
+                        attn_dcp_size=1,
                         kv_cache_dtype=torch.bfloat16,
                         is_draft_worker=True,
                     )

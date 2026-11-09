@@ -412,7 +412,6 @@ class PyHIPIndexer:
             #     1,000,000   250,000    977 KiB     2,147
             #     1,048,576   262,144      1 MiB     2,047
             and (rows * table.shape[1] * 16 + 512) * 4 < 2**31
-            and table.shape[1] * 16 <= 65536
             and lengths.dtype == torch.int32
             and lengths.shape == (rows,)
             and lengths.is_contiguous()

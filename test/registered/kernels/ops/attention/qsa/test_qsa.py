@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton_ck,
 )
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+    QSAMTPSharedSparseIndices,
     QwenSparseAttnBackend,
     QwenSparseMultiStepDraftBackend,
 )
@@ -1689,6 +1690,58 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
         extend_len=0,
         num_padding=0,
     )
+
+
+def test_prefill_extend_capture_anchors_last_row_per_request():
+    """The post-prefill draft extend (plain EXTEND, batch-major row mapping)
+    seeds the first decode loop; only each request's FINAL row is the seed,
+    and that exact row must be what the following MTP decode steps read."""
+    TOPK = 8
+    state = QSAMTPSharedSparseIndices(
+        layer_ids=[48], num_requests=8, token_topk=TOPK, tail_width=4, device="cpu"
+    )
+    backend = QwenSparseAttnBackend()
+    backend.set_mtp_shared_sparse_indices(state)
+    token_to_batch = torch.tensor([0, 0, 0, 1, 1], dtype=torch.int32)
+    req_pool_indices = torch.tensor([5, 2], dtype=torch.int32)
+    seqlens = torch.tensor([30, 31, 32, 40, 41], dtype=torch.int32)
+    backend.forward_metadata = SimpleNamespace(
+        indexer_metadata=SimpleNamespace(
+            is_cuda_graph=False,
+            get_token_to_batch_idx=lambda: token_to_batch,
+            get_seqlens_expanded=lambda: seqlens,
+            req_pool_indices=req_pool_indices,
+        )
+    )
+    topk = torch.arange(5 * TOPK, dtype=torch.int32).reshape(5, TOPK)
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        _original_forward_mode=None,
+        batch_size=2,
+        spec_info=SimpleNamespace(extend_seq_lens_tensor=None, num_accept_tokens=None),
+        extend_seq_lens=torch.tensor([3, 2], dtype=torch.int32),
+        req_pool_indices=req_pool_indices,
+    )
+    assert backend.should_capture_mtp_sparse_indices(forward_batch)
+    backend.capture_mtp_sparse_indices(topk, forward_batch, layer_id=48)
+
+    backend.forward_metadata = SimpleNamespace(
+        indexer_metadata=SimpleNamespace(
+            decode_logical_positions=None,
+            get_seqlens_expanded=lambda: torch.tensor([33, 42], dtype=torch.int32),
+            token_to_batch_idx_is_identity=True,
+        )
+    )
+    got = backend.lookup_mtp_sparse_indices(
+        SimpleNamespace(req_pool_indices=req_pool_indices), layer_id=48
+    )
+    assert torch.equal(got[0, :TOPK], topk[2])
+    assert torch.equal(got[1, :TOPK], topk[4])
+    # The tail appends exactly [captured_len, current_position]: request A
+    # captured at 32, now at 32 -> tail {32}; request B captured at 41, now
+    # at 41 -> tail {41}; the rest of the tail is -1 (dropped downstream).
+    assert got[0, TOPK:].tolist() == [32, -1, -1, -1]
+    assert got[1, TOPK:].tolist() == [41, -1, -1, -1]
 
 
 if __name__ == "__main__":
