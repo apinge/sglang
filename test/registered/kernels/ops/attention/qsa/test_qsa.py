@@ -33,6 +33,7 @@ from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
     QwenSparseMultiStepDraftBackend,
 )
+from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -547,6 +548,7 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
         )
         indexer = SimpleNamespace(
             layer_id=0,
+            _log_indexer_backend=False,
             project_qk=lambda hidden, rope_positions, **kwargs: (
                 hidden.reshape(-1, 1, 2),
                 hidden.reshape(-1, 1, 2),
@@ -600,6 +602,7 @@ def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
         qsa_backend_module, "sparse_gqa_fwd_interface_triton", fake_sparse_gqa
     )
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend._pyhip_attention = None
 
     class Pool:
         def set_kv_buffer(self, layer, loc, k, v):
@@ -817,6 +820,7 @@ def test_qsa_extend_rope_matrix_uses_mrope_coordinates():
         seq_lens_cpu=torch.tensor([num_tokens], dtype=torch.int32),
         forward_mode=ForwardMode.EXTEND,
         extend_seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
+        extend_seq_lens_cpu=[num_tokens],
         extend_prefix_lens=torch.zeros(1, dtype=torch.int32),
         positions=flat,
         mrope_positions=mrope,
@@ -969,6 +973,7 @@ class _DispatchIndexer:
     def __init__(self):
         self.selected = None
         self.logical_positions = None
+        self._log_indexer_backend = False
 
     @staticmethod
     def project_qk(hidden_states, positions, **kwargs):
@@ -1038,6 +1043,81 @@ class _ForwardMode:
 
     def is_decode(self):
         return self.decode
+
+
+class _RingIndexer:
+    """The real pending-ring store and group gather; the stand-in normalization adds
+    the group's RoPE start position to the averaged key so both are compared."""
+
+    layer_id = 3
+    compress_ratio = COMPRESS_RATIO
+    _pending_ring_slots = QSAIndexer._pending_ring_slots
+    _group_ring_slots = QSAIndexer._group_ring_slots
+    update_key_state_and_compress = QSAIndexer.update_key_state_and_compress
+
+    @staticmethod
+    def _use_fused_compress(pool):
+        return False
+
+    @staticmethod
+    def _rope_from_matrix(positions):
+        return positions[:, 0]
+
+    @staticmethod
+    def normalize_compressed_keys(values, positions):
+        return values + positions.to(values.dtype)[:, None, None]
+
+
+def _paged_index_step(indexer, pool, request, positions, keys):
+    """One eager paged forward (decode or verify rows) of a single request."""
+    logical = torch.tensor(positions)
+    ends = [p for p in positions if (p + 1) % COMPRESS_RATIO == 0]
+    metadata = QSAIndexerMetadata(
+        sequence_lengths=torch.tensor([positions[-1] + 1], dtype=torch.int32),
+        token_to_batch_idx=torch.zeros(len(positions), dtype=torch.int32),
+        token_slot_table=torch.zeros((1, 1), dtype=torch.int32),
+        out_cache_loc=torch.zeros(len(positions), dtype=torch.int64),
+        token_to_kv_pool=pool,
+        compress_ratio=COMPRESS_RATIO,
+        block_topk=BLOCK_TOPK,
+        req_pool_indices=torch.tensor([request]),
+        write_locs=torch.tensor(
+            [end // COMPRESS_RATIO + 1 for end in ends], dtype=torch.int32
+        ),
+        compress_group_positions=torch.tensor(ends, dtype=torch.long),
+        compress_sequence_ids=torch.zeros(len(ends), dtype=torch.long),
+    )
+    indexer.update_key_state_and_compress(keys[logical], logical, logical, metadata)
+
+
+@pytest.mark.parametrize("start", [64, 65, 66, 67])
+def test_qsa_target_verify_window_compresses_its_group_like_decode(start):
+    """A verify window stores all of its rows' keys before any row gathers its
+    group. When the group boundary is not the window's last row, the later rows
+    must not overwrite the members that precede the window: the window has to
+    write the same compressed key as one-token decode steps over the same keys.
+    """
+    torch.manual_seed(0)
+    keys = torch.randn(start + 4, 1, 128).to(torch.bfloat16)
+    window = list(range(start, start + 4))
+
+    def compressed(steps):
+        pool = QSATokenToKVPool.__new__(QSATokenToKVPool)
+        pool.full_attention_layer_id_mapping = {3: 0}
+        pool.qsa_key_state_buffer_pool = [torch.zeros(64, 1, 128, dtype=torch.bfloat16)]
+        pool.qsa_rope_position_buffer = torch.zeros(64, 3, dtype=torch.int64)
+        pool.qsa_compressed_k_buffer_pool = [
+            torch.zeros(32, 1, 128, dtype=torch.bfloat16)
+        ]
+        for position in range(start - start % COMPRESS_RATIO, start):
+            _paged_index_step(_RingIndexer(), pool, 2, [position], keys)
+        for rows in steps:
+            _paged_index_step(_RingIndexer(), pool, 2, rows, keys)
+        return pool.qsa_compressed_k_buffer_pool[0]
+
+    expected = compressed([[position] for position in window])
+    assert expected.abs().sum() > 0
+    torch.testing.assert_close(compressed([window]), expected, rtol=0, atol=0)
 
 
 def test_qsa_row_ranges_do_not_cross_sequences():
@@ -1548,3 +1628,37 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_non_hip_paged_dispatch_does_not_import_amd_kernel(monkeypatch):
+    import builtins
+
+    module = qsa_backend_module
+    backend = QwenSparseAttnBackend(
+        SimpleNamespace(
+            token_to_kv_pool=SimpleNamespace(
+                get_key_buffer=lambda _: None, get_value_buffer=lambda _: None
+            ),
+            req_to_token_pool=None,
+        )
+    )
+    monkeypatch.setattr(module, "is_hip", lambda: False)
+    monkeypatch.setattr(backend, "_resolve_metadata", lambda _: None)
+    sentinel = object()
+    monkeypatch.setattr(module, "_resolve_trtllm_sparse_decode", lambda: sentinel)
+    monkeypatch.setattr(backend, "_forward_trtllm_sparse", lambda *args: sentinel)
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        assert name != "sglang.srt.layers.attention.qsa.sparse_attn_decode"
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    output = backend._forward_paged_attention(
+        SimpleNamespace(is_cuda=True),
+        SimpleNamespace(layer_id=0),
+        None,
+        torch.zeros((1, 1), dtype=torch.int32),
+    )
+    assert output is sentinel
+    assert backend._paged_gqa_workspace is None

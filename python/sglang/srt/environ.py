@@ -316,6 +316,15 @@ class Envs:
     # sizes the KV pool. Cap its resident set; 0 disables the trim.
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
+    # Direct gfx942 compressed-QSA operators; unsupported layouts stay native.
+    SGLANG_USE_PYHIP_QSA = EnvBool(False)
+    # Numerical acceptance only; never enable for performance measurements.
+    SGLANG_TEST_PYHIP_QSA = EnvBool(False)
+    # Log actual QSA indexer dispatch once per layer, forward mode and backend.
+    SGLANG_LOG_QSA_INDEXER_BACKEND = EnvBool(False)
+    # Split long PyHIP QSA prefill indexer rows across attention-TP ranks,
+    # then all-gather the selections.
+    SGLANG_OPT_PYHIP_QSA_SPLIT_INDEXER = EnvBool(False)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
