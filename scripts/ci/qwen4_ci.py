@@ -280,6 +280,10 @@ def check_rocjpeg_log(path):
             "rocJPEG GPU decoding was not confirmed: expected "
             "'rocJPEG GPU JPEG decoding: on' in server.log"
         )
+    if "rocJPEG batch decode failed" in text:
+        raise ValueError("rocJPEG request batch fell back to PIL; see server.log")
+    if not re.search(r"rocJPEG request batch decoded: [1-9]\d* image\(s\)", text):
+        raise ValueError("rocJPEG request batch decoding was not confirmed in server.log")
 
 
 def validate_performance(path, prompts, output_tokens, speculative=False):
@@ -606,7 +610,7 @@ def summary(output, rows, args, errors):
     text = f"## {title} — {'Failed' if failed else 'Passed'}\n\n"
     text += f"Cases passed: **{sum(row['status'] == 'passed' for row in rows)}/{len(rows)}**. "
     text += f"Coverage: {len(rows)}/6 selected cases. "
-    text += "Multimodal: assistant text and rocJPEG activation in server.log are required.\n\n"
+    text += "Multimodal: assistant text, rocJPEG activation and successful request-batch decoding are required.\n\n"
     if pressure_only:
         text += "Pressure: request completion, multimodal response, and final server-log checks are required.\n\n"
         if args.smoke:

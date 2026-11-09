@@ -992,6 +992,7 @@ class BaseMultimodalProcessor(ABC):
             if modality == Modality.IMAGE:
                 if (
                     discard_alpha_channel
+                    and not cls.smart_rgb_conversion
                     and not isinstance(data, Image.Image)
                     and rocjpeg_decode_enabled(cls.gpu_image_decode)
                 ):

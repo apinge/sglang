@@ -193,6 +193,22 @@ class TestDeferredJpegLoading(CustomTestCase):
             image = self._load(_jpeg(), discard_alpha_channel=False)
         self.assertIsInstance(image, Image.Image)
 
+    def test_smart_rgb_keeps_exif_orientation_with_rocjpeg_enabled(self):
+        for orientation in range(1, 9):
+            with self.subTest(orientation=orientation):
+                exif = Image.Exif()
+                exif[274] = orientation
+                data = _jpeg(exif=exif)
+                reference = common.smart_to_rgb(Image.open(io.BytesIO(data)))
+                with (
+                    patch.object(_StubProcessor, "smart_rgb_conversion", True),
+                    patch.object(common, "is_cuda", return_value=False),
+                ):
+                    image = self._load(data)
+                self.assertIsInstance(image, Image.Image)
+                self.assertEqual(image.size, reference.size)
+                np.testing.assert_array_equal(np.asarray(image), np.asarray(reference))
+
 
 class TestDecodeDeferredJpegs(CustomTestCase):
     def test_one_batch_call_decodes_and_corrects_in_order(self):
@@ -211,9 +227,11 @@ class TestDecodeDeferredJpegs(CustomTestCase):
             patch.object(
                 rocjpeg_decoder, "bt709_to_bt601", side_effect=corrected
             ) as correct,
+            self.assertLogs(rocjpeg_decoder.logger, level="INFO") as logs,
         ):
             decode_deferred_jpegs(images)
 
+        self.assertIn("rocJPEG request batch decoded: 2 image(s)", logs.output[-1])
         decode.assert_called_once()
         encoded = decode.call_args.args[0]
         self.assertEqual([t.numpy().tobytes() for t in encoded], [first, second])
@@ -252,11 +270,28 @@ class TestDecodeDeferredJpegs(CustomTestCase):
                 decode_deferred_jpegs(images, color_correction=argument)
                 self.assertEqual(correct.called, expected)
 
-    def test_batch_failure_falls_back_to_pil(self):
+    def test_batch_failure_after_self_check_falls_back_without_success_signal(self):
         data = _jpeg()
         images = [DeferredJpeg(data)]
-        with patch("torchvision.io.decode_jpeg", side_effect=RuntimeError("failed")):
+        rocjpeg_decoder._rocjpeg_needs_correction.cache_clear()
+        self.addCleanup(rocjpeg_decoder._rocjpeg_needs_correction.cache_clear)
+
+        def decode(encoded, **kwargs):
+            if isinstance(encoded, list):
+                raise RuntimeError("injected batch failure")
+            return _pil_decode(encoded)
+
+        with (
+            patch("torchvision.io.decode_jpeg", side_effect=decode) as mocked,
+            self.assertLogs(rocjpeg_decoder.logger, level="INFO") as logs,
+        ):
+            self.assertIs(rocjpeg_decoder._rocjpeg_needs_correction(), False)
             decode_deferred_jpegs(images)
+        self.assertEqual(mocked.call_count, 2)
+        messages = "\n".join(logs.output)
+        self.assertIn("rocJPEG GPU JPEG decoding: on", messages)
+        self.assertIn("rocJPEG batch decode failed", messages)
+        self.assertNotIn("rocJPEG request batch decoded:", messages)
         self.assertIsInstance(images[0], Image.Image)
         reference = Image.open(io.BytesIO(data)).convert("RGB")
         np.testing.assert_array_equal(np.asarray(images[0]), np.asarray(reference))

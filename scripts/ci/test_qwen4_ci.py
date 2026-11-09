@@ -257,7 +257,7 @@ def test_rocjpeg_success_metric_is_not_a_server_fault(tmp_path, correction):
         f"[server] rocJPEG GPU JPEG decoding: on, color correction {correction} "
         "(mean abs error vs PIL 0.58)"
     )
-    path.write_text(message + "\n")
+    path.write_text(message + "\nrocJPEG request batch decoded: 1 image(s)\n")
     ci.check_rocjpeg_log(path)
     ci.check_server_log(path)
     path.write_text(message + "; GPU fault detected\n")
@@ -364,7 +364,9 @@ def test_multimodal_script_targets_case_and_propagates_http_errors(tmp_path, sta
 
 
 @pytest.mark.parametrize("valid", [True, False])
-@pytest.mark.parametrize("rocjpeg", ["on", "off", "missing"])
+@pytest.mark.parametrize(
+    "rocjpeg", ["on", "off", "missing", "self_check_only", "batch_fallback"]
+)
 def test_case_runs_multimodal_after_text_phases_and_gates_failure(
     tmp_path, monkeypatch, valid, rocjpeg
 ):
@@ -379,9 +381,16 @@ def test_case_runs_multimodal_after_text_phases_and_gates_failure(
         yield object()
         # Only available after the log relay drains, as in the real lifecycle.
         if rocjpeg != "missing":
-            log.write_text(
-                f"[server] rocJPEG GPU JPEG decoding: {rocjpeg}, color correction on\n"
+            activation = "off" if rocjpeg == "off" else "on"
+            message = (
+                f"[server] rocJPEG GPU JPEG decoding: {activation}, color correction on\n"
             )
+            if rocjpeg in ("on", "batch_fallback"):
+                message += "rocJPEG request batch decoded: 1 image(s)\n"
+            if rocjpeg == "batch_fallback":
+                # An earlier successful batch must not hide a later fallback.
+                message += "rocJPEG batch decode failed, decoding with PIL: injected\n"
+            log.write_text(message)
 
     monkeypatch.setattr(ci, "managed_process", managed_process)
     monkeypatch.setattr(ci, "wait_ready", lambda *args: {})
@@ -439,6 +448,10 @@ def test_case_runs_multimodal_after_text_phases_and_gates_failure(
         assert row["multimodal"]["rocjpeg"] == "on"
     elif valid and rocjpeg == "off":
         assert "rocJPEG GPU decoding was not confirmed" in row["errors"][0]
+    elif valid and rocjpeg == "self_check_only":
+        assert "request batch decoding was not confirmed" in row["errors"][0]
+    elif valid and rocjpeg == "batch_fallback":
+        assert "request batch fell back to PIL" in row["errors"][0]
     assert (
         json.loads((tmp_path / "launch.json").read_text())["env"][
             "SGLANG_ROCM_GPU_JPEG_DECODE"

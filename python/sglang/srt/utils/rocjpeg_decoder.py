@@ -166,7 +166,7 @@ def decode_deferred_jpegs(
     try:
         decoded = decode_jpeg(encoded, mode=ImageReadMode.RGB, device="cuda")
     except Exception as e:
-        logger.debug("rocJPEG batch decode failed, decoding with PIL: %s", e)
+        logger.warning("rocJPEG batch decode failed, decoding with PIL: %s", e)
         for i in indices:
             try:
                 image, _ = load_image(images[i].data, gpu_image_decode=False)
@@ -181,3 +181,4 @@ def decode_deferred_jpegs(
         color_correction = _rocjpeg_needs_correction()
     for i, image in zip(indices, decoded):
         images[i] = bt709_to_bt601(image) if color_correction else image
+    logger.info("rocJPEG request batch decoded: %d image(s)", len(indices))
