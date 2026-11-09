@@ -15,11 +15,12 @@
 set -euo pipefail
 
 IMAGE="${IMAGE:?set IMAGE to the seed container image}"
-# Host directory mounted at /root/workspace in both containers; it holds this repo.
+# Host directory mounted at /root/workspace in both containers.
 HOST_WORKSPACE="${HOST_WORKSPACE:?set HOST_WORKSPACE to the host dir mounted at /root/workspace}"
 HOST_MODELS="${HOST_MODELS:-/models}"
 CONTAINER_NAME="${CONTAINER_NAME:-rfork-fork}"
-REPO_DIR="${REPO_DIR:-/root/workspace/sglang-rfork}"
+# SGLang checkout inside the new container; defaults to the image's own install.
+REPO_DIR="${REPO_DIR:-/opt/sglang}"
 # Packages the image lacks but the seed container has (e.g. a PyHIP source tree and
 # its dist-info dir); appended to PYTHONPATH.
 EXTRA_PYTHONPATH="${EXTRA_PYTHONPATH:-}"
