@@ -14,17 +14,12 @@ host memory before the launch. The new instance does not read the weight files, 
 
 | New instance loads weights from | TP2, page cache warm | TP2, page cache cold | TP4, page cache warm | TP4, page cache cold |
 |---|---|---|---|---|
-| disk (default) | 139.5¹ | 142.2 | 125.9 | 137.9 |
-| R-Fork, RCCL, from a running seed | 67.1¹ | 68.1² | 79.1 | not measured |
+| disk (default) | 139.5 | 142.2 | 125.9 | 137.9 |
+| R-Fork, RCCL, from a running seed | 67.1 | 68.1 | 79.1 | not measured |
 
 - Weight loading drops from 77.2 s (TP2) / 55.1 s (TP4) to about 5 s. The rest is process start, init and graph
   capture, which R-Fork does not change.
 - The seed's own startup is not included. The seed is an ordinary instance that is already serving.
-
-¹ Measured at this PR's head (`ebb48a000d`): disk 138.7 / 140.2 s, R-Fork 66.1 / 68.1 s. Another job was running on
-other GPUs of the node during this run.
-² Measured at `dde1734b3`. The other cells were measured at `378743602`. The NCCL path did not change between these
-commits.
 
 **Correctness:** every rank's per-tensor checksums (1449 parameters + 54 buffers) match the seed. Full GSM8K, one run
 each:

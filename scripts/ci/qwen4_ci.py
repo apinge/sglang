@@ -93,6 +93,24 @@ CASES = [
 ]
 
 
+# Off the daily schedule, CI runs these only when selected explicitly: they take
+# four GPUs and check startup paths rather than serving accuracy or speed.
+DAILY_ONLY_CASES = {"Qwen3.8-Flash-TP2-RFork"}
+
+
+def matrix_cases(selected, event_name):
+    """Case IDs for the Actions matrix, in CASES order."""
+    ids = [case[0] for case in CASES]
+    unknown = selected - set(ids)
+    if unknown:
+        raise ValueError(f"Unknown cases: {', '.join(sorted(unknown))}")
+    if selected:
+        return [name for name in ids if name in selected]
+    return [
+        name for name in ids if event_name == "schedule" or name not in DAILY_ONLY_CASES
+    ]
+
+
 def write_json(path, value):
     Path(path).write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
 
@@ -530,24 +548,27 @@ def run_rfork_case(case, args, directory, row):
             }
             if seed.poll() is not None:
                 raise RuntimeError("Seed exited during the weight transfer")
-            if getattr(args, "pressure", False):
-                return
-            try:
-                run_phase(
-                    "run_gsm8k.sh",
-                    directory,
-                    client_environment(
-                        args, model_path, served_name, fork_port, directory
-                    ),
-                    fork,
-                    7200,
-                )
-                row["accuracy"] = validate_accuracy(
-                    directory / "gsm8k.json", args.smoke
-                )
-                check_accuracy_gate(row["accuracy"]["score"], baseline, args.smoke)
-            except Exception as exc:
-                row["errors"].append(f"accuracy: {exc}")
+            if not getattr(args, "pressure", False):
+                try:
+                    run_phase(
+                        "run_gsm8k.sh",
+                        directory,
+                        client_environment(
+                            args, model_path, served_name, fork_port, directory
+                        ),
+                        fork,
+                        7200,
+                    )
+                    row["accuracy"] = validate_accuracy(
+                        directory / "gsm8k.json", args.smoke
+                    )
+                    check_accuracy_gate(row["accuracy"]["score"], baseline, args.smoke)
+                except Exception as exc:
+                    row["errors"].append(f"accuracy: {exc}")
+    if getattr(args, "pressure", False):
+        # Inspect both complete logs after shutdown, like the other pressure cases.
+        check_server_log(directory / "seed.log")
+        check_server_log(directory / "server.log")
 
 
 def run_case(case, args, directory, row):

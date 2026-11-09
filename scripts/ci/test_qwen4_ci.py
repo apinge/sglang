@@ -262,3 +262,14 @@ def test_rfork_case_needs_a_seed_and_a_fork_worth_of_gpus(tmp_path):
     args = argparse.Namespace(models_root=tmp_path, gpus="0,1,2", port=7080)
     with pytest.raises(ValueError, match=f"requires {2 * case[2]} GPUs"):
         ci.run_case(case, args, tmp_path, {"errors": []})
+
+
+def test_daily_only_cases_run_on_schedule_or_when_selected():
+    ids = [case[0] for case in ci.CASES]
+    daily = ci.DAILY_ONLY_CASES
+    assert daily <= set(ids)
+    assert ci.matrix_cases(set(), "pull_request") == [i for i in ids if i not in daily]
+    assert ci.matrix_cases(set(), "schedule") == ids
+    assert ci.matrix_cases(set(daily), "pull_request") == [i for i in ids if i in daily]
+    with pytest.raises(ValueError, match="Unknown cases"):
+        ci.matrix_cases({"bogus"}, "schedule")
