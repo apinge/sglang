@@ -32,6 +32,7 @@ model="${MODEL_PATH:-/models/Qwen3.5-397B-A17B-PTPC-FP8}"
         --mem-fraction-static 0.9 \
         --max-prefill-tokens 32768 \
         --max-running-requests 128 \
+        --linear-attn-prefill-backend aiter \
         --attention-backend aiter \
         --mm-attention-backend aiter_attn \
         --kv-cache-dtype fp8_e4m3 \
@@ -40,7 +41,6 @@ model="${MODEL_PATH:-/models/Qwen3.5-397B-A17B-PTPC-FP8}"
         --disable-radix-cache  2>&1 | tee "${LOG_FILE:-launch_qwen3.5-397B-fp8_tp8_disable_prefix_cache.sh.log}"
         # --linear-attn-backend aiter \
         # --linear-attn-decode-backend aiter \
-        # --linear-attn-prefill-backend aiter \
         # --mamba-radix-cache-strategy extra_buffer \
         # --page-size 64  2>&1 | tee "${LOG_FILE:-launch_qwen3.5-397B-fp8_tp8_disable_prefix_cache.sh.log}"
 
