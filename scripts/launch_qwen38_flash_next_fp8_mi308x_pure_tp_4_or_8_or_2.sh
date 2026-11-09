@@ -117,9 +117,15 @@ export SGLANG_QWEN4_SP_SDMA_RS="${SGLANG_QWEN4_SP_SDMA_RS:-1}"
 export SGLANG_QWEN4_SP_SDMA_AG="${SGLANG_QWEN4_SP_SDMA_AG:-1}"
 export SGLANG_QWEN4_SP_SDMA_AG_MOE="${SGLANG_QWEN4_SP_SDMA_AG_MOE:-1}"
 export SGLANG_QWEN4_SP_SDMA_RS_TRANSPORT="${SGLANG_QWEN4_SP_SDMA_RS_TRANSPORT:-bf16}"
-# Optional tuning; unset picks the per-TP default measured on 12000-token prefills.
-# export SGLANG_QWEN4_SP_SDMA_RS_CHUNKS=2       # RS row chunks per owner block: 2 at TP2, 1 above
-# export SGLANG_QWEN4_SP_SDMA_AG_MOE_CHUNKS=4   # MoE input AG row ranges: 4 at TP2, 2 above
+# RS row chunks per owner block and MoE input AG row ranges; the per-TP defaults were
+# measured on 12000-token prefills and match qwen4_exp.py's _sdma_rs_chunks / _sdma_ag_moe_chunks.
+if (( TP_SIZE == 2 )); then
+  export SGLANG_QWEN4_SP_SDMA_RS_CHUNKS="${SGLANG_QWEN4_SP_SDMA_RS_CHUNKS:-2}"
+  export SGLANG_QWEN4_SP_SDMA_AG_MOE_CHUNKS="${SGLANG_QWEN4_SP_SDMA_AG_MOE_CHUNKS:-4}"
+else
+  export SGLANG_QWEN4_SP_SDMA_RS_CHUNKS="${SGLANG_QWEN4_SP_SDMA_RS_CHUNKS:-1}"
+  export SGLANG_QWEN4_SP_SDMA_AG_MOE_CHUNKS="${SGLANG_QWEN4_SP_SDMA_AG_MOE_CHUNKS:-2}"
+fi
 # mori posts the copies from the GPU (amd_mori, pinned in python/pyproject_other.toml);
 # without a usable mori the aiter collectives run, with a warning.
 export MORI_ENABLE_SDMA="${MORI_ENABLE_SDMA:-1}"
