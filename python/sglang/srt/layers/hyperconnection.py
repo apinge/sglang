@@ -125,7 +125,7 @@ class GatedResidual(HyperConnectionBase):
         self._gr_read_enabled = False
         self._gr_read_weights = None
         self._gr_read_fn = None
-        # Used only for logging and tracking the number of packaging runs in test statistics
+       # Used only for logging and tracking the number of packaging runs in test statistics
         self._gr_read_pack_count = 0
 
         norm_dim = (
@@ -181,12 +181,8 @@ class GatedResidual(HyperConnectionBase):
                 get_pyhip_ops()  # Fail before checkpoint loading if installation is missing.
                 self._gr_read_enabled = True
                 self.quant_method = PyHIPGRReadMethod()
-                self.input_mix_weight_down.weight.weight_loader = (
-                    self._load_gr_read_weight
-                )
-                self.input_mix_weight_up.weight.weight_loader = (
-                    self._load_gr_read_weight
-                )
+                self.input_mix_weight_down.weight.weight_loader = self._load_gr_read_weight
+                self.input_mix_weight_up.weight.weight_loader = self._load_gr_read_weight
 
         if use_combine:
             self.block_inject_weight = nn.Linear(
@@ -253,17 +249,13 @@ class GatedResidual(HyperConnectionBase):
 
     def _apply(self, fn, recurse=True):
         if self._gr_read_weights is not None:
-            raise RuntimeError(
-                "Moving packed PyHIP GR read weights requires a fresh model and graphs"
-            )
+            raise RuntimeError("Moving packed PyHIP GR read weights requires a fresh model and graphs")
         return super()._apply(fn, recurse=recurse)
 
     @torch.no_grad()
     def _load_gr_read_weight(self, param, loaded_weight):
         if self._gr_read_weights is not None:
-            raise RuntimeError(
-                "Reloading packed PyHIP GR read weights requires a fresh model and graphs"
-            )
+            raise RuntimeError("Reloading packed PyHIP GR read weights requires a fresh model and graphs")
         if param.shape != loaded_weight.shape:
             raise ValueError("GR checkpoint weight shape mismatch")
         param.copy_(loaded_weight)
