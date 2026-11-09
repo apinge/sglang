@@ -32,10 +32,11 @@ HIP_VISIBLE_DEVICES=0,1 TP_SIZE=2 PORT=7090 MODE=seed \
 
 New instance, from the host (TP2 on GPU2-3). The script starts a container with the settings above and runs `MODE=rfork`:
 ```bash
-IMAGE=<seed container image> HOST_WORKSPACE=<host dir mounted at /root/workspace> HOST_MODELS=<host model dir> \
+IMAGE=<seed container image> HOST_MODELS=<host model dir> \
 HIP_VISIBLE_DEVICES=2,3 TP_SIZE=2 PORT=7091 SEED_PORT=7090 \
   bash scripts/launch_qwen38_flash_next_fp8_mi308x_rfork_cross_container.sh
 ```
+- The new container runs the SGLang install at `REPO_DIR` (default `/opt/sglang`, the image's own). To run a checkout from the host instead, mount it with `DOCKER_ARGS="-v <host checkout>:/src"` and set `REPO_DIR=/src`.
 - Packages the image lacks go in `EXTRA_PYTHONPATH`. One-time setup goes in `SETUP_CMD`, for example `tar -C /root -xf <kernel cache tar>; cp -n <dir>/*.so /opt/aiter/aiter/jit/`.
 
 Check that the transfer used P2P by starting the new instance with `NCCL_DEBUG=INFO`. The log should show `via P2P/IPC` and no `via NET`. To verify the weights, set `SGLANG_DEBUG_WEIGHT_CHECKSUM_DIR` on both instances and diff the per-rank files.
