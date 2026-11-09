@@ -117,7 +117,7 @@ srt_hip = [
   "sglang[runtime_common]",
   "torch",
   "petit_kernel==0.0.2",
-  "pyhip @ git+https://github.com/tingqli/pyhip.git@5e45f9b3edb114222322174168d780daff77b1dd",
+  "pyhip @ git+https://github.com/tingqli/pyhip.git@8027faad29415747707670db7776528c6b72db81",
   "wave-lang==3.8.2",
 ]
 
@@ -127,7 +127,7 @@ srt_hip_rocm724 = [
   # torch<2.11, while 0.16.0 supports torch>=2.10.
   "compressed-tensors==0.16.0",
   "petit_kernel==0.0.2",
-  "pyhip @ git+https://github.com/tingqli/pyhip.git@5e45f9b3edb114222322174168d780daff77b1dd",
+  "pyhip @ git+https://github.com/tingqli/pyhip.git@8027faad29415747707670db7776528c6b72db81",
   "sglang[runtime_common]",
   "torch==2.11.0",
   "wave-lang==3.8.2",

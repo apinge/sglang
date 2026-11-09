@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Tuple
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.qsa import mqa
 from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
@@ -22,10 +25,21 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.utils import is_gfx942_supported
+
+logger = logging.getLogger(__name__)
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
+
+
+# Qwen3.8 Flash Next's direct PyHIP indexer is implemented for gfx942 only.
+# Per-forward input and metadata checks remain in PyHIPIndexer.
+_USE_PYHIP_QSA_INDEXER = (
+    envs.SGLANG_USE_PYHIP_QSA.get()
+    and is_gfx942_supported()
+)
 
 
 def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
@@ -80,6 +94,28 @@ class QSAIndexer(MultiPlatformOp):
             self.index_head_dim, eps=getattr(config, "rms_norm_eps", 1e-6)
         )
         self._rope_axis_map_cache = None
+        self._log_indexer_backend = envs.SGLANG_LOG_QSA_INDEXER_BACKEND.get()
+        self._logged_indexer_backends = set()
+        self._pyhip_indexer = None
+        if _USE_PYHIP_QSA_INDEXER:
+            from sglang.srt.layers.attention.qsa.pyhip_backend import PyHIPIndexer
+
+            self._pyhip_indexer = PyHIPIndexer.create(indexer=self)
+
+    def _log_backend_once(self, backend: str, forward_mode, rows: int) -> None:
+        if rows == 0:
+            return
+        key = (forward_mode, backend)
+        if key in self._logged_indexer_backends:
+            return
+        self._logged_indexer_backends.add(key)
+        logger.info(
+            "QSA indexer backend=%s layer=%s mode=%s rows=%s",
+            backend,
+            self.layer_id,
+            forward_mode.name,
+            rows,
+        )
 
     @staticmethod
     def _validate_config(config) -> None:
@@ -581,6 +617,20 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.compress_member_rows is not None,
             )
+        if hidden_states.is_cuda and self._pyhip_indexer is not None:
+            output = self._pyhip_indexer.forward(
+                indexer=self,
+                hidden=hidden_states,
+                positions=positions,
+                logical=logical_positions,
+                batch=forward_batch,
+                metadata=indexer_metadata,
+                state_slots=state_slots,
+            )
+            if output is not None:
+                if self._log_indexer_backend:
+                    self._log_backend_once("pyhip", forward_mode, num_valid_tokens)
+                return output
         q, token_k, state_stored = self.project_qk(
             hidden_states,
             positions,
@@ -605,7 +655,7 @@ class QSAIndexer(MultiPlatformOp):
             compressed_cache, page_table, compressed_lengths, max_model_len = (
                 indexer_metadata.get_decode_mqa_inputs(self.layer_id)
             )
-            return self.select_decode_tokens(
+            output = self.select_decode_tokens(
                 q,
                 compressed_cache,
                 page_table,
@@ -614,6 +664,10 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
             )
+            if self._log_indexer_backend:
+                backend = "tilelang" if q.is_cuda and mqa.HAS_TILELANG else "torch"
+                self._log_backend_once(backend, forward_mode, num_valid_tokens)
+            return output
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (
             indexer_metadata.get_prefill_mqa_inputs(self.layer_id, logical_positions)
@@ -622,7 +676,7 @@ class QSAIndexer(MultiPlatformOp):
         row_sequence_lengths = sequence_lengths.index_select(
             0, query_sequence_ids.long()
         )
-        return self.select_prefill_tokens(
+        output = self.select_prefill_tokens(
             q,
             compressed_keys,
             row_starts,
@@ -630,6 +684,10 @@ class QSAIndexer(MultiPlatformOp):
             logical_positions,
             row_sequence_lengths,
         )
+        if self._log_indexer_backend:
+            backend = "tilelang" if q.is_cuda and mqa.HAS_TILELANG else "torch"
+            self._log_backend_once(backend, forward_mode, num_valid_tokens)
+        return output
 
     def forward_cuda(
         self,
