@@ -90,9 +90,9 @@ class WeightExporter:
         group_port = ports_list[self.tp_rank]
         group_name = f"{group_name}_{group_port}_{self.tp_rank}"
 
-        if self._weights_send_group[group_name] is not None:
-            send_group = self._weights_send_group[group_name]
-        else:
+        # Missing when init failed on this rank (e.g. port in use); report instead of crashing the seed.
+        send_group = self._weights_send_group.get(group_name)
+        if send_group is None:
             message = f"Group {group_name} not in _weights_send_group list. Please call `init_weights_send_group_for_remote_instance` first."
             logger.error(message)
             return False, message
