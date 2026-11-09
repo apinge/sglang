@@ -28,7 +28,7 @@ def accuracy_result(tmp_path, score=0.97, examples=200):
 
 @pytest.mark.parametrize(
     "case,minimum_count",
-    zip(ci.CASES, (191, 192, 189, 189, 193, 192)),
+    zip(ci.CASES, (191, 192, 191, 189, 189, 193, 192)),
     ids=[case[0] for case in ci.CASES],
 )
 def test_accuracy_gate_preserves_each_baseline_and_rejects_the_next_lower_count(
@@ -226,3 +226,39 @@ def test_gpu_selection_skips_busy_devices_and_maps_to_host_indices(monkeypatch):
     assert ci.select_gpus({}, ["0", "2", "5", "7"], 1) == ["2"]
     with pytest.raises(RuntimeError, match="Need 4 idle GPUs.*idle: 2,7"):
         ci.select_gpus({}, ["0", "2", "5", "7"], 4)
+
+
+def write_checksums(directory, rows):
+    directory.mkdir()
+    for rank, lines in rows.items():
+        (directory / f"target_rank{rank}.tsv").write_text(
+            "".join("\t".join(line) + "\n" for line in lines)
+        )
+
+
+def test_rfork_weight_checksums_must_match_on_every_rank(tmp_path):
+    seed = [
+        ("param", "w", "(2, 2)", "torch.bfloat16", "cuda", "8:10:30"),
+        ("buffer", "b", "(2,)", "torch.float32", "cuda", "8:4:9"),
+    ]
+    write_checksums(tmp_path / "seed", {0: seed, 1: seed})
+    # The device column is not compared.
+    same = [line[:4] + ("cpu",) + line[5:] for line in seed]
+    write_checksums(tmp_path / "same", {0: same, 1: same})
+    assert ci.compare_weight_checksums(tmp_path / "seed", tmp_path / "same", 2) == 2
+    changed = [seed[0][:5] + ("8:10:31",), seed[1]]
+    write_checksums(tmp_path / "changed", {0: seed, 1: changed})
+    with pytest.raises(ValueError, match="rank 1: 1/2 differ"):
+        ci.compare_weight_checksums(tmp_path / "seed", tmp_path / "changed", 2)
+    write_checksums(tmp_path / "missing", {0: seed, 1: seed[:1]})
+    with pytest.raises(ValueError, match="rank 1: 1/2 differ"):
+        ci.compare_weight_checksums(tmp_path / "seed", tmp_path / "missing", 2)
+
+
+def test_rfork_case_needs_a_seed_and_a_fork_worth_of_gpus(tmp_path):
+    case = next(case for case in ci.CASES if case[3] == "rfork")
+    (tmp_path / case[1]).mkdir()
+    (tmp_path / case[1] / "config.json").write_text("{}")
+    args = argparse.Namespace(models_root=tmp_path, gpus="0,1,2", port=7080)
+    with pytest.raises(ValueError, match=f"requires {2 * case[2]} GPUs"):
+        ci.run_case(case, args, tmp_path, {"errors": []})

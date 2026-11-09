@@ -22,7 +22,7 @@ on:
         type: boolean
         default: false
       case:
-        description: 'Comma-separated case IDs; empty runs all six'
+        description: 'Comma-separated case IDs; empty runs all cases'
         type: string
   workflow_call:
     inputs:
