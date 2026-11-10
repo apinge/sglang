@@ -89,14 +89,16 @@ All of them act only with `SGLANG_QWEN4_SEQ_PARALLEL=1`.
 
 ### mori dependency
 
-| Component | Tested version | Why |
-|---|---|---|
-| ROCm | 7.14.0 | |
-| torch | 2.12.0+rocm7.14.0 | |
-| FlyDSL | 0.3.2 | mori's device API compiles the push / wait kernels with it |
-| mori | apinge/mori `qwen3.8-flash-sdma` | SDMA queues and engine-side completion signals |
-| libibverbs-dev | system package | build time only: mori's `setup.py` stops without the ibverbs headers |
-| PyHIP | `8027faa` | required by the base branch's QSA path, not by this feature |
+Everything except mori and the ibverbs headers comes with the ROCm 7.14 image; keep the image's versions.
+
+| Component | Version | Source | Why |
+|---|---|---|---|
+| ROCm (incl. `rocm_sysdeps` libdrm) | 7.14.0 | image | HIP runtime; the libdrm copy mori must share with it |
+| torch | 2.12.0+rocm7.14.0 | image | |
+| FlyDSL | 0.3.2 | image | mori's device API compiles the push / wait kernels with it |
+| libibverbs-dev | distro package | **install** | build time only: mori's `setup.py` stops without the ibverbs headers |
+| mori | apinge/mori `qwen3.8-flash-sdma` | **install** | SDMA queues and engine-side completion signals |
+| PyHIP | `8027faa` | base branch | required by the base branch's QSA path, not by this feature |
 
 mori is pinned in `python/pyproject_other.toml` (`srt_hip`, next to PyHIP) as
 `amd_mori @ git+https://github.com/apinge/mori.git@qwen3.8-flash-sdma`. The branch includes the MI308X
@@ -108,8 +110,9 @@ Install:
 # 1. ibverbs headers: not in the ROCm base image, needed only to build mori.
 apt-get update && apt-get install -y libibverbs-dev       # RHEL/Fedora: dnf install -y rdma-core-devel
 # 2. mori: pulled in by the srt_hip extras, or on its own into the current environment
-#    (add --target DIR and put DIR on PYTHONPATH to keep it separate).
-pip install --no-deps "amd_mori @ git+https://github.com/apinge/mori.git@qwen3.8-flash-sdma"
+#    (add --target DIR and put DIR on PYTHONPATH to keep it separate). Do not use the
+#    [flydsl] extra: it is unpinned and would replace the image's FlyDSL.
+pip install "amd_mori @ git+https://github.com/apinge/mori.git@qwen3.8-flash-sdma"
 ```
 
 The pip build uses mori's defaults (`BUILD_CCO_SDMA=ON`, local GPU arch); the built libraries do not link
@@ -120,8 +123,14 @@ libibverbs, so the package is not needed at run time. Runtime requirements, all 
   the HIP runtime its private copy, and two copies cannot share the GPU VM (mori's KFD setup would exit
   the process; sglang checks this and falls back before touching mori).
 
-Check: `python -c "import mori.cco, flydsl.compiler"` and look for `push_one_0` / `push_all_0` kernels in
-a prefill trace.
+Check, with the launch script's libdrm preload (without it, importing mori next to FlyDSL can crash):
+
+```bash
+LD_PRELOAD=/opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so.2:/opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so.1 \
+  python -c "import mori.cco, flydsl.compiler"
+```
+
+and look for `push_one_0` / `push_all_0` kernels in a prefill trace.
 
 | Script | What it measures |
 |---|---|
