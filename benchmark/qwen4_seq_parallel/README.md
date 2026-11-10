@@ -95,15 +95,25 @@ All of them act only with `SGLANG_QWEN4_SEQ_PARALLEL=1`.
 | torch | 2.12.0+rocm7.14.0 | |
 | FlyDSL | 0.3.2 | mori's device API compiles the push / wait kernels with it |
 | mori | apinge/mori `qwen3.8-flash-sdma` | SDMA queues and engine-side completion signals |
-| libibverbs-dev | system package, build time only | not in the base image; mori's `setup.py` stops without `/usr/include/infiniband/verbs.h`. Install it before `pip install` (`apt-get install -y libibverbs-dev`, or `dnf install -y rdma-core-devel`); `docker/rocm.Dockerfile` and `scripts/ci/amd/amd_ci_install_dependency.sh` install it. The built libraries do not link it. |
+| libibverbs-dev | system package | build time only: mori's `setup.py` stops without the ibverbs headers |
 | PyHIP | `8027faa` | required by the base branch's QSA path, not by this feature |
 
 mori is pinned in `python/pyproject_other.toml` (`srt_hip`, next to PyHIP) as
 `amd_mori @ git+https://github.com/apinge/mori.git@qwen3.8-flash-sdma`. The branch includes the MI308X
-SDMA engine spread (without it, two of a GPU's xGMI links can share one SDMA engine at TP4). A plain pip
-install uses mori's defaults (`BUILD_CCO_SDMA=ON`, local GPU arch); to install elsewhere, use
-`pip install --no-deps --target DIR "amd_mori @ git+https://github.com/apinge/mori.git@qwen3.8-flash-sdma"` and
-add `DIR` to `PYTHONPATH`. Runtime requirements, all set by the MI308X launch script:
+SDMA engine spread (without it, two of a GPU's xGMI links can share one SDMA engine at TP4).
+
+Install:
+
+```bash
+# 1. ibverbs headers: not in the ROCm base image, needed only to build mori.
+apt-get update && apt-get install -y libibverbs-dev       # RHEL/Fedora: dnf install -y rdma-core-devel
+# 2. mori: pulled in by the srt_hip extras, or on its own into the current environment
+#    (add --target DIR and put DIR on PYTHONPATH to keep it separate).
+pip install --no-deps "amd_mori @ git+https://github.com/apinge/mori.git@qwen3.8-flash-sdma"
+```
+
+The pip build uses mori's defaults (`BUILD_CCO_SDMA=ON`, local GPU arch); the built libraries do not link
+libibverbs, so the package is not needed at run time. Runtime requirements, all set by the MI308X launch script:
 
 - `MORI_ENABLE_SDMA=1`, `MORI_SOCKET_IFNAME=lo`.
 - `LD_PRELOAD` of ROCm's `rocm_sysdeps/lib/librocm_sysdeps_drm{,_amdgpu}`: mori links the system libdrm,
