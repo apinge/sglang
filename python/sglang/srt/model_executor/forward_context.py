@@ -23,8 +23,8 @@ worker threads ever share a process, migrate to contextvars.ContextVar.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -38,12 +38,13 @@ class ForwardContext:
     write time — use dataclasses.replace for per-call overrides."""
 
     attn_backend: AttentionBackend
+    comm_phase: str | None = None
 
 
-_current: Optional[ForwardContext] = None
+_current: ForwardContext | None = None
 
 
-def set_forward_context(ctx: Optional[ForwardContext]) -> Optional[ForwardContext]:
+def set_forward_context(ctx: ForwardContext | None) -> ForwardContext | None:
     """Set the active context; return the previous one for explicit
     save/restore. Prefer the forward_context() context manager."""
     global _current
@@ -75,8 +76,27 @@ def get_req_to_token_pool() -> ReqToTokenPool:
     return get_attn_backend().req_to_token_pool
 
 
+def get_communication_phase() -> str | None:
+    return _current.comm_phase if _current is not None else None
+
+
+def communication_phase_for_mode(mode) -> str:
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    if mode in (ForwardMode.EXTEND, ForwardMode.SPLIT_PREFILL):
+        return "prefill"
+    if mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY, ForwardMode.IDLE):
+        return "decode"
+    return "unsupported"
+
+
 @contextmanager
-def forward_context(ctx: ForwardContext):
+def forward_context(ctx: ForwardContext, *, forward_mode=None):
+    if forward_mode is not None:
+        ctx = replace(ctx, comm_phase=communication_phase_for_mode(forward_mode))
+    elif ctx.comm_phase is None and _current is not None:
+        # Backend-only overrides (PDmux, etc.) retain the current phase.
+        ctx = replace(ctx, comm_phase=_current.comm_phase)
     prev = set_forward_context(ctx)
     try:
         yield
