@@ -169,6 +169,19 @@ Target model: [sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16](https://huggin
 ./launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2.sh
 ```
 
+The script enables the sequence-parallel hyper-connection residual for prefills of at least 2048 tokens, with its
+reduce-scatter and all-gathers overlapped with compute over SDMA through mori (see
+`benchmark/qwen4_seq_parallel/README.md`). mori is not in the base image:
+
+```bash
+apt-get update && apt-get install -y libibverbs-dev   # build-time only
+pip install "amd_mori @ git+https://github.com/apinge/mori.git@qwen3.8-flash-sdma"
+```
+
+Without mori the aiter collectives run, with a warning. `SGLANG_QWEN4_SP_SDMA_RS=0`, `SGLANG_QWEN4_SP_SDMA_AG=0` and
+`SGLANG_QWEN4_SP_SDMA_AG_MOE=0` keep the corresponding collective on aiter; `SGLANG_QWEN4_SEQ_PARALLEL=0` restores
+the all-reduce.
+
 
 
 ### Run benchmark
@@ -232,6 +245,7 @@ python3 -m sglang.benchmark.serving \
 <summary>Qwen 3.5 & Qwen 3.8 CI Overview</summary>
 ### PR test:
 - CI runs each selected case in its own GitHub Actions matrix job using `evaluation/Dockerfile.ci` and the existing launch, benchmark, and `run_gsm8k.sh` scripts.
+- `evaluation/Dockerfile.ci` adds `libibverbs-dev` and mori to the base image, so the Qwen3.8 TP2 cases run with the launch script's sequence-parallel prefill over SDMA.
 - Non-draft fork PRs require the `run-qwen4-ci` label to run GPU cases. Adding the label triggers a new run through the `labeled` event.
 - Case jobs run serially on the shared host, each with its own image container, console logs, and result artifact. Docker builds reuse cached layers.
 - CI skips Docker registry login and requires the configured base image (`QWEN4_BASE_IMAGE`, or the workflow default) in each GPU runner's Docker image store. A missing image fails the case before the build. The default Docker builder uses the cached image with `--pull=false`, and case containers use `--pull=never`.

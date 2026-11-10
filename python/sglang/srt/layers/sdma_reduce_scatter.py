@@ -428,8 +428,10 @@ class PendingAllGather:
             if i > 0:
                 self._wait_block(src)
             if r1 > r0:
-                yield r0, r1, (
-                    self.local[: r1 - r0] if i == 0 else self.gathered[r0:r1]
+                yield (
+                    r0,
+                    r1,
+                    (self.local[: r1 - r0] if i == 0 else self.gathered[r0:r1]),
                 )
             if i == 0:
                 # Pushes read this rank's slot of `gathered`, not `local`; drop it
