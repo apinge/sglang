@@ -125,7 +125,7 @@ class PendingReduceScatter:
         self,
         *,
         carrier: torch.Tensor,
-        local_chunks: List[torch.Tensor],
+        local_chunks: List[Optional[torch.Tensor]],
         recv_records: torch.Tensor,
         rec_bytes: int,
         fp8: bool,
@@ -154,6 +154,9 @@ class PendingReduceScatter:
             out = torch.empty_like(local)
             if r1 > r0:
                 self._reduce_into(local, r0, out)
+            # The model keeps this handle on its carrier tensor (a reference
+            # cycle), so drop each projection chunk as soon as it is reduced.
+            self._local_chunks[j] = None
             yield r0, r1, out
 
     def result(self) -> torch.Tensor:
@@ -428,6 +431,10 @@ class PendingAllGather:
                 yield r0, r1, (
                     self.local[: r1 - r0] if i == 0 else self.gathered[r0:r1]
                 )
+            if i == 0:
+                # Pushes read this rank's slot of `gathered`, not `local`; drop it
+                # since the model keeps this handle on its carrier tensor.
+                self.local = None
         self._waited = True
 
     def wait_all(self) -> torch.Tensor:

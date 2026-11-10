@@ -240,6 +240,9 @@ class MoriSdmaHub:
         reqs.gda_counter_count = 0
         reqs.sdma_queue_count = 1
         self._dev_comm = self._comm.create_dev_comm(reqs)
+        # 0 when mori was built without BUILD_CCO_SDMA or no peer has SDMA; puts
+        # on such a communicator move no bytes, so waits would never return.
+        self.sdma_queues = self._dev_comm.sdma_num_queue
         (
             self._flyc,
             self._fx,
@@ -295,6 +298,7 @@ class MoriSdmaHub:
 
 
 _HUB: Optional[MoriSdmaHub] = None
+_GROUP_USABLE: Optional[bool] = None
 
 
 def get_mori_hub(cpu_group: dist.ProcessGroup, device: torch.device) -> MoriSdmaHub:
@@ -303,3 +307,33 @@ def get_mori_hub(cpu_group: dist.ProcessGroup, device: torch.device) -> MoriSdma
     if _HUB is None:
         _HUB = MoriSdmaHub(cpu_group, device)
     return _HUB
+
+
+def sdma_group_usable(cpu_group: dist.ProcessGroup, device: torch.device) -> bool:
+    """Whether the SDMA collectives can run over this group; the first call is
+    collective over the group and warns once when they cannot."""
+    global _GROUP_USABLE
+    if _GROUP_USABLE is None:
+        reason = _group_unusable_reason(cpu_group, device)
+        if reason is not None:
+            logger.warning(
+                "SP SDMA overlap disabled (%s); using the aiter reduce-scatter / all-gather",
+                reason,
+            )
+        _GROUP_USABLE = reason is None
+    return _GROUP_USABLE
+
+
+def _group_unusable_reason(
+    cpu_group: dist.ProcessGroup, device: torch.device
+) -> Optional[str]:
+    from sglang.srt.distributed.parallel_state import in_the_same_node_as
+
+    # The SDMA destinations are HIP IPC buffers, which map only within one node.
+    if not all(in_the_same_node_as(cpu_group, source_rank=0)):
+        return "the group spans nodes"
+    queues = torch.tensor([get_mori_hub(cpu_group, device).sdma_queues])
+    dist.all_reduce(queues, op=dist.ReduceOp.MIN, group=cpu_group)
+    if queues.item() < 1:
+        return "mori set up no SDMA queue (built without BUILD_CCO_SDMA?)"
+    return None

@@ -46,7 +46,7 @@ from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scat
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
-from sglang.srt.layers.sdma_mori import sdma_available
+from sglang.srt.layers.sdma_mori import sdma_available, sdma_group_usable
 from sglang.srt.layers.sdma_reduce_scatter import (
     PendingAllGather,
     PendingReduceScatter,
@@ -74,8 +74,7 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5LinearDecoderLayer,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
-from sglang.srt.runtime_context import get_forward, get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_forward, get_parallel, get_schedule
 from sglang.srt.utils import is_hip, logger
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
@@ -1260,13 +1259,21 @@ class Qwen4ExpPLELayer(nn.Module):
         return _pad_token_rows(output, batch.physical_tokens)
 
 
+def _sdma_usable() -> bool:
+    return sdma_available() and sdma_group_usable(
+        get_attn_tp_group().cpu_group,
+        torch.device("cuda", torch.cuda.current_device()),
+    )
+
+
 def _sdma_reduce_scatter_for(
     plan: SeqParallelPlan, *, hidden_size: int, dtype: torch.dtype
 ) -> Optional[SdmaReduceScatter]:
-    if not sdma_available():
+    # The SDMA reduce sums bf16 rows; other dtypes keep the aiter reduce-scatter.
+    if dtype != torch.bfloat16 or not _sdma_usable():
         return None
     rs = get_sdma_reduce_scatter(
-        capacity_tokens=get_global_server_args().max_prefill_tokens,
+        capacity_tokens=get_schedule().max_prefill_tokens,
         hidden_size=hidden_size,
         dtype=dtype,
         cpu_group=get_attn_tp_group().cpu_group,
@@ -1381,7 +1388,10 @@ def _install_sp_sdma_proj(layer: nn.Module, proj: nn.Module) -> None:
         )
         if rs is None:
             return plain_forward(x)
-        rows = lambda r0, r1: plain_forward(x[r0:r1])[0]
+
+        def rows(r0: int, r1: int) -> torch.Tensor:
+            return plain_forward(x[r0:r1])[0]
+
         return _send_sdma_reduce_scatter(rs, plan, rows), None
 
     proj.forward = forward
@@ -1390,10 +1400,10 @@ def _install_sp_sdma_proj(layer: nn.Module, proj: nn.Module) -> None:
 def _sdma_all_gather_for(
     plan: SeqParallelPlan, *, hidden_size: int, dtype: torch.dtype
 ) -> Optional[SdmaAllGather]:
-    if not sdma_available():
+    if not _sdma_usable():
         return None
     ag = get_sdma_all_gather(
-        capacity_tokens=get_global_server_args().max_prefill_tokens,
+        capacity_tokens=get_schedule().max_prefill_tokens,
         hidden_size=hidden_size,
         dtype=dtype,
         cpu_group=get_attn_tp_group().cpu_group,
