@@ -32,7 +32,7 @@ def accuracy_result(tmp_path, score=0.97, examples=200):
 
 @pytest.mark.parametrize(
     "case,minimum_count",
-    zip(ci.CASES, (191, 192, 189, 189, 193, 192)),
+    zip(ci.CASES, (191, 192, 191, 189, 189, 193, 192)),
     ids=[case[0] for case in ci.CASES],
 )
 def test_accuracy_gate_preserves_each_baseline_and_rejects_the_next_lower_count(
@@ -154,6 +154,10 @@ def test_accuracy_regression_fails_the_run_and_reports_remaining_cases(
 
 
 @pytest.mark.parametrize(
+    "case_id", ["Qwen3.8-Flash-TP2-Base", "Qwen3.8-Flash-TP2-RFork"]
+)
+@pytest.mark.parametrize("pressure", [False, True])
+@pytest.mark.parametrize(
     "execution_attempt,conclusion,has_report,has_multimodal,has_rocjpeg",
     [
         (2, "success", True, True, True),
@@ -167,13 +171,17 @@ def test_accuracy_regression_fails_the_run_and_reports_remaining_cases(
 def test_summary_uses_actual_execution_and_keeps_latest_conclusion(
     tmp_path,
     monkeypatch,
+    case_id,
+    pressure,
     execution_attempt,
     conclusion,
     has_report,
     has_multimodal,
     has_rocjpeg,
 ):
-    case, baseline = ci.CASES[0][0], ci.CASES[0][5]
+    definition = next(case for case in ci.CASES if case[0] == case_id)
+    case, baseline = definition[0], definition[5]
+    is_rfork = definition[3] == "rfork"
     original = {
         "name": f"Qwen4 ({case})",
         "run_attempt": 2,
@@ -195,6 +203,7 @@ def test_summary_uses_actual_execution_and_keeps_latest_conclusion(
         "CASE_MATRIX": json.dumps({"case": [case]}),
         "VALIDATION_RESULT": "success",
         "CASES_RESULT": "success",
+        "DAILY_PRESSURE": "true" if pressure else "false",
     }.items():
         monkeypatch.setenv(key, value)
     for attempt, score in [(2, 0.98)] + (
@@ -214,12 +223,20 @@ def test_summary_uses_actual_execution_and_keeps_latest_conclusion(
             errors=[],
             accuracy={"score": score},
         )
-        if has_multimodal:
+        if is_rfork:
+            row["rfork"] = {
+                "startup_s": 71.1,
+                "load_weight_s": 13.02,
+                "tensors_per_rank": 1504,
+            }
+        elif has_multimodal:
             row["multimodal"] = {"status": "passed", "completion_tokens": 10}
             if has_rocjpeg:
                 row["multimodal"]["rocjpeg"] = "on"
-        ci.summary(directory, [row], argparse.Namespace(smoke=False), [])
-    passed = conclusion == "success" and has_multimodal and has_rocjpeg
+        ci.summary(
+            directory, [row], argparse.Namespace(smoke=False, pressure=pressure), []
+        )
+    passed = conclusion == "success" and (is_rfork or (has_multimodal and has_rocjpeg))
     assert ci.summarize_ci() == (not passed)
     row = json.loads((tmp_path / "qwen4-summary/summary.json").read_text())["cases"][0]
     assert row["status"] == ("passed" if passed else "failed")
@@ -228,10 +245,16 @@ def test_summary_uses_actual_execution_and_keeps_latest_conclusion(
     else:
         assert "accuracy" not in row
         assert "qwen4-results-" + case + "-6" in row["errors"][0]
-    if has_report and not has_multimodal:
+    if has_report and not is_rfork and not has_multimodal:
         assert "Missing or failed multimodal result" in row["errors"]
-    if has_report and has_multimodal and not has_rocjpeg:
+    if has_report and not is_rfork and has_multimodal and not has_rocjpeg:
         assert "Missing rocJPEG activation confirmation" in row["errors"]
+    rendered = (tmp_path / "qwen4-summary/summary.md").read_text()
+    assert f"Coverage: 1/{len(ci.CASES)}" in rendered
+    if is_rfork:
+        assert "not applicable" in rendered
+        if has_report:
+            assert "1504 tensors per rank match the seed" in rendered
 
 
 def multimodal_response(model="test-model", content="The image shows a triangle."):
@@ -382,9 +405,7 @@ def test_case_runs_multimodal_after_text_phases_and_gates_failure(
         # Only available after the log relay drains, as in the real lifecycle.
         if rocjpeg != "missing":
             activation = "off" if rocjpeg == "off" else "on"
-            message = (
-                f"[server] rocJPEG GPU JPEG decoding: {activation}, color correction on\n"
-            )
+            message = f"[server] rocJPEG GPU JPEG decoding: {activation}, color correction on\n"
             if rocjpeg in ("on", "batch_fallback"):
                 message += "rocJPEG request batch decoded: 1 image(s)\n"
             if rocjpeg == "batch_fallback":
@@ -473,3 +494,50 @@ def test_gpu_selection_skips_busy_devices_and_maps_to_host_indices(monkeypatch):
     assert ci.select_gpus({}, ["0", "2", "5", "7"], 1) == ["2"]
     with pytest.raises(RuntimeError, match="Need 4 idle GPUs.*idle: 2,7"):
         ci.select_gpus({}, ["0", "2", "5", "7"], 4)
+
+
+def write_checksums(directory, rows):
+    directory.mkdir()
+    for rank, lines in rows.items():
+        (directory / f"target_rank{rank}.tsv").write_text(
+            "".join("\t".join(line) + "\n" for line in lines)
+        )
+
+
+def test_rfork_weight_checksums_must_match_on_every_rank(tmp_path):
+    seed = [
+        ("param", "w", "(2, 2)", "torch.bfloat16", "cuda", "8:10:30"),
+        ("buffer", "b", "(2,)", "torch.float32", "cuda", "8:4:9"),
+    ]
+    write_checksums(tmp_path / "seed", {0: seed, 1: seed})
+    # The device column is not compared.
+    same = [line[:4] + ("cpu",) + line[5:] for line in seed]
+    write_checksums(tmp_path / "same", {0: same, 1: same})
+    assert ci.compare_weight_checksums(tmp_path / "seed", tmp_path / "same", 2) == 2
+    changed = [seed[0][:5] + ("8:10:31",), seed[1]]
+    write_checksums(tmp_path / "changed", {0: seed, 1: changed})
+    with pytest.raises(ValueError, match="rank 1: 1/2 differ"):
+        ci.compare_weight_checksums(tmp_path / "seed", tmp_path / "changed", 2)
+    write_checksums(tmp_path / "missing", {0: seed, 1: seed[:1]})
+    with pytest.raises(ValueError, match="rank 1: 1/2 differ"):
+        ci.compare_weight_checksums(tmp_path / "seed", tmp_path / "missing", 2)
+
+
+def test_rfork_case_needs_a_seed_and_a_fork_worth_of_gpus(tmp_path):
+    case = next(case for case in ci.CASES if case[3] == "rfork")
+    (tmp_path / case[1]).mkdir()
+    (tmp_path / case[1] / "config.json").write_text("{}")
+    args = argparse.Namespace(models_root=tmp_path, gpus="0,1,2", port=7080)
+    with pytest.raises(ValueError, match=f"requires {2 * case[2]} GPUs"):
+        ci.run_case(case, args, tmp_path, {"errors": []})
+
+
+def test_daily_only_cases_run_on_schedule_or_when_selected():
+    ids = [case[0] for case in ci.CASES]
+    daily = ci.DAILY_ONLY_CASES
+    assert daily <= set(ids)
+    assert ci.matrix_cases(set(), "pull_request") == [i for i in ids if i not in daily]
+    assert ci.matrix_cases(set(), "schedule") == ids
+    assert ci.matrix_cases(set(daily), "pull_request") == [i for i in ids if i in daily]
+    with pytest.raises(ValueError, match="Unknown cases"):
+        ci.matrix_cases({"bogus"}, "schedule")

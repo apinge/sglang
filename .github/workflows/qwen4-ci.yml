@@ -22,7 +22,7 @@ on:
         type: boolean
         default: false
       case:
-        description: 'Comma-separated case IDs; empty runs all six'
+        description: 'Comma-separated case IDs; empty runs all cases'
         type: string
   workflow_call:
     inputs:
@@ -49,6 +49,7 @@ on:
         type: string
         default: ''
     secrets:
+      # Accepted for compatibility with existing callers; CI does not use it.
       DOCKER_PASSWORD:
         required: false
 
@@ -126,13 +127,14 @@ jobs:
           from pathlib import Path
 
           sys.path.insert(0, "scripts/ci")
-          from qwen4_ci import CASES
+          from qwen4_ci import matrix_cases
 
-          ids = [case[0] for case in CASES]
           selected = {name.strip() for name in os.environ.get("SELECTED_CASES", "").split(",") if name.strip()}
-          unknown = selected - set(ids)
-          if unknown:
-              raise SystemExit(f"Unknown cases: {', '.join(sorted(unknown))}")
+          try:
+              # Daily-only cases (e.g. R-Fork) run on the schedule or when selected explicitly.
+              cases = matrix_cases(selected, os.environ["GITHUB_EVENT_NAME"])
+          except ValueError as exc:
+              raise SystemExit(str(exc))
           revisions = {
               name: subprocess.check_output(["git", "-C", path, "rev-parse", "HEAD"], text=True).strip()
               for name, path in (("harness_sha", "."), ("sglang_sha", "candidate"), ("aiter_sha", "aiter-source"), ("pyhip_sha", "pyhip-source"))
@@ -140,7 +142,7 @@ jobs:
           outputs = {
               **revisions,
               "sglang_repository": os.environ["SGLANG_REPOSITORY"],
-              "matrix": json.dumps({"case": [name for name in ids if not selected or name in selected]}),
+              "matrix": json.dumps({"case": cases}),
           }
           with Path(os.environ["GITHUB_OUTPUT"]).open("a") as stream:
               for name, value in outputs.items():
@@ -166,6 +168,7 @@ jobs:
     env:
       QWEN4_WORK_ROOT: ${{ vars.QWEN4_WORK_ROOT || '/tmp' }}
       MODELS_ROOT: ${{ vars.QWEN4_MODELS_ROOT || '/raid/models' }}
+      BASE_IMAGE: ${{ vars.QWEN4_BASE_IMAGE || 'rocm/ali-private:ubuntu22.04_rocm7.14.0_cp310_torch2.12.0_sglang_4d63dea_aiter_514c166_20261105_v2' }}
       IMAGE: qwen4-ci:${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.case }}
       CONTAINER: qwen4-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.case }}
     steps:
@@ -189,21 +192,20 @@ jobs:
           echo "RESULTS=$work_dir/results" >> "$GITHUB_ENV"
           echo "DOCKER_CONFIG=$work_dir/docker" >> "$GITHUB_ENV"
           echo "BUILDX_CONFIG=$work_dir/buildx" >> "$GITHUB_ENV"
-      - name: Authenticate image pull
-        env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-          DOCKER_USERNAME: ${{ vars.QWEN4_DOCKER_USERNAME || 'alishared' }}
+      - name: Require cached base image
         run: |
-          if [ -n "$DOCKER_PASSWORD" ]; then
-            printf '%s' "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+          docker info >/dev/null
+          if ! docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
+            echo "::error::Base image $BASE_IMAGE is not cached on this runner. Load it into the runner's Docker daemon before running Qwen4 CI; registry login and image pulls are disabled."
+            exit 1
           fi
       - name: Build case image using the pinned sources and Docker cache
         env:
           AITER_REF: ${{ needs.validate.outputs.aiter_sha }}
           PYHIP_REF: ${{ needs.validate.outputs.pyhip_sha }}
-          BASE_IMAGE: ${{ vars.QWEN4_BASE_IMAGE || 'rocm/ali-private:ubuntu22.04_rocm7.14.0_cp310_torch2.12.0_sglang_4d63dea_aiter_514c166_20261105_v2' }}
         run: |
-          docker build --network=host --progress=plain --build-arg "AITER_REF=$AITER_REF" \
+          # The default Docker builder can resolve the base from the daemon's image store.
+          docker build --builder default --pull=false --network=host --progress=plain --build-arg "AITER_REF=$AITER_REF" \
             --build-arg "PYHIP_REF=$PYHIP_REF" \
             --build-arg "BASE_IMAGE=$BASE_IMAGE" --build-arg SGLANG_SOURCE=candidate \
             -f evaluation/Dockerfile.ci -t "$IMAGE" . \
@@ -219,7 +221,7 @@ jobs:
           args=(--output /results/evaluation --case "$CASE_ID")
           if [ "$SMOKE" = true ]; then args+=(--smoke); fi
           if [ "$DAILY_PRESSURE" = true ]; then args+=(--pressure); fi
-          docker run -d --name "$CONTAINER" --device /dev/kfd --device /dev/dri \
+          docker run --pull=never -d --name "$CONTAINER" --device /dev/kfd --device /dev/dri \
             --ipc=host --network=host --group-add video --ulimit nofile=65536:65536 --security-opt seccomp=unconfined \
             -v "$MODELS_ROOT:/models:ro" -v "$RESULTS:/results" \
             -v /tmp/qwen4-mi308x.lock:/tmp/qwen4-mi308x.lock \

@@ -235,18 +235,20 @@ python3 -m sglang.benchmark.serving \
 - The default image is `rocm/ali-private:ubuntu22.04_rocm7.14.0_cp310_torch2.12.0_sglang_4d63dea_aiter_514c166_20261105_v2`. All Qwen3.5/Qwen3.8 launchers select `--mm-feature-transport cuda_ipc`. CI enables rocJPEG and supplies the ROCm libva driver settings.
 - Non-draft fork PRs require the `run-qwen4-ci` label to run GPU cases. Adding the label triggers a new run through the `labeled` event.
 - Case jobs run serially on the shared host, each with its own image container, console logs, and result artifact. Docker builds reuse cached layers.
+- CI skips Docker registry login and requires the configured base image (`QWEN4_BASE_IMAGE`, or the workflow default) in each GPU runner's Docker image store. A missing image fails the case before the build. The default Docker builder uses the cached image with `--pull=false`, and case containers use `--pull=never`.
 - Each new CI run resolves AITER `qwen38-flash-next-dev` and pyhip `dev` to their latest commits. Cases and GPU-only retries use the same resolved SHAs, recorded in `build.json`. Manual and reusable workflows accept `aiter_ref` and `pyhip_ref` overrides; companion-repository callers default to their PR or workflow commit.
 - Each GPU case job has a 60-minute timeout, including the image build. Cancellation stops its container, and the container also exits after 60 minutes from creation so its server workers cannot keep holding GPUs if the runner disconnects. Timed-out cases fail the final CI gate.
-- The final **Qwen4 CI** job calls `python3 scripts/ci/qwen4_ci.py summarize` to publish one combined table and the number of passing cases (for example, **6/6**).
-- The default case order is Qwen3.8 Flash TP2 base, Qwen3.8 Flash TP2 MTP, Qwen3.5 35B TP4 base, Qwen3.5 35B TP1 DFlash, Qwen3.5 397B TP8 base, then Qwen3.5 397B TP8 DFlash. Local runs and the Actions matrix use this order. Direct local runs can evaluate multiple cases in one container and share its normal kernel cache:
+- The final **Qwen4 CI** job calls `python3 scripts/ci/qwen4_ci.py summarize` to publish one combined table and the number of passing cases (for example, **7/7**).
+- The default case order is Qwen3.8 Flash TP2 base, Qwen3.8 Flash TP2 MTP, Qwen3.8 Flash TP2 R-Fork, Qwen3.5 35B TP4 base, Qwen3.5 35B TP1 DFlash, Qwen3.5 397B TP8 base, then Qwen3.5 397B TP8 DFlash. Local runs and the Actions matrix use this order. PR runs skip `Qwen3.8-Flash-TP2-RFork`; it runs in the daily schedule, or when selected with the `case` input. Direct local runs can evaluate multiple cases in one container and share its normal kernel cache:
 
 ```bash
 python3 scripts/ci/qwen4_ci.py --models-root /raid/models \
   --client-root /path/to/pinned-client --output /tmp/qwen4-results-new
 ```
 
-The default command runs **performance, GSM8K accuracy, then a multimodal smoke test** against the
-same server. Use it without `--accuracy-only` or `--smoke` for the full workload.
+For serving cases, the default command runs **performance, GSM8K accuracy, then a multimodal smoke test** against the
+same server. The R-Fork case checks startup, transferred weights, and GSM8K instead.
+Use it without `--accuracy-only` or `--smoke` for the full workload.
 Performance uses 10 warmup requests and 128 random requests at concurrency one;
 Qwen3.5 uses 8,000 input / 500 output tokens, and Qwen3.8 uses 12,000 / 350.
 Accuracy scores 200 examples and enforces the recorded gate.
@@ -292,19 +294,20 @@ Use that image to run the local benchmark and accuracy checks:
 )
 ```
 
-Remove `--case Qwen3.5-397B-TP8-DFlash` to run all six cases sequentially, or pass
+Remove `--case Qwen3.5-397B-TP8-DFlash` to run all cases sequentially, or pass
 comma-separated case IDs from the table below.
 
 The command exits nonzero for launch errors, incomplete requests, invalid results, or an accuracy regression. Logs, native JSON/HTML reports, and `summary.md` are written under the fresh output directory. Build provenance lists the source commits and installed package versions. Keep `QWEN4_WORK_ROOT` outside `/home` on hosts with limited home storage; Docker layers remain in the daemon's data root.
 Use a fresh `--output-dir` for each direct evaluator run. Ordinary evaluations retain model-specific report filenames; strict GSM8K runs use `gsm8k.json/html`.
 
-Default runs evaluate all six cases with 128 fixed-length performance requests and 200 GSM8K examples each. The accuracy gate permits at most a 3% relative drop: `score >= recorded_reference * 0.97`; performance thresholds are advisory.
+Default runs evaluate all cases with 128 fixed-length performance requests and 200 GSM8K examples each (the R-Fork case runs GSM8K only). The accuracy gate permits at most a 3% relative drop: `score >= recorded_reference * 0.97`; performance thresholds are advisory.
 
 
 | Case ID                 | Reference | Minimum correct / 200 |
 | ----------------------- | --------- | --------------------- |
 | Qwen3.8-Flash-TP2-Base  | 98.0%     | 191                   |
 | Qwen3.8-Flash-TP2-MTP   | 98.5%     | 192                   |
+| Qwen3.8-Flash-TP2-RFork | 98.0%     | 191                   |
 | Qwen3.5-35B-TP4-Base    | 97.0%     | 189                   |
 | Qwen3.5-35B-TP1-DFlash  | 97.0%     | 189                   |
 | Qwen3.5-397B-TP8-Base   | 99.0%     | 193                   |
@@ -319,9 +322,22 @@ reports its coverage and does not reuse prior results. `--accuracy-only` runs th
 and two examples and reports diagnostic results with the accuracy gate disabled.
 `--port` selects an unused server port.
 
+`Qwen3.8-Flash-TP2-RFork` checks R-Fork scale-out within one container. CI runs it daily, not on PRs; select it with the `case` input to run it on demand. It uses four idle GPUs:
+1. It starts a TP2 seed on the first two, loaded from disk on `--port`.
+2. It starts a second TP2 instance on the other two, on `--port + 1`, with `--load-format remote_instance` over RCCL. Transfer group ports start at 62000.
+3. The case fails if any of these hold:
+   - the new instance does not load via R-Fork;
+   - any rank's per-tensor checksums (`SGLANG_DEBUG_WEIGHT_CHECKSUM_DIR`) differ from the seed's;
+   - the new instance fails the GSM8K gate.
+4. The summary also reports the new instance's startup time and `load_weight`. The seed log is `seed.log`; the new instance's log is `server.log`.
+
+R-Fork does not run the multimodal smoke test; its multimodal summary column is
+`not applicable`. Serving cases require a successful multimodal response and
+rocJPEG request-batch decoding, including in daily pressure runs.
+
 
 ### Daily Pressure Test
-- The daily run starts at **04:00 China time** and runs only pressure tests for all six cases.
+- The daily run starts at **04:00 China time** and runs pressure and multimodal checks for serving cases. The R-Fork case checks loading and weight checksums instead, then the seed and server logs.
 - Pressure uses `benchmark_example-20261013-363695ea/concurrency/run.sh` with `LLM_AUTO_SEQ_SIGMA=4`. Qwen3.8 uses `tk_in:12000,tk_out:350,conc:1-2-4-8-12-16-32`; Qwen3.5 uses `tk_in:8000,tk_out:500,conc:1-2-4-8-12-16-32`. Fixed concurrency levels use 8, 8, 8, 16, 32, 32, and 64 main requests respectively, with repost warmups disabled.
 - CI checks the complete server log for error, core-dump, segmentation-fault, and GPU memory-access-fault markers. Matches fail the case. The daily summary shows each case's status, multimodal status, and any failure messages. The original `server.log`, pressure console log, and multimodal response are retained for debugging.
 - To run one pressure case locally, add `--pressure` to the driver command. `--smoke --pressure` runs two requests at concurrency one. The CI image adds the pinned concurrency-client packages without upgrading the serving runtime;
