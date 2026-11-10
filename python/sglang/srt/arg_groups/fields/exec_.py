@@ -22,6 +22,7 @@ from sglang.srt.arg_groups.choices import (
     FP8_GEMM_RUNNER_BACKEND_CHOICES,
     GRAMMAR_BACKEND_CHOICES,
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+    LINEAR_ATTN_PREFILL_BACKEND_CHOICES,
     MOE_RUNNER_BACKEND_CHOICES,
     RL_ON_POLICY_TARGET_CHOICES,
 )
@@ -429,8 +430,8 @@ class ExecMamba(msgspec.Struct):
     linear_attn_prefill_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention prefill/extend. If not set, uses --linear-attn-backend; compatible SM100 GDN models may automatically select FlashInfer.",
-            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            help="Override the kernel backend for linear attention prefill/extend. If not set, uses --linear-attn-backend; compatible SM100 GDN models may automatically select FlashInfer. AITER supports GDN prefill on ROCm, with Triton fallback for unsupported inputs.",
+            choices=LINEAR_ATTN_PREFILL_BACKEND_CHOICES,
         ),
     ] = None
     linear_attn_verify_backend: A[

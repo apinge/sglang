@@ -39,6 +39,7 @@ draft_model="${DRAFT_MODEL_PATH:-/models/Qwen3.5-35B-A3B-DFlash}"
  --max-prefill-tokens 32768 \
  --max-running-requests 32 \
  --cuda-graph-max-bs-decode 32 \
+ --linear-attn-prefill-backend aiter \
  --attention-backend aiter \
  --mm-attention-backend aiter_attn \
  --kv-cache-dtype fp8_e4m3 \
@@ -47,5 +48,4 @@ draft_model="${DRAFT_MODEL_PATH:-/models/Qwen3.5-35B-A3B-DFlash}"
  --page-size 64  2>&1 | tee "${LOG_FILE:-qwen3.5-35B-fp8_tp1_dflash_radix_cache.log}"
 #  --linear-attn-backend aiter \
 #  --linear-attn-decode-backend aiter \
-#  --linear-attn-prefill-backend aiter \
 

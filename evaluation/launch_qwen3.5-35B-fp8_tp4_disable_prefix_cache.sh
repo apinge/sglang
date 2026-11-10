@@ -38,6 +38,7 @@ model="${MODEL_PATH:-/models/Qwen3.5-35B-A3B-PTPC-FP8/}"
   --max-prefill-tokens 32768 \
   --max-running-requests 128 \
   --cuda-graph-max-bs-decode 128 \
+  --linear-attn-prefill-backend aiter \
   --attention-backend aiter \
   --mm-attention-backend aiter_attn \
   --enable-strict-thinking \
@@ -47,5 +48,4 @@ model="${MODEL_PATH:-/models/Qwen3.5-35B-A3B-PTPC-FP8/}"
   2>&1 | tee "${LOG_FILE:-${ROOT}/logs/server/qwen3.5-35B-fp8_tp4_disable_prefix_cache.log}"
   # --linear-attn-backend aiter \
   # --linear-attn-decode-backend aiter \
-  # --linear-attn-prefill-backend aiter \
 

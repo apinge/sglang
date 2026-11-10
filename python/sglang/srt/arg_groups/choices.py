@@ -195,6 +195,9 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "helion",
     "intel_xpu",
 ]
+LINEAR_ATTN_PREFILL_BACKEND_CHOICES = list(
+    dict.fromkeys([*LINEAR_ATTN_KERNEL_BACKEND_CHOICES, "aiter"])
+)
 
 
 # --------------------------------------------------------------------------
@@ -275,7 +278,14 @@ add_rl_on_policy_target_choices = RL_ON_POLICY_TARGET_CHOICES.extend
 
 # --- Linear attention ---
 
-add_linear_attn_kernel_backend_choices = LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend
+
+def add_linear_attn_kernel_backend_choices(choices):
+    for choice in choices:
+        if choice not in LINEAR_ATTN_KERNEL_BACKEND_CHOICES:
+            LINEAR_ATTN_KERNEL_BACKEND_CHOICES.append(choice)
+        if choice not in LINEAR_ATTN_PREFILL_BACKEND_CHOICES:
+            LINEAR_ATTN_PREFILL_BACKEND_CHOICES.append(choice)
+
 
 # --------------------------------------------------------------------------
 # Add new extension points at the end of the matching group above. A new
