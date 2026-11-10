@@ -23,12 +23,16 @@ EVALUATION = ROOT / "evaluation"
 CLIENT_SHA = "fc6ddbbf7aac80167ea04cc00bf200af8adf2b85"
 PRESSURE_BENCHMARK = "benchmark_example-20261013-363695ea/concurrency"
 GSM8K_MAX_RELATIVE_DROP = 0.03
+# R-Fork transfer groups listen on the seed; keep them outside the default
+# ip_local_port_range (32768-60999) so an ephemeral socket cannot take one.
+RFORK_GROUP_PORT_BASE = 62000
 DATASETS = {
     "gsm8k/test.jsonl": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
     "ShareGPT_V3_unfiltered_cleaned_split.json": "35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4",
 }
 # Default order: Qwen3.8 first, then Qwen3.5.
 # Case, model, TP, mode, launch script, approved 200-example full-02 accuracy.
+# "rfork" runs a seed and an R-Fork instance in the same container: 2 x TP GPUs.
 CASES = [
     (
         "Qwen3.8-Flash-TP2-Base",
@@ -45,6 +49,14 @@ CASES = [
         "mtp",
         "launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2.sh",
         0.985,
+    ),
+    (
+        "Qwen3.8-Flash-TP2-RFork",
+        "Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16",
+        2,
+        "rfork",
+        "launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2.sh",
+        0.980,
     ),
     (
         "Qwen3.5-35B-TP4-Base",
@@ -79,6 +91,24 @@ CASES = [
         0.985,
     ),
 ]
+
+
+# Off the daily schedule, CI runs these only when selected explicitly: they take
+# four GPUs and check startup paths rather than serving accuracy or speed.
+DAILY_ONLY_CASES = {"Qwen3.8-Flash-TP2-RFork"}
+
+
+def matrix_cases(selected, event_name):
+    """Case IDs for the Actions matrix, in CASES order."""
+    ids = [case[0] for case in CASES]
+    unknown = selected - set(ids)
+    if unknown:
+        raise ValueError(f"Unknown cases: {', '.join(sorted(unknown))}")
+    if selected:
+        return [name for name in ids if name in selected]
+    return [
+        name for name in ids if event_name == "schedule" or name not in DAILY_ONLY_CASES
+    ]
 
 
 def write_json(path, value):
@@ -182,7 +212,9 @@ def wait_ready(server, url, case, model_path, served_name, timeout):
             or str(args.get("model_path", "")).rstrip("/") != str(model_path)
             or args.get("tp_size") != case[2]
             or args.get("speculative_algorithm")
-            != {"base": None, "dflash": "DFLASH", "mtp": "EAGLE"}[case[3]]
+            != {"base": None, "dflash": "DFLASH", "mtp": "EAGLE", "rfork": None}[
+                case[3]
+            ]
             or bool(args.get("disable_radix_cache")) != (case[3] != "dflash")
         ):
             raise ValueError("Endpoint does not match the requested model, TP, or mode")
@@ -353,8 +385,196 @@ print(json.dumps(idle))
     return idle[:tp]
 
 
+def client_environment(args, model_path, served_name, port, directory):
+    datasets = Path(
+        args.datasets_root or Path(args.models_root) / "benchmark_datasets"
+    ).resolve()
+    env = clean_environment(
+        PYTHONPATH=str(Path(args.client_root).resolve() / "python"),
+        BENCH_MODEL=str(model_path),
+        BENCH_SERVED_MODEL=served_name,
+        BENCH_HOST="127.0.0.1",
+        BENCH_PORT=str(port),
+        DATASET_PATH=str(datasets / "ShareGPT_V3_unfiltered_cleaned_split.json"),
+        BENCH_OUTPUT_FILE=str(directory / "performance.jsonl"),
+        BENCH_LOG_FILE=os.devnull,  # Avoid a second copy of the phase log.
+        GSM8K_DATA_PATH=str(datasets / "gsm8k/test.jsonl"),
+        GSM8K_OUTPUT_DIR=str(directory),
+    )
+    if args.smoke:
+        env.update(NUM_PROMPTS="2", WARMUP_REQUESTS="1", GSM8K_NUM_EXAMPLES="2")
+    return env
+
+
+def read_weight_checksums(path):
+    rows = {}
+    for line in Path(path).read_text().splitlines():
+        kind, name, shape, dtype, _device, checksum = line.split("\t")
+        rows[(kind, name)] = (shape, dtype, checksum)
+    return rows
+
+
+def compare_weight_checksums(seed_dir, fork_dir, tp):
+    """Every rank's params and buffers must match the seed in shape, dtype and bytes."""
+    mismatched = []
+    for rank in range(tp):
+        seed = read_weight_checksums(Path(seed_dir) / f"target_rank{rank}.tsv")
+        fork = read_weight_checksums(Path(fork_dir) / f"target_rank{rank}.tsv")
+        if not seed:
+            raise ValueError(f"Seed rank {rank} wrote no weight checksums")
+        differ = sorted(
+            k for k in seed.keys() | fork.keys() if seed.get(k) != fork.get(k)
+        )
+        if differ:
+            mismatched.append(
+                f"rank {rank}: {len(differ)}/{len(seed)} differ (e.g. {differ[0][1]})"
+            )
+    if mismatched:
+        raise ValueError(
+            "R-Fork weights differ from the seed: " + "; ".join(mismatched)
+        )
+    return len(seed)
+
+
+def run_rfork_case(case, args, directory, row):
+    """Start a seed, then an R-Fork instance on other GPUs that pulls the seed's weights."""
+    name, model, tp, _mode, script, baseline = case
+    model_path = Path(args.models_root).resolve() / model
+    if not (model_path / "config.json").is_file():
+        raise ValueError(f"Missing model: {model_path}")
+    devices = args.gpus.split(",")
+    if len(devices) < 2 * tp:
+        raise ValueError(
+            f"{name} requires {2 * tp} GPUs; --gpus supplies {len(devices)}"
+        )
+    served_name = f"qwen4-{os.getpid()}-{name}"
+    seed_port, fork_port = args.port, args.port + 1
+    group_ports = list(range(RFORK_GROUP_PORT_BASE, RFORK_GROUP_PORT_BASE + tp))
+    env = clean_environment(
+        SERVER_PYTHON=sys.executable,
+        HOST="127.0.0.1",
+        MODEL_PATH=str(model_path),
+        SERVED_MODEL_NAME=served_name,
+        GPU_ARCHS="gfx942",
+        TP_SIZE=str(tp),
+        MTP="0",
+        PLE_OFFLOAD_EMBEDDING="0",
+        LOG_FILE=os.devnull,  # managed_process captures the complete server log.
+    )
+    gpus = select_gpus(env, devices, 2 * tp)
+    seed_env = {
+        **env,
+        "PORT": str(seed_port),
+        "HIP_VISIBLE_DEVICES": ",".join(gpus[:tp]),
+        "SGLANG_DEBUG_WEIGHT_CHECKSUM_DIR": str(directory / "checksums-seed"),
+    }
+    fork_env = {
+        **env,
+        "PORT": str(fork_port),
+        "HIP_VISIBLE_DEVICES": ",".join(gpus[tp:]),
+        "SGLANG_DEBUG_WEIGHT_CHECKSUM_DIR": str(directory / "checksums-fork"),
+    }
+    fork_args = [
+        "--load-format",
+        "remote_instance",
+        "--remote-instance-weight-loader-backend",
+        "nccl",
+        "--remote-instance-weight-loader-seed-instance-ip",
+        "127.0.0.1",
+        "--remote-instance-weight-loader-seed-instance-service-port",
+        str(seed_port),
+        "--remote-instance-weight-loader-send-weights-group-ports",
+        json.dumps(group_ports),
+    ]
+    print(
+        f"{name}: seed on GPUs {seed_env['HIP_VISIBLE_DEVICES']}, "
+        f"R-Fork instance on GPUs {fork_env['HIP_VISIBLE_DEVICES']}",
+        flush=True,
+    )
+    for port in (seed_port, fork_port, *group_ports):
+        with socket.socket() as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", port))
+    write_json(
+        directory / "launch.json",
+        {
+            "script": script,
+            "seed_env": seed_env,
+            "fork_env": fork_env,
+            "fork_args": fork_args,
+        },
+    )
+    argv = ["bash", str(EVALUATION / script)]
+    with managed_process(argv, directory / "seed.log", seed_env, directory) as seed:
+        print(
+            f"{name}: waiting for the seed; log: {directory / 'seed.log'}", flush=True
+        )
+        wait_ready(
+            seed,
+            f"http://127.0.0.1:{seed_port}",
+            case,
+            model_path,
+            served_name,
+            args.server_timeout,
+        )
+        started = time.monotonic()
+        with managed_process(
+            argv + fork_args, directory / "server.log", fork_env, directory
+        ) as fork:
+            print(
+                f"{name}: waiting for the R-Fork instance; log: {directory / 'server.log'}",
+                flush=True,
+            )
+            info = wait_ready(
+                fork,
+                f"http://127.0.0.1:{fork_port}",
+                case,
+                model_path,
+                served_name,
+                args.server_timeout,
+            )
+            startup = time.monotonic() - started
+            write_json(directory / "server-info.json", info)
+            log = (directory / "server.log").read_text(errors="replace")
+            if "Loading weights from remote instance" not in log:
+                raise ValueError("The new instance did not load its weights via R-Fork")
+            load_weight = re.findall(r"load_weight=([0-9.]+)", log)
+            row["rfork"] = {
+                "startup_s": round(startup, 1),
+                "load_weight_s": float(load_weight[-1]) if load_weight else None,
+                "tensors_per_rank": compare_weight_checksums(
+                    directory / "checksums-seed", directory / "checksums-fork", tp
+                ),
+            }
+            if seed.poll() is not None:
+                raise RuntimeError("Seed exited during the weight transfer")
+            if not getattr(args, "pressure", False):
+                try:
+                    run_phase(
+                        "run_gsm8k.sh",
+                        directory,
+                        client_environment(
+                            args, model_path, served_name, fork_port, directory
+                        ),
+                        fork,
+                        7200,
+                    )
+                    row["accuracy"] = validate_accuracy(
+                        directory / "gsm8k.json", args.smoke
+                    )
+                    check_accuracy_gate(row["accuracy"]["score"], baseline, args.smoke)
+                except Exception as exc:
+                    row["errors"].append(f"accuracy: {exc}")
+    if getattr(args, "pressure", False):
+        # Inspect both complete logs after shutdown, like the other pressure cases.
+        check_server_log(directory / "seed.log")
+        check_server_log(directory / "server.log")
+
+
 def run_case(case, args, directory, row):
     name, model, tp, mode, script, baseline = case
+    if mode == "rfork":
+        return run_rfork_case(case, args, directory, row)
     model_path = Path(args.models_root).resolve() / model
     if not (model_path / "config.json").is_file():
         raise ValueError(f"Missing model: {model_path}")
@@ -413,23 +633,7 @@ def run_case(case, args, directory, row):
         write_json(directory / "server-info.json", info)
         q38 = model.startswith("Qwen3.8")
         output_tokens = 350 if q38 else 500
-        datasets = Path(
-            args.datasets_root or Path(args.models_root) / "benchmark_datasets"
-        ).resolve()
-        env = clean_environment(
-            PYTHONPATH=str(Path(args.client_root).resolve() / "python"),
-            BENCH_MODEL=str(model_path),
-            BENCH_SERVED_MODEL=served_name,
-            BENCH_HOST="127.0.0.1",
-            BENCH_PORT=str(args.port),
-            DATASET_PATH=str(datasets / "ShareGPT_V3_unfiltered_cleaned_split.json"),
-            BENCH_OUTPUT_FILE=str(directory / "performance.jsonl"),
-            BENCH_LOG_FILE=os.devnull,  # Avoid a second copy of the phase log.
-            GSM8K_DATA_PATH=str(datasets / "gsm8k/test.jsonl"),
-            GSM8K_OUTPUT_DIR=str(directory),
-        )
-        if args.smoke:
-            env.update(NUM_PROMPTS="2", WARMUP_REQUESTS="1", GSM8K_NUM_EXAMPLES="2")
+        env = client_environment(args, model_path, served_name, args.port, directory)
         if pressure:
             concurrents = [1] if args.smoke else [1, 2, 4, 8, 12, 16, 32]
             dataset = f"tk_in:{12000 if q38 else 8000},tk_out:{output_tokens}"
@@ -518,7 +722,7 @@ def summary(output, rows, args, errors):
     title = "Qwen4 daily pressure" if pressure_only else "Qwen4 evaluation"
     text = f"## {title} — {'Failed' if failed else 'Passed'}\n\n"
     text += f"Cases passed: **{sum(row['status'] == 'passed' for row in rows)}/{len(rows)}**. "
-    text += f"Coverage: {len(rows)}/6 selected cases. "
+    text += f"Coverage: {len(rows)}/{len(CASES)} selected cases. "
     if pressure_only:
         text += "Pressure only: request completion and final server-log checks are required.\n\n"
         if args.smoke:
@@ -558,6 +762,14 @@ def summary(output, rows, args, errors):
                 f"| {row['case']} | {row['status']} | {score} | {row['baseline']:.2%} / {minimum:.2%} | "
                 + " | ".join(metrics)
                 + " |\n"
+            )
+    for row in rows:
+        rfork = row.get("rfork")
+        if rfork:
+            text += (
+                f"\n{row['case']}: R-Fork instance ready in {rfork['startup_s']:.1f} s "
+                f"(load_weight {rfork['load_weight_s']} s); "
+                f"{rfork['tensors_per_rank']} tensors per rank match the seed.\n"
             )
     for error in errors + [
         f"{row['case']}: {e}" for row in rows for e in row["errors"]
@@ -899,7 +1111,7 @@ def main():
     )
     parser.add_argument("--output", default="qwen4-results")
     parser.add_argument(
-        "--case", default="", help="Comma-separated case IDs; empty runs all six"
+        "--case", default="", help="Comma-separated case IDs; empty runs all cases"
     )
     parser.add_argument("--models-root", default="/models")
     parser.add_argument("--datasets-root")

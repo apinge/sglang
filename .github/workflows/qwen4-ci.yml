@@ -22,7 +22,7 @@ on:
         type: boolean
         default: false
       case:
-        description: 'Comma-separated case IDs; empty runs all six'
+        description: 'Comma-separated case IDs; empty runs all cases'
         type: string
   workflow_call:
     inputs:
@@ -126,13 +126,14 @@ jobs:
           from pathlib import Path
 
           sys.path.insert(0, "scripts/ci")
-          from qwen4_ci import CASES
+          from qwen4_ci import matrix_cases
 
-          ids = [case[0] for case in CASES]
           selected = {name.strip() for name in os.environ.get("SELECTED_CASES", "").split(",") if name.strip()}
-          unknown = selected - set(ids)
-          if unknown:
-              raise SystemExit(f"Unknown cases: {', '.join(sorted(unknown))}")
+          try:
+              # Daily-only cases (e.g. R-Fork) run on the schedule or when selected explicitly.
+              cases = matrix_cases(selected, os.environ["GITHUB_EVENT_NAME"])
+          except ValueError as exc:
+              raise SystemExit(str(exc))
           revisions = {
               name: subprocess.check_output(["git", "-C", path, "rev-parse", "HEAD"], text=True).strip()
               for name, path in (("harness_sha", "."), ("sglang_sha", "candidate"), ("aiter_sha", "aiter-source"), ("pyhip_sha", "pyhip-source"))
@@ -140,7 +141,7 @@ jobs:
           outputs = {
               **revisions,
               "sglang_repository": os.environ["SGLANG_REPOSITORY"],
-              "matrix": json.dumps({"case": [name for name in ids if not selected or name in selected]}),
+              "matrix": json.dumps({"case": cases}),
           }
           with Path(os.environ["GITHUB_OUTPUT"]).open("a") as stream:
               for name, value in outputs.items():
