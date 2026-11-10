@@ -95,7 +95,7 @@ All of them act only with `SGLANG_QWEN4_SEQ_PARALLEL=1`.
 | torch | 2.12.0+rocm7.14.0 | |
 | FlyDSL | 0.3.2 | mori's device API compiles the push / wait kernels with it |
 | mori | apinge/mori `qwen3.8-flash-sdma` | SDMA queues and engine-side completion signals |
-| libibverbs-dev | system package, build time only | not in the base image; mori's `setup.py` stops without `/usr/include/infiniband/verbs.h`. Install it before `pip install` (`apt-get install -y libibverbs-dev`, or `dnf install -y rdma-core-devel`). The built libraries do not link it. |
+| libibverbs-dev | system package, build time only | not in the base image; mori's `setup.py` stops without `/usr/include/infiniband/verbs.h`. Install it before `pip install` (`apt-get install -y libibverbs-dev`, or `dnf install -y rdma-core-devel`); `docker/rocm.Dockerfile` and `scripts/ci/amd/amd_ci_install_dependency.sh` install it. The built libraries do not link it. |
 | PyHIP | `8027faa` | required by the base branch's QSA path, not by this feature |
 
 mori is pinned in `python/pyproject_other.toml` (`srt_hip`, next to PyHIP) as

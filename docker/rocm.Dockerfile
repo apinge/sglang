@@ -466,6 +466,9 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
     && mv pyproject_rocm.toml pyproject.toml \
     && AMDGPU_TARGET=$GPU_ARCH_LIST python setup_rocm.py install \
     && cd ../../../.. \
+    # srt_hip builds amd_mori from source; its setup.py stops without the ibverbs headers.
+    && apt-get update && apt-get install -y --no-install-recommends libibverbs-dev \
+    && rm -rf /var/lib/apt/lists/* \
     && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml \
     # srt_hip pins compressed-tensors==0.15.0, which requires torch<2.11 and so
     # cannot be satisfied on the ROCm 7.2.4 torch 2.11 stack. The *_rocm724 extras
