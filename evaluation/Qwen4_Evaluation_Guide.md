@@ -234,10 +234,13 @@ python3 -m sglang.benchmark.serving \
 - CI runs each selected case in its own GitHub Actions matrix job using `evaluation/Dockerfile.ci` and the existing launch, benchmark, and `run_gsm8k.sh` scripts.
 - Non-draft fork PRs require the `run-qwen4-ci` label to run GPU cases. Adding the label triggers a new run through the `labeled` event.
 - Case jobs run serially on the shared host, each with its own image container, console logs, and result artifact. Docker builds reuse cached layers.
+- CI skips Docker registry login and requires the configured base image (`QWEN4_BASE_IMAGE`, or the workflow default) in each GPU runner's Docker image store. A missing image fails the case before the build. The default Docker builder uses the cached image with `--pull=false`, and case containers use `--pull=never`.
 - Each new CI run resolves AITER `qwen38-flash-next-dev` and pyhip `dev` to their latest commits. Cases and GPU-only retries use the same resolved SHAs, recorded in `build.json`. Manual and reusable workflows accept `aiter_ref` and `pyhip_ref` overrides; companion-repository callers default to their PR or workflow commit.
 - Each GPU case job has a 60-minute timeout, including the image build. Cancellation stops its container, and the container also exits after 60 minutes from creation so its server workers cannot keep holding GPUs if the runner disconnects. Timed-out cases fail the final CI gate.
 - The final **Qwen4 CI** job calls `python3 scripts/ci/qwen4_ci.py summarize` to publish one combined table and the number of passing cases (for example, **7/7**).
 - The default case order is Qwen3.8 Flash TP2 base, Qwen3.8 Flash TP2 MTP, Qwen3.8 Flash TP2 R-Fork, Qwen3.5 35B TP4 base, Qwen3.5 35B TP1 DFlash, Qwen3.5 397B TP8 base, then Qwen3.5 397B TP8 DFlash. Local runs and the Actions matrix use this order. PR runs skip `Qwen3.8-Flash-TP2-RFork`; it runs in the daily schedule, or when selected with the `case` input. Direct local runs can evaluate multiple cases in one container and share its normal kernel cache:
+
+The default base image is `rocm/ali-private:ubuntu22.04_rocm7.14.0_cp310_torch2.12.0_sglang_4d63dea_aiter_514c166_20261105_v2`.
 
 ```bash
 python3 scripts/ci/qwen4_ci.py --models-root /raid/models \
