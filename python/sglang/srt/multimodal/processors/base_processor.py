@@ -54,6 +54,7 @@ from sglang.srt.utils import (
     configure_media_url_security,
     envs,
     is_cpu,
+    is_hip,
     is_npu,
     is_xpu,
     load_audio,
@@ -62,8 +63,16 @@ from sglang.srt.utils import (
     logger,
     smart_to_rgb,
 )
+from sglang.srt.utils.rocjpeg_decoder import (
+    DeferredJpeg,
+    decode_deferred_jpegs,
+    image_input_bytes,
+    rocjpeg_can_decode,
+    rocjpeg_decode_enabled,
+)
 
 _is_cpu = is_cpu()
+_is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
@@ -820,8 +829,11 @@ class BaseMultimodalProcessor(ABC):
     @contextmanager
     def _temporary_fast_processor_cuda_pool(self, device: Optional[str]):
         """Release fast-processor CUDA temporaries after CPU feature transport."""
+        # On ROCm an open MemPool aborts the process (captures_underway assert)
+        # when another thread's allocation has to free cached blocks.
         can_release = (
-            device is not None
+            not _is_hip
+            and device is not None
             and torch.device(device).type == "cuda"
             and not self.keep_mm_features_on_device
             and not self.precompute_hash_before_cpu_transfer
@@ -978,6 +990,16 @@ class BaseMultimodalProcessor(ABC):
             return data
         try:
             if modality == Modality.IMAGE:
+                if (
+                    discard_alpha_channel
+                    and not cls.smart_rgb_conversion
+                    and not isinstance(data, Image.Image)
+                    and rocjpeg_decode_enabled(cls.gpu_image_decode)
+                ):
+                    data = image_input_bytes(data)
+                    if rocjpeg_can_decode(data):
+                        # Decoded with the request's other JPEGs in _decode_deferred_jpegs.
+                        return DeferredJpeg(data)
                 img, _ = load_image(data, cls.gpu_image_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
@@ -1206,6 +1228,12 @@ class BaseMultimodalProcessor(ABC):
         BaseMultimodalProcessor._validate_one_modality(Modality.VIDEO, video_data)
         BaseMultimodalProcessor._validate_one_modality(Modality.AUDIO, audio_data)
 
+    async def _decode_deferred_jpegs(self, images: List[Any]) -> None:
+        if any(isinstance(image, DeferredJpeg) for image in images):
+            await asyncio.wrap_future(
+                self.io_executor.submit(decode_deferred_jpegs, images)
+            )
+
     def _process_loaded_mm_data(self, modality, raw_data, result):
         images, videos, audios = [], [], []
 
@@ -1388,6 +1416,7 @@ class BaseMultimodalProcessor(ABC):
             elif modality == Modality.AUDIO:
                 audios[idx] = result
 
+        await self._decode_deferred_jpegs(images)
         logger.debug(
             "[load_mm_data(simple)] loaded counts: images=%d, videos=%d, audios=%d",
             len(images),
@@ -1520,6 +1549,7 @@ class BaseMultimodalProcessor(ABC):
                 raise RuntimeError(
                     f"An exception occurred while loading multimodal data: {e}"
                 )
+        await self._decode_deferred_jpegs(images)
         return BaseMultiModalProcessorOutput(
             images=images,
             audios=audios,

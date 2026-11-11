@@ -1,9 +1,13 @@
 """Regression coverage for the accuracy gate and owned-process cleanup."""
 
 import argparse
+import contextlib
+import http.server
 import json
+import os
 import subprocess
 import sys
+import threading
 
 import pytest
 import qwen4_ci as ci
@@ -150,18 +154,34 @@ def test_accuracy_regression_fails_the_run_and_reports_remaining_cases(
 
 
 @pytest.mark.parametrize(
-    "execution_attempt,conclusion,has_report",
+    "case_id", ["Qwen3.8-Flash-TP2-Base", "Qwen3.8-Flash-TP2-RFork"]
+)
+@pytest.mark.parametrize("pressure", [False, True])
+@pytest.mark.parametrize(
+    "execution_attempt,conclusion,has_report,has_multimodal,has_rocjpeg",
     [
-        (2, "success", True),
-        (6, "success", True),
-        (6, "failure", True),
-        (6, "failure", False),
+        (2, "success", True, True, True),
+        (6, "success", True, True, True),
+        (6, "failure", True, True, True),
+        (6, "failure", False, True, True),
+        (6, "success", True, False, True),
+        (6, "success", True, True, False),
     ],
 )
 def test_summary_uses_actual_execution_and_keeps_latest_conclusion(
-    tmp_path, monkeypatch, execution_attempt, conclusion, has_report
+    tmp_path,
+    monkeypatch,
+    case_id,
+    pressure,
+    execution_attempt,
+    conclusion,
+    has_report,
+    has_multimodal,
+    has_rocjpeg,
 ):
-    case, baseline = ci.CASES[0][0], ci.CASES[0][5]
+    definition = next(case for case in ci.CASES if case[0] == case_id)
+    case, baseline = definition[0], definition[5]
+    is_rfork = definition[3] == "rfork"
     original = {
         "name": f"Qwen4 ({case})",
         "run_attempt": 2,
@@ -183,6 +203,7 @@ def test_summary_uses_actual_execution_and_keeps_latest_conclusion(
         "CASE_MATRIX": json.dumps({"case": [case]}),
         "VALIDATION_RESULT": "success",
         "CASES_RESULT": "success",
+        "DAILY_PRESSURE": "true" if pressure else "false",
     }.items():
         monkeypatch.setenv(key, value)
     for attempt, score in [(2, 0.98)] + (
@@ -202,15 +223,262 @@ def test_summary_uses_actual_execution_and_keeps_latest_conclusion(
             errors=[],
             accuracy={"score": score},
         )
-        ci.summary(directory, [row], argparse.Namespace(smoke=False), [])
-    assert ci.summarize_ci() == (conclusion != "success")
+        if is_rfork:
+            row["rfork"] = {
+                "startup_s": 71.1,
+                "load_weight_s": 13.02,
+                "tensors_per_rank": 1504,
+            }
+        elif has_multimodal:
+            row["multimodal"] = {"status": "passed", "completion_tokens": 10}
+            if has_rocjpeg:
+                row["multimodal"]["rocjpeg"] = "on"
+        ci.summary(
+            directory, [row], argparse.Namespace(smoke=False, pressure=pressure), []
+        )
+    passed = conclusion == "success" and (is_rfork or (has_multimodal and has_rocjpeg))
+    assert ci.summarize_ci() == (not passed)
     row = json.loads((tmp_path / "qwen4-summary/summary.json").read_text())["cases"][0]
-    assert row["status"] == ("passed" if conclusion == "success" else "failed")
+    assert row["status"] == ("passed" if passed else "failed")
     if has_report:
         assert row["accuracy"]["score"] == (0.98 if execution_attempt == 2 else 0.99)
     else:
         assert "accuracy" not in row
         assert "qwen4-results-" + case + "-6" in row["errors"][0]
+    if has_report and not is_rfork and not has_multimodal:
+        assert "Missing or failed multimodal result" in row["errors"]
+    if has_report and not is_rfork and has_multimodal and not has_rocjpeg:
+        assert "Missing rocJPEG activation confirmation" in row["errors"]
+    rendered = (tmp_path / "qwen4-summary/summary.md").read_text()
+    assert f"Coverage: 1/{len(ci.CASES)}" in rendered
+    if is_rfork:
+        assert "not applicable" in rendered
+        if has_report:
+            assert "1504 tensors per rank match the seed" in rendered
+
+
+def multimodal_response(model="test-model", content="The image shows a triangle."):
+    return {
+        "model": model,
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "completion_tokens": 8,
+            "prompt_tokens_details": {"image_tokens": 156},
+        },
+    }
+
+
+@pytest.mark.parametrize("correction", ["on", "off"])
+def test_rocjpeg_success_metric_is_not_a_server_fault(tmp_path, correction):
+    path = tmp_path / "server.log"
+    message = (
+        f"[server] rocJPEG GPU JPEG decoding: on, color correction {correction} "
+        "(mean abs error vs PIL 0.58)"
+    )
+    path.write_text(message + "\nrocJPEG request batch decoded: 1 image(s)\n")
+    ci.check_rocjpeg_log(path)
+    ci.check_server_log(path)
+    path.write_text(message + "; GPU fault detected\n")
+    with pytest.raises(RuntimeError, match="GPU fault"):
+        ci.check_server_log(path)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing",
+        "empty",
+        "reasoning_only",
+        "wrong_model",
+        "error",
+        "no_tokens",
+        "no_image_tokens",
+        "bad_choices",
+    ],
+)
+def test_multimodal_missing_or_invalid_response_fails(tmp_path, failure):
+    path = tmp_path / "multimodal.json"
+    data = multimodal_response()
+    if failure == "empty":
+        data["choices"][0]["message"]["content"] = " "
+    elif failure == "reasoning_only":
+        data["choices"][0]["message"].update(content=None, reasoning_content="thinking")
+    elif failure == "wrong_model":
+        data["model"] = "another-model"
+    elif failure == "error":
+        data = {"error": {"message": "decode failed"}}
+    elif failure == "no_tokens":
+        data["usage"]["completion_tokens"] = 0
+    elif failure == "no_image_tokens":
+        data["usage"]["prompt_tokens_details"]["image_tokens"] = 0
+    elif failure == "bad_choices":
+        data["choices"] = []
+    if failure != "missing":
+        path.write_text(json.dumps(data))
+    with pytest.raises((ValueError, OSError)):
+        ci.validate_multimodal(path, "test-model")
+
+
+@pytest.mark.parametrize("status", [200, 500])
+def test_multimodal_script_targets_case_and_propagates_http_errors(tmp_path, status):
+    seen = []
+    model = 'candidate/"quoted"'
+    data = (
+        multimodal_response(model)
+        if status == 200
+        else {"error": {"message": "image decoding failed"}}
+    )
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            seen.append(
+                (
+                    self.path,
+                    json.loads(self.rfile.read(int(self.headers["Content-Length"]))),
+                )
+            )
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode())
+
+        def log_message(self, *args):
+            pass
+
+    output = tmp_path / "multimodal.json"
+    with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            result = subprocess.run(
+                ["bash", str(ci.EVALUATION / "run_multimodal_test.sh")],
+                env={
+                    **os.environ,
+                    "CLIENT_PYTHON": sys.executable,
+                    "BENCH_HOST": "127.0.0.1",
+                    "BENCH_PORT": str(server.server_port),
+                    "BENCH_SERVED_MODEL": model,
+                    "MM_IMAGE_URL": "https://example.com/image.jpg",
+                    "MM_OUTPUT_FILE": str(output),
+                },
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+        finally:
+            server.shutdown()
+            thread.join()
+    assert (result.returncode == 0) == (status == 200)
+    assert json.loads(output.read_text()) == data
+    endpoint, body = seen[0]
+    assert endpoint == "/v1/chat/completions" and body["model"] == model
+    assert (
+        body["messages"][0]["content"][0]["image_url"]["url"]
+        == "https://example.com/image.jpg"
+    )
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+    if status == 200:
+        assert ci.validate_multimodal(output, model)["status"] == "passed"
+
+
+@pytest.mark.parametrize("valid", [True, False])
+@pytest.mark.parametrize(
+    "rocjpeg", ["on", "off", "missing", "self_check_only", "batch_fallback"]
+)
+def test_case_runs_multimodal_after_text_phases_and_gates_failure(
+    tmp_path, monkeypatch, valid, rocjpeg
+):
+    case = ci.CASES[0]
+    model = tmp_path / case[1]
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    monkeypatch.setattr(ci, "select_gpus", lambda *args: ["0", "1"])
+
+    @contextlib.contextmanager
+    def managed_process(argv, log, env, cwd):
+        yield object()
+        # Only available after the log relay drains, as in the real lifecycle.
+        if rocjpeg != "missing":
+            activation = "off" if rocjpeg == "off" else "on"
+            message = f"[server] rocJPEG GPU JPEG decoding: {activation}, color correction on\n"
+            if rocjpeg in ("on", "batch_fallback"):
+                message += "rocJPEG request batch decoded: 1 image(s)\n"
+            if rocjpeg == "batch_fallback":
+                # An earlier successful batch must not hide a later fallback.
+                message += "rocJPEG batch decode failed, decoding with PIL: injected\n"
+            log.write_text(message)
+
+    monkeypatch.setattr(ci, "managed_process", managed_process)
+    monkeypatch.setattr(ci, "wait_ready", lambda *args: {})
+    phases = []
+
+    def run_phase(script, directory, env, server, timeout):
+        phases.append(script)
+        if "pure_text" in script:
+            (directory / "performance.jsonl").write_text(
+                json.dumps(
+                    dict(
+                        completed=2,
+                        errors=["", ""],
+                        output_lens=[350, 350],
+                        mean_ttft_ms=100,
+                        mean_tpot_ms=2,
+                        output_throughput=100,
+                        request_throughput=1,
+                    )
+                )
+                + "\n"
+            )
+        elif script == "run_gsm8k.sh":
+            accuracy_result(directory, score=1, examples=2)
+        else:
+            ci.write_json(
+                env["MM_OUTPUT_FILE"],
+                multimodal_response(
+                    env["BENCH_SERVED_MODEL"], "A triangle" if valid else ""
+                ),
+            )
+
+    monkeypatch.setattr(ci, "run_phase", run_phase)
+    args = argparse.Namespace(
+        models_root=tmp_path,
+        gpus="0,1",
+        port=0,
+        server_timeout=1,
+        datasets_root=None,
+        client_root=tmp_path,
+        smoke=True,
+        accuracy_only=False,
+    )
+    row = {"errors": []}
+    ci.run_case(case, args, tmp_path, row)
+    assert phases == [
+        "run_qwen38_pure_text_bench.sh",
+        "run_gsm8k.sh",
+        "run_multimodal_test.sh",
+    ]
+    passed = valid and rocjpeg == "on"
+    assert row["multimodal"]["status"] == ("passed" if passed else "failed")
+    assert bool(row["errors"]) == (not passed)
+    if passed:
+        assert row["multimodal"]["rocjpeg"] == "on"
+    elif valid and rocjpeg == "off":
+        assert "rocJPEG GPU decoding was not confirmed" in row["errors"][0]
+    elif valid and rocjpeg == "self_check_only":
+        assert "request batch decoding was not confirmed" in row["errors"][0]
+    elif valid and rocjpeg == "batch_fallback":
+        assert "request batch fell back to PIL" in row["errors"][0]
+    assert (
+        json.loads((tmp_path / "launch.json").read_text())["env"][
+            "SGLANG_ROCM_GPU_JPEG_DECODE"
+        ]
+        == "1"
+    )
 
 
 def test_gpu_selection_skips_busy_devices_and_maps_to_host_indices(monkeypatch):

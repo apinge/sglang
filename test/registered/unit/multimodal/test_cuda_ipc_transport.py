@@ -31,11 +31,12 @@ from sglang.srt.multimodal.transport.memory_pool import (
     stream_wait_value32,
     stream_write_value32,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=37, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=90, suite="stage-b-test-2-gpu-large-amd")
 
 
 def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue, consumer_count=1):
@@ -82,11 +83,140 @@ def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue, consumer_co
     result_queue.put(("ok", None))
 
 
+def _consume_without_ready(proxy, status_queue, device_id):
+    torch.cuda.set_device(device_id)
+    # Compile the readiness kernel before starting the short fault-test
+    # deadline. The warmup word is already ready and belongs to this process.
+    warmup = torch.ones(1, dtype=torch.int32, device=f"cuda:{device_id}")
+    with get_context().override_server_args():
+        stream_wait_value32(device_id, warmup.data_ptr(), 1, "warmup")
+        torch.cuda.current_stream().synchronize()
+    status_queue.put("armed")
+    with get_context().override_server_args(watchdog_timeout=0.25):
+        proxy.reconstruct_on_target_device(device_id)
+        torch.cuda.current_stream().synchronize()
+    status_queue.put("unexpected completion")
+
+
 class TestCudaIpcTransport(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is required")
+
+    def setUp(self):
+        super().setUp()
+        config = get_context().override_server_args()
+        config.install()
+        self.addCleanup(config.restore)
+
+    @unittest.skipUnless(torch.version.hip is not None, "ROCm only")
+    def test_wait_uses_resolved_server_watchdog_timeout(self):
+        from sglang.srt.multimodal.transport import hip_stream_ops
+
+        for timeout in (0.5, 37.0, 600.0):
+            with self.subTest(timeout=timeout), get_context().override_server_args(
+                watchdog_timeout=timeout
+            ):
+                watchdog = Mock()
+                with patch.object(
+                    hip_stream_ops, "get_ipc_wait_watchdog", return_value=watchdog
+                ), patch.object(hip_stream_ops, "_wait_value32"), patch.object(
+                    torch.cuda, "Event", return_value=Mock()
+                ):
+                    hip_stream_ops.wait_value32(0x1000, 17, "test IPC")
+                watchdog.arm.assert_called_once_with(
+                    device_id=torch.cuda.current_device(),
+                    address=0x1000,
+                    generation=17,
+                    transport_name="test IPC",
+                    timeout=timeout,
+                )
+
+    @unittest.skipUnless(torch.version.hip is not None, "ROCm only")
+    def test_missing_ready_word_terminates_without_recycling_lease(self):
+        for use_cache in (True, False):
+            with self.subTest(use_cache=use_cache):
+                self._check_missing_ready_word(use_cache)
+
+    def _check_missing_ready_word(self, use_cache):
+        pool = MmItemMemoryPool(
+            memory_size=1 << 16,
+            recycle_interval=0.01,
+            base_gpu_id=0,
+            consumer_count=1,
+            max_inflight_slices=1,
+        )
+        source = torch.arange(35, dtype=torch.float32, device="cuda:0")
+        with patch("sglang.srt.multimodal.transport.memory_pool.stream_write_value32"):
+            # Publish the proxy, but deliberately omit the producer's ready word.
+            proxy = pool.wrap_tensor(source, use_pool_handle_cache=use_cache)
+        ctx = mp.get_context("spawn")
+        status_queue = ctx.Queue()
+        # Exercise the peer IPC mapping on the registered two-GPU AMD runner.
+        consumer_device = 1 if torch.cuda.device_count() >= 2 else 0
+        consumer = ctx.Process(
+            target=_consume_without_ready, args=(proxy, status_queue, consumer_device)
+        )
+        try:
+            consumer.start()
+            self.assertEqual(status_queue.get(timeout=60), "armed")
+            consumer.join(timeout=10)
+            self.assertFalse(consumer.is_alive(), "IPC watchdog did not stop consumer")
+            self.assertEqual(consumer.exitcode, 1)
+            self.assertEqual(pool._pool._control_words[0].cpu().tolist(), [0, 0])
+            self.assertEqual(pool.active_lease_count, 1)
+            self.assertIsNone(pool.wrap_tensor(source, use_pool_handle_cache=True))
+        finally:
+            if consumer.is_alive():
+                consumer.kill()
+                consumer.join(timeout=5)
+            pool.shutdown()
+
+    @unittest.skipUnless(torch.version.hip is not None, "ROCm only")
+    def test_wait_event_record_failure_keeps_deadline_armed(self):
+        from sglang.srt.multimodal.transport import hip_stream_ops
+
+        watchdog = Mock()
+        event = Mock()
+        event.record.side_effect = RuntimeError("cannot record event")
+        with patch.object(
+            hip_stream_ops, "get_ipc_wait_watchdog", return_value=watchdog
+        ), patch.object(hip_stream_ops, "_wait_value32"), patch.object(
+            torch.cuda, "Event", return_value=event
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cannot record event"):
+                hip_stream_ops.wait_value32(0x1000, 17)
+        watchdog.arm.assert_called_once()
+        watchdog.cancel.assert_not_called()
+        watchdog.launched.assert_not_called()
+
+    @unittest.skipUnless(torch.version.hip is not None, "ROCm only")
+    def test_wait_launch_failure_cancels_deadline(self):
+        from sglang.srt.multimodal.transport import hip_stream_ops
+
+        watchdog = Mock()
+        kernel = Mock()
+        kernel.__getitem__ = Mock(
+            return_value=Mock(side_effect=RuntimeError("launch failed"))
+        )
+        with patch.object(
+            hip_stream_ops, "get_ipc_wait_watchdog", return_value=watchdog
+        ), patch.object(hip_stream_ops, "_wait_value32", kernel):
+            with self.assertRaisesRegex(RuntimeError, "launch failed"):
+                hip_stream_ops.wait_value32(0x1000, 17)
+        watchdog.cancel.assert_called_once_with(watchdog.arm.return_value)
+
+    @unittest.skipUnless(torch.version.hip is not None, "ROCm only")
+    def test_wait_rejects_graph_capture_before_launch(self):
+        from sglang.srt.multimodal.transport import hip_stream_ops
+
+        with patch.object(
+            torch.cuda, "is_current_stream_capturing", return_value=True
+        ), patch.object(hip_stream_ops, "get_ipc_wait_watchdog") as get_watchdog:
+            with self.assertRaisesRegex(RuntimeError, "CUDA graph capture"):
+                hip_stream_ops.wait_value32(0x1000, 17)
+        get_watchdog.assert_not_called()
 
     def test_stream_memory_operations_order_nondefault_streams(self):
         control = torch.zeros(1, dtype=torch.int32, device="cuda:0")
