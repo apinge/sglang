@@ -21,7 +21,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGra
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
-from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+from sglang.srt.layers.attention.qsa.config import is_qwen_qsa, parse_qsa_profile
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QSAMTPSharedSparseIndices,
     QwenSparseAttnBackend,
@@ -529,6 +529,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 isinstance(self.draft_attn_backend, AiterMultiStepDraftBackend)
                 or isinstance(self.draft_extend_attn_backend, DeepseekV4HipRadixBackend)
                 or isinstance(self.draft_extend_attn_backend, DeepseekSparseAttnBackend)
+                # Same graph-stable QSA draft-extend metadata as on CUDA (below).
+                or (
+                    self.draft_extend_attn_backend is not None
+                    and is_qwen_qsa(self.draft_runner.model_config.hf_config)
+                )
             )
 
         graph_supported_backend_types = [
@@ -933,6 +938,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     rotated_mm[pt : pt + extend_len - 1].copy_(
                         mm_input_embeds[pt + 1 : pt + extend_len]
                     )
+                    # The draft overwrites each tail with its actual token embedding.
+                    # Initialize tails before publishing the shifted buffer.
+                    rotated_mm[pt + extend_len - 1 : pt + extend_len].zero_()
                 pt += extend_len
             assert pt == batch.input_ids.numel()
             batch.input_ids = new_input_ids
@@ -1003,15 +1011,28 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
-            logits_output.next_token_logits,
-            batch.sampling_info,
-            use_rejection_sampling,
-        )
-        if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
+        if (
+            self.topk == 1
+            and _is_hip
+            and not use_rejection_sampling
+            and is_qwen_qsa(self.draft_runner.model_config.hf_config)
+        ):
+            # ROCm keeps max()'s tie-break (#26358) without the vocab softmax.
+            probs = None
+            topk_index = torch.max(
+                logits_output.next_token_logits, dim=-1, keepdim=True
+            ).indices
+            topk_p = torch.ones_like(topk_index, dtype=torch.float32)
         else:
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            probs = renorm_draft_probs(
+                logits_output.next_token_logits,
+                batch.sampling_info,
+                use_rejection_sampling,
+            )
+            if use_rejection_sampling:
+                topk_p, topk_index = fast_sample(probs, num_samples=1)
+            else:
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
