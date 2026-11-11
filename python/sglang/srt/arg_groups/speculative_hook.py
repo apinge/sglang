@@ -1066,11 +1066,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "trtllm_mha backend only supports topk = 1 for speculative decoding."
             )
 
-    # ROCm/HIP has no CUDA/MUSA sampling-verify kernels, so EAGLE verify would
-    # otherwise fall back to greedy (argmax) and silently ignore temperature and
-    # top_p. Default rejection sampling on -- it routes verify through the Triton
-    # chain sampler -- for configs that support it. See
-    # _should_auto_enable_hip_rejection_sampling for the cases we must not flip.
+    # Diagnostic A/B patch: retain the legacy ROCm EAGLE greedy default.
+    # Explicit --speculative-use-rejection-sampling still restores sampling.
     if _should_auto_enable_hip_rejection_sampling(
         is_hip=get_platform().is_hip,
         use_rejection_sampling=cfg.speculative_use_rejection_sampling,
@@ -1082,18 +1079,13 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         enable_deterministic_inference=cfg.enable_deterministic_inference,
         simulate_acc_len=float(envs.SGLANG_SIMULATE_ACC_LEN.get()),
     ):
-        declare_resolution(
-            server_args,
-            "_handle_eagle_family",
-            speculative_use_rejection_sampling=True,
-        )
-        logger.info(
-            "ROCm needs rejection sampling for EAGLE spec-decode to sample at all; "
-            "enabling speculative_use_rejection_sampling by default."
+        logger.warning(
+            "[MTP sampling A/B] Keeping legacy ROCm EAGLE greedy draft/verify: "
+            "rejection sampling is OFF, so verify ignores temperature/top_p. "
+            "Pass --speculative-use-rejection-sampling to restore sampling."
         )
 
-    # resolved_view, not cfg: the block above may have just decided this field,
-    # and declare_resolution writes to the stash rather than the dataclass.
+    # Read any rejection-sampling choice made by other resolution rules.
     if resolved_view(server_args).speculative_use_rejection_sampling:
         # Resolved alias by now: NEXTN -> EAGLE, Gemma4 draft -> FROZEN_KV_MTP.
         # Only the EAGLE/EAGLE3 draft workers emit a target-vocab proposal that
