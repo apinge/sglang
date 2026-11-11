@@ -169,6 +169,19 @@ Target model: [sammysun0711/Qwen3.8-Flash-Next-PTPC-FP8-PLE-BF16](https://huggin
 ./launch_qwen38_flash_next_fp8_mi308x_pure_tp_4_or_8_or_2.sh
 ```
 
+The script enables the sequence-parallel hyper-connection residual for prefills of at least 2048 tokens, with its
+reduce-scatter and all-gathers overlapped with compute over SDMA through mori (see
+`benchmark/qwen4_seq_parallel/README.md`). mori is not in the base image:
+
+```bash
+apt-get update && apt-get install -y libibverbs-dev   # build-time only
+pip install "amd_mori @ git+https://github.com/apinge/mori.git@qwen3.8-flash-sdma"
+```
+
+Without mori the aiter collectives run, with a warning. `SGLANG_QWEN4_SP_SDMA_RS=0`, `SGLANG_QWEN4_SP_SDMA_AG=0` and
+`SGLANG_QWEN4_SP_SDMA_AG_MOE=0` keep the corresponding collective on aiter; `SGLANG_QWEN4_SEQ_PARALLEL=0` restores
+the all-reduce.
+
 
 
 ### Run benchmark

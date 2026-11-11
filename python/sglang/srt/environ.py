@@ -316,6 +316,25 @@ class Envs:
     # sizes the KV pool. Cap its resident set; 0 disables the trim.
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
+    # Qwen4 TP prefill path: keep the hyper-connection residual stream sharded by
+    # tokens (reduce-scatter / all-gather instead of all-reduce); 0 restores the all-reduce.
+    SGLANG_QWEN4_SEQ_PARALLEL = EnvBool(True)
+    # Arbitrary; smaller batches (decode, short prefill) keep the all-reduce.
+    SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS = EnvInt(2048)
+    # ROCm, sequence-parallel prefill: move each communication to SDMA, overlapped with compute.
+    # Needs mori (layers/sdma_mori.py); without it the aiter collectives run, with a warning.
+    # RS: the producing projection runs in row chunks, each pushed as it finishes.
+    SGLANG_QWEN4_SP_SDMA_RS = EnvBool(True)
+    # "bf16" (exact) or "fp8" (peers' rows as fp8 + a bf16 scale per 32 values; lossy).
+    SGLANG_QWEN4_SP_SDMA_RS_TRANSPORT = EnvStr("bf16")
+    # Row chunks per owner block; None picks the measured best (2 at TP2, 1 above).
+    SGLANG_QWEN4_SP_SDMA_RS_CHUNKS = EnvInt(None)
+    # Attention / GDN input AG: the input projection consumes each peer's block as it lands.
+    SGLANG_QWEN4_SP_SDMA_AG = EnvBool(True)
+    # MoE input AG: combine / norm / mix run in row ranges, each pushed as soon as it is mixed.
+    SGLANG_QWEN4_SP_SDMA_AG_MOE = EnvBool(True)
+    # Minimum number of row ranges; None picks the measured best (4 at TP2, 2 above).
+    SGLANG_QWEN4_SP_SDMA_AG_MOE_CHUNKS = EnvInt(None)
     # Direct gfx942 compressed-QSA operators; unsupported layouts stay native.
     SGLANG_USE_PYHIP_QSA = EnvBool(False)
     # Numerical acceptance only; never enable for performance measurements.

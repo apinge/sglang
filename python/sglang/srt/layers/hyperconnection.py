@@ -273,6 +273,37 @@ class GatedResidual(HyperConnectionBase):
             hyper_input_normed = self.hc_norm(
                 hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
             ).flatten(-2)
+        return self._mix_normed(hyper_input_normed), (hyper_input, hyper_input_normed)
+
+    def can_mix_rows(self, hyper_input: torch.Tensor) -> bool:
+        """Whether `mix_rows` (in-place norm on row slices) applies."""
+        return (
+            self.config.hc_per_branch_norm
+            and self.hc_norm._jit_group_size is not None
+            and hyper_input.is_cuda
+            and hyper_input.dtype in (torch.bfloat16, torch.float16)
+        )
+
+    def mix_rows(
+        self, hyper_input: torch.Tensor, *, normed_out: torch.Tensor, rows: slice
+    ) -> torch.Tensor:
+        """`mix` for one row range: writes the normed rows into `normed_out[rows]`
+        and returns the mixed rows; norm and mix are per token."""
+        from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
+            grouped_gemma_rmsnorm,
+        )
+
+        normed = normed_out[rows]
+        grouped_gemma_rmsnorm(
+            hyper_input[rows],
+            self.hc_norm.weight,
+            self.hc_norm._jit_group_size,
+            self.hc_norm.variance_epsilon,
+            out=normed,
+        )
+        return self._mix_normed(normed)
+
+    def _mix_normed(self, hyper_input_normed: torch.Tensor) -> torch.Tensor:
         if self._gr_read_weights is not None:
             mixed_input = self._gr_read_fn(hyper_input_normed, *self._gr_read_weights)
         elif self._gr_read_enabled:
@@ -319,7 +350,42 @@ class GatedResidual(HyperConnectionBase):
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)
-        return mixed_input, (hyper_input, hyper_input_normed)
+        return mixed_input
+
+    def can_combine_rows(self, dtype: torch.dtype, residuals) -> bool:
+        """Whether `combine_rows` (the JIT kernel on row slices) applies."""
+        hyper_input, hyper_input_normed = residuals
+        return (
+            self._jit_combine_ok
+            and hyper_input.is_cuda
+            and dtype in (torch.bfloat16, torch.float16)
+            and hyper_input.dtype == dtype
+            and hyper_input_normed.dtype == dtype
+            and self.block_inject_weight.weight.dtype == dtype
+        )
+
+    def combine_rows(
+        self,
+        block_output_rows: torch.Tensor,
+        residuals,
+        *,
+        out: torch.Tensor,
+        rows: slice,
+    ) -> None:
+        """`combine` for one row range, written into `out[rows]`; the gate is
+        per token, so row ranges are independent."""
+        from sglang.kernels.ops.elementwise.hc_combine import hc_combine
+
+        hyper_input, hyper_input_normed = residuals
+        hc_combine(
+            block_output_rows,
+            hyper_input[rows],
+            hyper_input_normed[rows],
+            self.block_inject_weight.weight,
+            self.hc_count,
+            self.hidden_size,
+            out=out[rows],
+        )
 
     def combine(self, block_output: torch.Tensor, residuals) -> torch.Tensor:
         hyper_input, hyper_input_normed = residuals

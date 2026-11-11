@@ -107,6 +107,33 @@ export LIBVA_DRIVER_NAME="${LIBVA_DRIVER_NAME:-radeonsi}"
 export SGLANG_GR_READ_FLYDSL="${SGLANG_GR_READ_FLYDSL:-1}"
 export SGLANG_USE_PYHIP_QSA="${SGLANG_USE_PYHIP_QSA:-1}"
 export SGLANG_LOG_QSA_INDEXER_BACKEND="${SGLANG_LOG_QSA_INDEXER_BACKEND:-1}"
+# Sequence-parallel hyper-connection residual for TP prefill (TP > 1); set 0 to disable.
+export SGLANG_QWEN4_SEQ_PARALLEL="${SGLANG_QWEN4_SEQ_PARALLEL:-1}"
+export SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS="${SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS:-2048}"
+# SP communication over SDMA, overlapped with compute (RS, attention/GDN input AG,
+# MoE input AG); set a switch to 0 to keep that collective on aiter.
+export SGLANG_QWEN4_SP_SDMA_RS="${SGLANG_QWEN4_SP_SDMA_RS:-1}"
+export SGLANG_QWEN4_SP_SDMA_AG="${SGLANG_QWEN4_SP_SDMA_AG:-1}"
+export SGLANG_QWEN4_SP_SDMA_AG_MOE="${SGLANG_QWEN4_SP_SDMA_AG_MOE:-1}"
+export SGLANG_QWEN4_SP_SDMA_RS_TRANSPORT="${SGLANG_QWEN4_SP_SDMA_RS_TRANSPORT:-bf16}"
+# RS row chunks per owner block and MoE input AG row ranges; the per-TP defaults were
+# measured on 12000-token prefills and match qwen4_exp.py's _sdma_rs_chunks / _sdma_ag_moe_chunks.
+if (( TP_SIZE == 2 )); then
+  export SGLANG_QWEN4_SP_SDMA_RS_CHUNKS="${SGLANG_QWEN4_SP_SDMA_RS_CHUNKS:-2}"
+  export SGLANG_QWEN4_SP_SDMA_AG_MOE_CHUNKS="${SGLANG_QWEN4_SP_SDMA_AG_MOE_CHUNKS:-4}"
+else
+  export SGLANG_QWEN4_SP_SDMA_RS_CHUNKS="${SGLANG_QWEN4_SP_SDMA_RS_CHUNKS:-1}"
+  export SGLANG_QWEN4_SP_SDMA_AG_MOE_CHUNKS="${SGLANG_QWEN4_SP_SDMA_AG_MOE_CHUNKS:-2}"
+fi
+# mori posts the copies from the GPU (amd_mori, pinned in python/pyproject_other.toml);
+# without a usable mori the aiter collectives run, with a warning.
+export MORI_ENABLE_SDMA="${MORI_ENABLE_SDMA:-1}"
+export MORI_SOCKET_IFNAME="${MORI_SOCKET_IFNAME:-lo}"
+# mori must use the same libdrm copy as the HIP runtime (ROCm's rocm_sysdeps one).
+ROCM_SYSDEPS_LIB="${ROCM_PATH:-/opt/rocm}/lib/rocm_sysdeps/lib"
+if [[ -f "${ROCM_SYSDEPS_LIB}/librocm_sysdeps_drm_amdgpu.so.1" && "${LD_PRELOAD:-}" != *rocm_sysdeps_drm_amdgpu* ]]; then
+  export LD_PRELOAD="${ROCM_SYSDEPS_LIB}/librocm_sysdeps_drm.so.2:${ROCM_SYSDEPS_LIB}/librocm_sysdeps_drm_amdgpu.so.1${LD_PRELOAD:+:${LD_PRELOAD}}"
+fi
 printf 'GR read: installed PyHIP enabled=%s; TP=%s; AITER_MOE_PADDING_SIZE=%s; LINEAR_ATTN_PREFILL_BACKEND=%s\n' \
   "${SGLANG_GR_READ_FLYDSL}" "${TP_SIZE}" "${AITER_MOE_PADDING_SIZE}" \
   "${LINEAR_ATTN_PREFILL_BACKEND}"

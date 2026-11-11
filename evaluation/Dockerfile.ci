@@ -10,6 +10,14 @@ RUN python3 -m pip install --no-deps --no-cache-dir \
 ARG AITER_REF=qwen38-flash-next-dev
 ENV AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=gfx942 PYTORCH_ROCM_ARCH=gfx942 SGLANG_BUILD_RUST_EXTS=none PYTHONPATH=""
 
+# mori runs the Qwen4 sequence-parallel collectives over SDMA; its build needs the
+# ibverbs headers, which the base image lacks. Installed here because the candidate's
+# srt_hip extras pin it by URL, which the requirement check below cannot install.
+RUN apt-get update && apt-get install -y --no-install-recommends libibverbs-dev && \
+    rm -rf /var/lib/apt/lists/*
+RUN MORI_GPU_ARCHS=gfx942 python3 -m pip install --no-cache-dir \
+    "amd_mori @ git+https://github.com/apinge/mori.git@qwen3.8-flash-sdma"
+
 # CI resolves companion branches once per run; keep the evaluator pinned.
 RUN git init /ci/aiter && \
     git -C /ci/aiter remote add origin https://github.com/apinge/aiter.git && \

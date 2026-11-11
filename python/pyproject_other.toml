@@ -114,6 +114,8 @@ tracing = [
 # in its compressed-tensors and torch pins. A dependency added here has to be
 # added there too; nothing enforces that.
 srt_hip = [
+  # SDMA overlap of Qwen4-Exp sequence parallelism; builds need libibverbs-dev.
+  "amd_mori @ git+https://github.com/apinge/mori.git@qwen3.8-flash-sdma",
   "sglang[runtime_common]",
   "torch",
   "petit_kernel==0.0.2",
@@ -123,6 +125,8 @@ srt_hip = [
 
 # Kept in step with srt_hip above by hand; only the two pins below differ.
 srt_hip_rocm724 = [
+  # SDMA overlap of Qwen4-Exp sequence parallelism; builds need libibverbs-dev.
+  "amd_mori @ git+https://github.com/apinge/mori.git@qwen3.8-flash-sdma",
   # ROCm 7.2.4 uses torch 2.11. compressed-tensors 0.15.0 requires
   # torch<2.11, while 0.16.0 supports torch>=2.10.
   "compressed-tensors==0.16.0",
