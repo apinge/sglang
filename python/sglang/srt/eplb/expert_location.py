@@ -371,9 +371,15 @@ class ExpertLocationMetadata:
             return list(
                 range(logical_expert_id, num_physical_experts, self.num_logical_experts)
             )
+        # Weight loading calls this once per expert tensor; indexing the tensor
+        # each time dominates. In-place map updates bump _version.
+        rows = getattr(self, "_logical_to_all_physical_rows", None)
+        if rows is None or rows[0] is not cpu_map or rows[1] != cpu_map._version:
+            rows = (cpu_map, cpu_map._version, cpu_map.tolist())
+            self._logical_to_all_physical_rows = rows
         return [
             physical_expert_id
-            for physical_expert_id in cpu_map[layer_id, logical_expert_id].tolist()
+            for physical_expert_id in rows[2][layer_id][logical_expert_id]
             if physical_expert_id != -1
         ]
 
