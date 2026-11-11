@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export SGLANG_DISABLE_CUDNN_CHECK=1
-export SGLANG_USE_CUDA_IPC_TRANSPORT=1
 export SGLANG_VLM_CACHE_SIZE_MB=8192 #阿里用0
 
 
 export SGLANG_USE_AITER=1
+export SGLANG_ROCM_GPU_JPEG_DECODE=1
+export LIBVA_DRIVERS_PATH="${LIBVA_DRIVERS_PATH:-${ROCM_PATH:-/opt/rocm-7.14}/lib/rocm_sysdeps/lib}"
+export LIBVA_DRIVER_NAME="${LIBVA_DRIVER_NAME:-radeonsi}"
 export AITER_MOE_PADDING_SIZE="${AITER_MOE_PADDING_SIZE:-64}"
 export SGLANG_ROCM_USE_AITER_LINEAR_SHUFFLE=1
 export SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB=1
@@ -28,6 +30,7 @@ draft_model="${DRAFT_MODEL_PATH:-/models/Qwen3.5-397B-A17B-DFlash/}"
  --reasoning-parser qwen3 \
  --tool-call-parser qwen3_coder \
  --enable-multimodal \
+ --mm-feature-transport cuda_ipc \
  --trust-remote-code \
  --speculative-algorithm DFLASH \
  --speculative-draft-model-path "${draft_model}" \
