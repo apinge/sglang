@@ -101,6 +101,9 @@ PY
 # selected below while this disables the unreleased global paged-QSA path.
 #unset SGLANG_USE_AITER
 export SGLANG_USE_AITER=1
+export SGLANG_ROCM_GPU_JPEG_DECODE=1
+export LIBVA_DRIVERS_PATH="${LIBVA_DRIVERS_PATH:-${ROCM_PATH:-/opt/rocm-7.14}/lib/rocm_sysdeps/lib}"
+export LIBVA_DRIVER_NAME="${LIBVA_DRIVER_NAME:-radeonsi}"
 export SGLANG_GR_READ_FLYDSL="${SGLANG_GR_READ_FLYDSL:-1}"
 export SGLANG_USE_PYHIP_QSA="${SGLANG_USE_PYHIP_QSA:-1}"
 export SGLANG_LOG_QSA_INDEXER_BACKEND="${SGLANG_LOG_QSA_INDEXER_BACKEND:-1}"
@@ -130,6 +133,7 @@ command=(
   --mem-fraction-static "${MEM_FRACTION_STATIC}"
   --max-running-requests "${MAX_RUNNING_REQUESTS}"
   --cuda-graph-max-bs-decode "${CUDA_GRAPH_MAX_BS_DECODE}"
+  --mm-feature-transport cuda_ipc
   --mamba-ssm-dtype "${MAMBA_SSM_DTYPE}"
 )
 
