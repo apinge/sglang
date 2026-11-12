@@ -955,6 +955,8 @@ class Envs:
     # unset, the self-check decides.
     SGLANG_ROCM_JPEG_COLOR_CORRECTION = EnvBool(None)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
+    SGLANG_ROCM_USE_AITER_LINEAR_SHUFFLE = EnvBool(False)
+    SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB = EnvBool(False)
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
