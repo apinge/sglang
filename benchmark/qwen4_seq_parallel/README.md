@@ -97,12 +97,13 @@ Everything except mori and the ibverbs headers comes with the ROCm 7.14 image; k
 | torch | 2.12.0+rocm7.14.0 | image | |
 | FlyDSL | 0.3.2 | image | mori's device API compiles the push / wait kernels with it |
 | libibverbs-dev | distro package | **install** | build time only: mori's `setup.py` stops without the ibverbs headers |
-| mori | apinge/mori `qwen3.8-flash-sdma` | **install** | SDMA queues and engine-side completion signals |
+| mori | ROCm/mori `de97cea` | **install** | SDMA queues and engine-side completion signals |
 | PyHIP | `8027faa` | base branch | required by the base branch's QSA path, not by this feature |
 
 mori is pinned in `python/pyproject_other.toml` (`srt_hip`, next to PyHIP) as
-`amd_mori @ git+https://github.com/apinge/mori.git@qwen3.8-flash-sdma`. The branch includes the MI308X
-SDMA engine spread (without it, two of a GPU's xGMI links can share one SDMA engine at TP4).
+`amd_mori @ git+https://github.com/ROCm/mori.git@de97ceacefa96a6ba45b5ed3276abdb4a3bf7fd6`. That upstream
+commit includes the MI308X per-link SDMA engine balancing (ROCm/mori#921; without it, two of a GPU's xGMI links
+can share one SDMA engine at TP4).
 
 Install:
 
@@ -112,7 +113,7 @@ apt-get update && apt-get install -y libibverbs-dev       # RHEL/Fedora: dnf ins
 # 2. mori: pulled in by the srt_hip extras, or on its own into the current environment
 #    (add --target DIR and put DIR on PYTHONPATH to keep it separate). Do not use the
 #    [flydsl] extra: it is unpinned and would replace the image's FlyDSL.
-pip install "amd_mori @ git+https://github.com/apinge/mori.git@qwen3.8-flash-sdma"
+pip install "amd_mori @ git+https://github.com/ROCm/mori.git@de97ceacefa96a6ba45b5ed3276abdb4a3bf7fd6"
 ```
 
 The pip build uses mori's defaults (`BUILD_CCO_SDMA=ON`, local GPU arch); the built libraries do not link
