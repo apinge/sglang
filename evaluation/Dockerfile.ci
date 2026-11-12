@@ -16,7 +16,7 @@ ENV AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=gfx942 PYTORCH_ROCM_ARCH=gfx942 SGLANG_B
 RUN apt-get update && apt-get install -y --no-install-recommends libibverbs-dev && \
     rm -rf /var/lib/apt/lists/*
 RUN MORI_GPU_ARCHS=gfx942 python3 -m pip install --no-cache-dir \
-    "amd_mori @ git+https://github.com/apinge/mori.git@qwen3.8-flash-sdma"
+    "amd_mori @ git+https://github.com/ROCm/mori.git@de97ceacefa96a6ba45b5ed3276abdb4a3bf7fd6"
 
 # CI resolves companion branches once per run; keep the evaluator pinned.
 RUN git init /ci/aiter && \

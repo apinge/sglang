@@ -175,7 +175,7 @@ reduce-scatter and all-gathers overlapped with compute over SDMA through mori (s
 
 ```bash
 apt-get update && apt-get install -y libibverbs-dev   # build-time only
-pip install "amd_mori @ git+https://github.com/apinge/mori.git@qwen3.8-flash-sdma"
+pip install "amd_mori @ git+https://github.com/ROCm/mori.git@de97ceacefa96a6ba45b5ed3276abdb4a3bf7fd6"
 ```
 
 Without mori the aiter collectives run, with a warning. `SGLANG_QWEN4_SP_SDMA_RS=0`, `SGLANG_QWEN4_SP_SDMA_AG=0` and
