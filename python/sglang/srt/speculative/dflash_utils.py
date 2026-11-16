@@ -852,8 +852,16 @@ def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
             "quantized qkv_proj is not supported for this path "
             f"(quant_method={type(quant_method).__name__})",
         )
-    if not hasattr(qkv_proj, "weight"):
+    weight = getattr(qkv_proj, "weight", None)
+    if weight is None:
         return False, "qkv weight tensor is missing"
+    # UnquantizedLinearMethod may store an AITER-swizzled [K, N] matrix.
+    # Both KV-only paths read rows directly, so such weights must instead
+    # go through the linear layer's layout-aware dispatch.
+    if getattr(weight, "aiter_trans_weight", False):
+        return False, "AITER-swizzled qkv weight requires the linear dispatch"
+    if weight.ndim != 2 or weight.dtype not in _DENSE_HEAD_DTYPES:
+        return False, "qkv weight is not a dense floating-point matrix"
     return True, ""
 
 

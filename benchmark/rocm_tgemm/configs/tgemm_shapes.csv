@@ -1,0 +1,8 @@
+M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle
+8192,8192,2560,False,torch.float8_e4m3fnuz,torch.bfloat16,True,True
+8192,2560,3072,False,torch.float8_e4m3fnuz,torch.bfloat16,True,True
+8192,6656,2560,False,torch.float8_e4m3fnuz,torch.bfloat16,True,True
+256,1728,1152,True,torch.bfloat16,torch.bfloat16,False,True
+256,2152,1152,True,torch.bfloat16,torch.bfloat16,False,False
+256,1152,2152,True,torch.bfloat16,torch.bfloat16,False,False
+256,1152,576,True,torch.bfloat16,torch.bfloat16,False,True

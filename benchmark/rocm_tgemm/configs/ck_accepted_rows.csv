@@ -1,0 +1,2 @@
+gfx,cu_num,M,N,K,q_dtype_w,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
+gfx942,80,4,2560,3072,torch.float8_e4m3fnuz,ck,10,0,7.1939,a8w8_bpreshuffle_128x16x32x512_16x16_16x16_32x4x1_32x4x1_1x16x1x8_4x4x1_1x1_intrawave_v1,8.75,1097.75,0.0
