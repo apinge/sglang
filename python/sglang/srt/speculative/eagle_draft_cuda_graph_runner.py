@@ -48,6 +48,7 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
+    is_hip,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -58,6 +59,8 @@ from sglang.srt.utils.device_timer import device_timer_ctx
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+
+_is_hip = is_hip()
 
 
 @dataclass
@@ -96,6 +99,14 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     state). Instead it sets up its own state directly while making sure
     the parent's capture() / backend contract is satisfied.
     """
+
+    def _draft_q_width(self) -> int:
+        """Width of one draft-step proposal row (ROCm keeps it sparse; see hip_verify_sampling)."""
+        if _is_hip:
+            from sglang.srt.speculative.hip_verify_sampling import DRAFT_Q_WIDTH
+
+            return DRAFT_Q_WIDTH
+        return self.model_runner.model_config.vocab_size
 
     def __init__(
         self,
@@ -196,7 +207,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
             draft_probs = (
                 torch.zeros(
-                    (self.max_bs, self.model_runner.model_config.vocab_size),
+                    (self.max_bs, self._draft_q_width()),
                     dtype=torch.float32,
                 )
                 if get_spec().speculative_use_rejection_sampling
@@ -223,6 +234,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             # (SamplingParams rewrites it), and it would read as top_k <= 1, i.e.
             # greedy, for the padded rows and for a run that never copies in.
             self.top_ks = torch.full((self.max_bs,), TOP_K_ALL, dtype=torch.int32)
+            self.top_ps = torch.ones((self.max_bs,), dtype=torch.float)
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -426,9 +438,14 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         if self.buffers.dsa_seed_topk is not None:
             spec_info.dsa_topk_indices = self.buffers.dsa_seed_topk[:num_seqs]
 
+        rocm_sampled_draft = _is_hip and get_spec().speculative_use_rejection_sampling
         sampling_info = SamplingBatchInfo(
             temperatures=self.temperatures[:num_seqs],
-            top_ps=torch.ones((num_seqs,), dtype=torch.float),
+            top_ps=(
+                self.top_ps[:num_seqs]
+                if rocm_sampled_draft
+                else torch.ones((num_seqs,), dtype=torch.float)
+            ),
             top_ks=self.top_ks[:num_seqs],
             min_ps=torch.zeros((num_seqs,), dtype=torch.float),
             is_all_greedy=False,
@@ -642,6 +659,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 forward_batch.sampling_info.temperatures[:raw_bs]
             )
             self.top_ks[:raw_bs].copy_(forward_batch.sampling_info.top_ks[:raw_bs])
+            if _is_hip:
+                self.top_ps[:raw_bs].copy_(forward_batch.sampling_info.top_ps[:raw_bs])
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:

@@ -12,6 +12,17 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 logger = logging.getLogger(__name__)
 
 
+def _draft_q_width(vocab_size: int) -> int:
+    """Width of one draft-step proposal row; ROCm keeps it sparse (hip_verify_sampling)."""
+    from sglang.srt.utils import is_hip
+
+    if is_hip():
+        from sglang.srt.speculative.hip_verify_sampling import DRAFT_Q_WIDTH
+
+        return DRAFT_Q_WIDTH
+    return vocab_size
+
+
 @dataclass
 class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
@@ -212,7 +223,7 @@ class EagleDraftInput(SpecInput):
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             draft_probs=(
-                torch.empty((0, vocab_size), device=device, dtype=torch.float32)
+                torch.empty((0, _draft_q_width(vocab_size)), device=device, dtype=torch.float32)
                 if get_spec().speculative_use_rejection_sampling
                 else None
             ),

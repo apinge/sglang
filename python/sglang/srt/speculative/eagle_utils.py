@@ -807,26 +807,63 @@ def eagle_sample(
     # Sample tokens
     target_predict = None
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-    if _verify_uses_greedy(
+    if _is_hip or _verify_uses_greedy(
         is_all_greedy=sampling_info.is_all_greedy,
         is_cpu=_is_cpu,
         is_hip=_is_hip,
         is_xpu=_is_xpu,
         use_rejection_sampling=use_rejection_sampling,
     ):
-        target_predict = torch.argmax(next_token_logits, dim=-1)
-        target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
-        predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
-            predicts=predict,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=num_correct_drafts,  # mutable
-            candidates=candidates,
-            retrieve_index=verify_input.retrieve_index,
-            retrieve_next_token=verify_input.retrieve_next_token,
-            retrieve_next_sibling=verify_input.retrieve_next_sibling,
-            target_predict=target_predict,
-            topk=verify_input.tree_topk,
-        )
+        hip_sampling = _is_hip and not sampling_info.is_all_greedy
+        if hip_sampling and use_rejection_sampling:
+            from sglang.srt.speculative.hip_verify_sampling import (
+                verify_sampled_chain,
+            )
+
+            # ROCm sampled drafts (hip_draft_proposal): speculative sampling against a
+            # sparse cut target distribution; greedy-draft requests match target samples.
+            verify_sampled_chain(
+                next_token_logits,
+                sampling_info,
+                batch.reqs,
+                batch.seq_lens,
+                candidates,
+                verify_input.retrieve_index,
+                verify_input.draft_probs,
+                predict,
+                accept_index,
+                num_correct_drafts,
+            )
+        else:
+            if hip_sampling:
+                from sglang.srt.speculative.hip_verify_sampling import (
+                    sample_verify_targets,
+                )
+
+                # ROCm has no sampling-verify kernels: sample one target token per verify
+                # row and match it against the drafts (exact speculative sampling for
+                # deterministic drafts), instead of silently committing argmax.
+                target_predict = sample_verify_targets(
+                    next_token_logits,
+                    sampling_info,
+                    batch.reqs,
+                    verify_input.draft_token_num,
+                    batch.seq_lens,
+                )
+            else:
+                target_predict = torch.argmax(next_token_logits, dim=-1)
+            target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+            predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
+                candidates=candidates,
+                retrieve_index=verify_input.retrieve_index,
+                retrieve_next_token=verify_input.retrieve_next_token,
+                retrieve_next_sibling=verify_input.retrieve_next_sibling,
+                target_predict=target_predict,
+                topk=verify_input.tree_topk,
+            )
 
         if _is_hip:
             # On ROCm, the per-rank draft tokens can differ, so ranks accept a
