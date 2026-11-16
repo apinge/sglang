@@ -178,11 +178,15 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 weight_scale = layer.weight_scale.data
 
             if _use_aiter:
+                layout = (16, 16)
                 # keep the weight as (N, K)
                 layer.weight = Parameter(
-                    shuffle_weight(weight, (16, 16)), requires_grad=False
+                    shuffle_weight(weight, layout), requires_grad=False
                 )
+                # Parameter construction drops the shuffle tensor's metadata.
+                layer.weight.is_shuffled = True
             else:
+                # keep the weight as (K, N)
                 layer.weight = Parameter(weight.t(), requires_grad=False)
 
             # required by torch.compile to be torch.nn.Parameter
@@ -234,8 +238,21 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         if isinstance(x, tuple):
             # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:
             # x = (fp8_input, per_tensor_input_scale[, orig_dtype]).
-            # apply_fp8_linear detects the fp8 dtype and skips re-quantizing;
-            # orig_dtype (when present) sets the GEMM output dtype.
+            # Packed channel weights require layout-aware PTPC dispatch even
+            # when tgemm is disabled or the producer requests FP16 output.
+            # The generic path keeps the caller's original output dtype.
+            if (
+                _use_aiter
+                and getattr(layer.weight, "is_shuffled", False)
+                and self.strategy == QuantizationStrategy.CHANNEL
+            ):
+                return apply_fp8_ptpc_linear(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    input_scale=layer.input_scale,
+                    bias=bias,
+                )
             qx, x_scale = x[0], x[1]
             out_dtype = x[2] if len(x) > 2 else None
             return apply_fp8_linear(

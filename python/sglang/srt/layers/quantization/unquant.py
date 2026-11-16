@@ -47,6 +47,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_hip,
     is_npu,
     is_xpu,
@@ -74,6 +75,7 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
+    from aiter.ops.shuffle import shuffle_weight
     from aiter.tuned_gemm import tgemm
 
 
@@ -468,6 +470,21 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
 
+        weight = layer.weight
+        if (
+            _use_aiter
+            and is_gfx942_supported()
+            and get_bool_env_var("SGLANG_ROCM_USE_AITER_LINEAR_SHUFFLE")
+            and weight.dtype == torch.bfloat16
+            and weight.dim() == 2
+            and weight.shape[0] % 16 == 0
+            and weight.shape[1] % 32 == 0
+        ):
+            packed = Parameter(shuffle_weight(weight, (16, 16)), requires_grad=False)
+            packed.is_shuffled = True
+            # Keep dense weights available to decode and DFlash KV slicing.
+            layer.register_parameter("aiter_prefill_weight", packed)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -489,6 +506,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return output
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
+            if x.numel() // x.shape[-1] > 16 and x.dtype == torch.bfloat16:
+                packed = getattr(layer, "aiter_prefill_weight", None)
+                if packed is not None:
+                    # tgemm's non-viewable input fallback expects dense weights.
+                    output = tgemm.mm(
+                        x.reshape(-1, x.shape[-1]), packed, bias, otype=x.dtype
+                    )
+                    return output.view(*x.shape[:-1], packed.shape[0])
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         elif (
@@ -537,6 +562,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run an inference-only BF16 linear into caller-owned storage."""
+        if getattr(layer.weight, "aiter_trans_weight", False):
+            output.copy_(self.apply(layer, x, bias))
+            return output
         if (
             _enable_bf16_splitk_gemm
             and bias is None
