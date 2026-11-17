@@ -918,6 +918,34 @@ def _verify_commit_step_indices(
     return last_correct_step_indices, mamba_steps_to_track
 
 
+def _commit_ple_states_after_replayssm_verify(
+    model_runner,
+    state_batch_indices: torch.Tensor,
+    last_correct_step_indices: torch.Tensor,
+    mamba_track_indices: Optional[torch.Tensor],
+    mamba_steps_to_track: Optional[torch.Tensor],
+) -> None:
+    """Commit PLE side states when ReplaySSM bypasses the generic SSM scatter."""
+    commit_ple = getattr(
+        model_runner.attn_backend, "_update_ple_state_after_mtp_verify", None
+    )
+    if commit_ple is None:
+        return
+    req_pool = model_runner.req_to_token_pool
+    state_indices = req_pool.translate_mamba_indices(state_batch_indices)
+    track_indices = (
+        req_pool.translate_mamba_indices(mamba_track_indices)
+        if mamba_track_indices is not None
+        else None
+    )
+    commit_ple(
+        state_indices,
+        last_correct_step_indices,
+        track_indices,
+        mamba_steps_to_track,
+    )
+
+
 def commit_mamba_states_after_verify(
     target_worker: TpModelWorker,
     batch: ScheduleBatch,
@@ -981,6 +1009,13 @@ def commit_mamba_states_after_verify(
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             null_block_id=-1,
+        )
+        _commit_ple_states_after_replayssm_verify(
+            model_runner,
+            state_batch_indices,
+            last_correct_step_indices,
+            batch.mamba_track_indices,
+            mamba_steps_to_track,
         )
         return
 
@@ -1055,6 +1090,13 @@ def commit_mamba_states_after_verify(
                 batch.mamba_track_indices,
                 mamba_steps_to_track,
             )
+        _commit_ple_states_after_replayssm_verify(
+            model_runner,
+            state_batch_indices,
+            last_correct_step_indices,
+            batch.mamba_track_indices,
+            mamba_steps_to_track,
+        )
         return
 
     # KDA ReplaySSM (fold-every-commit): KDA keeps its own recurrent verify kernel
