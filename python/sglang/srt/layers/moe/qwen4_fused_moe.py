@@ -6,13 +6,12 @@ experts, bit-exact with the aiter runner. Decode: small-M MoE with the output cl
 into gate-up, used only where it beats the tuned path.
 """
 
+import functools
 import logging
-from typing import Optional
 
 import torch
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.topk import TopKOutputChecker
 from sglang.srt.utils import is_gfx942_supported
 
 logger = logging.getLogger(__name__)
@@ -38,6 +37,7 @@ def fused_moe_supported(experts: torch.nn.Module) -> bool:
     )
 
 
+@functools.cache
 def fused_moe_available() -> bool:
     try:
         _prefill_moe()
@@ -70,30 +70,6 @@ def _run(moe_block, hidden_states, topk_weights, topk_ids) -> torch.Tensor:
     )
 
 
-def routed_partial(moe_block, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
-    """[num_tokens, hidden] partial MoE output without the TP reduction; None when the
-    block's routing is not the standard top-k + fused shared expert layout."""
-    topk_output = _standard_topk(moe_block, hidden_states)
-    if topk_output is None:
-        return None
-    out = _run(moe_block, hidden_states, topk_output.topk_weights, topk_output.topk_ids)
-    if envs.SGLANG_QWEN4_FUSED_MOE_CHECK.get() > 0:
-        _check_against_runner(moe_block, hidden_states, topk_output, out)
-    return out
-
-
-def _check_against_runner(moe_block, hidden_states, topk_output, out) -> None:
-    envs.SGLANG_QWEN4_FUSED_MOE_CHECK.set(envs.SGLANG_QWEN4_FUSED_MOE_CHECK.get() - 1)
-    ref = moe_block.experts(hidden_states, topk_output)
-    diff = (ref.float() - out.float()).abs()
-    logger.info(
-        "Qwen4 fused MoE check: M=%d exact_frac=%.6f max_abs=%.3e",
-        hidden_states.shape[0],
-        (diff == 0).float().mean().item(),
-        diff.max().item(),
-    )
-
-
 # Routing metadata all-gathered next to the bf16 MoE input rows, one f32 row per token:
 # [unused, topk_ids (bitcast i32) x topk, topk_weights x topk, pad to a multiple of 8].
 def meta_words(topk: int) -> int:
@@ -104,9 +80,7 @@ def route_meta(moe_block, rows: torch.Tensor) -> torch.Tensor:
     """[n, meta_words] f32 routing metadata of this rank's bf16 rows."""
     topk_output = _standard_topk(moe_block, rows)
     if topk_output is None:
-        raise RuntimeError(
-            "Qwen4 fused MoE fused_route needs the standard top-k output"
-        )
+        raise RuntimeError("Qwen4 fused MoE needs the standard top-k output")
     ids = topk_output.topk_ids.to(torch.int32)
     topk = ids.shape[1]
     meta = rows.new_zeros(rows.shape[0], meta_words(topk), dtype=torch.float32)
@@ -120,13 +94,7 @@ def route_partial(moe_block, x: torch.Tensor, meta: torch.Tensor) -> torch.Tenso
     topk = moe_block.topk.topk_config.top_k + moe_block.num_fused_shared_experts
     topk_weights = meta[:, 1 + topk : 1 + 2 * topk].contiguous()
     topk_ids = meta[:, 1 : 1 + topk].contiguous().view(torch.int32)
-    out = _run(moe_block, x, topk_weights, topk_ids)
-    if envs.SGLANG_QWEN4_FUSED_MOE_CHECK.get() > 0:
-        topk_output = StandardTopKOutput(
-            topk_weights=topk_weights, topk_ids=topk_ids, router_logits=None
-        )
-        _check_against_runner(moe_block, x, topk_output, out)
-    return out
+    return _run(moe_block, x, topk_weights, topk_ids)
 
 
 _DECODE_SMALL_LOGGED: list = []

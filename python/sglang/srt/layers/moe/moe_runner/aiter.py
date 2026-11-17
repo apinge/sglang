@@ -71,12 +71,8 @@ class AiterMoeQuantInfo(MoeQuantInfo):
 
 
 def _qwen4_decode_small(runner_input, quant_info, config, a1_scale, extra):
-    """SGLANG_QWEN4_FUSED_MOE_DECODE: small-M PTPC fp8 decode on aiter's batch1 kernels with
-    the output clear fused into gate-up; None when it does not apply."""
-    from sglang.srt.environ import envs
-
-    if not envs.SGLANG_QWEN4_FUSED_MOE_DECODE.get():
-        return None
+    """Small-M PTPC fp8 decode on aiter's batch1 kernels with the output clear fused into
+    gate-up (Qwen4 MoE shapes on gfx942); None when it does not apply."""
     w13 = quant_info.w13_weight
     if (
         w13.dtype != torch.float8_e4m3fnuz

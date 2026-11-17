@@ -50,7 +50,6 @@ from sglang.srt.layers.moe.qwen4_fused_moe import (
     meta_words,
     route_meta,
     route_partial,
-    routed_partial,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -1596,7 +1595,7 @@ class Qwen4ExpLayerExtensionMixin:
             and envs.SGLANG_QWEN4_SEQ_PARALLEL.get()
             and envs.SGLANG_QWEN4_SP_SDMA_AG_MOE.get()
         )
-        self._fused_moe_mode = self._resolve_fused_moe_mode(config)
+        self._fused_moe = self._fused_moe_enabled(config)
         if self._sp_sdma_ag:
             # The first reader of the attention / GDN input in prefill.
             _install_sp_sdma_ag_consumer(
@@ -1721,7 +1720,7 @@ class Qwen4ExpLayerExtensionMixin:
         if ag is None:
             return None
         ranges = _HcRanges(partial, seq_parallel)
-        if self._fused_moe_mode == "fused_route":
+        if self._fused_moe:
             return self._sp_route_mlp_input(ranges, residual, seq_parallel, ag)
         writer = ag.begin(
             num_tokens=seq_parallel.num_tokens,
@@ -1736,23 +1735,20 @@ class Qwen4ExpLayerExtensionMixin:
             writer.push(r0, r1, mixed)
         return writer.finish(), (combined, normed)
 
-    def _resolve_fused_moe_mode(self, config) -> str:
-        mode = envs.SGLANG_QWEN4_FUSED_MOE.get() if self._sp_sdma_rs else "off"
-        if mode not in ("off", "fused", "fused_route"):
-            raise ValueError(
-                f"SGLANG_QWEN4_FUSED_MOE must be off|fused|fused_route, got {mode!r}"
-            )
-        if mode != "off" and not (
-            config.num_experts
+    def _fused_moe_enabled(self, config) -> bool:
+        """SP prefill MoE on aiter's fused-quant kernels, routed on this rank's rows before
+        the bf16 all-gather; only for gfx942 PTPC fp8 experts with those kernels present."""
+        if not (
+            self._sp_sdma_rs
+            and config.num_experts
             and fused_moe_supported(self.mlp.experts)
             and fused_moe_available()
         ):
-            return "off"
-        if mode == "fused_route":
-            self._route_meta_words = meta_words(
-                config.num_experts_per_tok + self.mlp.num_fused_shared_experts
-            )
-        return mode
+            return False
+        self._route_meta_words = meta_words(
+            config.num_experts_per_tok + self.mlp.num_fused_shared_experts
+        )
+        return True
 
     def _sp_route_mlp_input(self, ranges, residual, seq_parallel: SeqParallelPlan, ag):
         """Pipelined MoE input with routing done on this rank's rows: the bf16 rows and a
@@ -1785,10 +1781,6 @@ class Qwen4ExpLayerExtensionMixin:
         routed = getattr(hidden_states, "_sglang_moe_route", None)
         if routed is not None:
             return route_partial(self.mlp, *routed)
-        if self._fused_moe_mode != "off":
-            partial = routed_partial(self.mlp, hidden_states)
-            if partial is not None:
-                return partial
         with get_forward().scoped(mlp_reduce_scatter=True):
             return self.mlp(hidden_states, forward_batch)
 

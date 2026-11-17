@@ -335,18 +335,6 @@ class Envs:
     SGLANG_QWEN4_SP_SDMA_AG_MOE = EnvBool(True)
     # Minimum number of row ranges; None picks the measured best (4 at TP2, 2 above).
     SGLANG_QWEN4_SP_SDMA_AG_MOE_CHUNKS = EnvInt(None)
-    # SP prefill MoE on aiter's gfx942 fused-quant MoE kernels: "off"; "fused" (gate-up with
-    # fused fp8 requant); "fused_route" also routes this rank's rows before the bf16 all-gather.
-    # Applies only to gfx942 PTPC fp8 MoE with aiter's moe_fused_quant_gfx942; otherwise "off".
-    SGLANG_QWEN4_FUSED_MOE = EnvStr("fused_route")
-    # Numerical acceptance only: compare this many fused MoE calls with the aiter runner (logged).
-    SGLANG_QWEN4_FUSED_MOE_CHECK = EnvInt(0)
-    # gfx942 PTPC fp8 decode: small-M MoE with the output clear fused into gate-up,
-    # used only for the Qwen4 MoE shapes and token counts where it beats the tuned path.
-    SGLANG_QWEN4_FUSED_MOE_DECODE = EnvBool(True)
-    # gfx942: route decode-sized Qwen4 rows (hidden 2560, 512 experts) through the Triton
-    # router instead of aiter's topkGatingSoftmax.
-    SGLANG_QWEN4_TRITON_ROUTER_GFX942 = EnvBool(True)
     # Direct gfx942 compressed-QSA operators; unsupported layouts stay native.
     SGLANG_USE_PYHIP_QSA = EnvBool(False)
     # Numerical acceptance only; never enable for performance measurements.
