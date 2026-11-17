@@ -44,6 +44,14 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.qwen4_fused_moe import (
+    fused_moe_available,
+    fused_moe_supported,
+    meta_words,
+    route_meta,
+    route_partial,
+    routed_partial,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
@@ -1432,6 +1440,23 @@ class _HcRanges:
                 yield s0, s1, rows[s0 - c0 : s1 - c0]
 
 
+_ROUTE_META_AGS = {}
+
+
+def _route_meta_all_gather(meta_words: int) -> SdmaAllGather:
+    """SDMA all-gather of the f32 routing metadata rows; created collectively on first use,
+    in the same order on every rank."""
+    if meta_words not in _ROUTE_META_AGS:
+        _ROUTE_META_AGS[meta_words] = SdmaAllGather(
+            capacity_tokens=get_schedule().max_prefill_tokens,
+            hidden_size=meta_words,
+            dtype=torch.float32,
+            device=torch.device("cuda", torch.cuda.current_device()),
+            cpu_group=get_attn_tp_group().cpu_group,
+        )
+    return _ROUTE_META_AGS[meta_words]
+
+
 def _install_sp_sdma_proj(layer: nn.Module, proj: nn.Module) -> None:
     """Under a sequence-parallel plan, compute the row-parallel projection in row
     chunks and reduce-scatter them over SDMA while the next chunks compute."""
@@ -1571,6 +1596,7 @@ class Qwen4ExpLayerExtensionMixin:
             and envs.SGLANG_QWEN4_SEQ_PARALLEL.get()
             and envs.SGLANG_QWEN4_SP_SDMA_AG_MOE.get()
         )
+        self._fused_moe_mode = self._resolve_fused_moe_mode(config)
         if self._sp_sdma_ag:
             # The first reader of the attention / GDN input in prefill.
             _install_sp_sdma_ag_consumer(
@@ -1695,6 +1721,8 @@ class Qwen4ExpLayerExtensionMixin:
         if ag is None:
             return None
         ranges = _HcRanges(partial, seq_parallel)
+        if self._fused_moe_mode == "fused_route":
+            return self._sp_route_mlp_input(ranges, residual, seq_parallel, ag)
         writer = ag.begin(
             num_tokens=seq_parallel.num_tokens,
             local_rows=seq_parallel.local_rows,
@@ -1707,6 +1735,62 @@ class Qwen4ExpLayerExtensionMixin:
             mixed = mlp_hc.mix_rows(combined, normed_out=normed, rows=slice(r0, r1))
             writer.push(r0, r1, mixed)
         return writer.finish(), (combined, normed)
+
+    def _resolve_fused_moe_mode(self, config) -> str:
+        mode = envs.SGLANG_QWEN4_FUSED_MOE.get() if self._sp_sdma_rs else "off"
+        if mode not in ("off", "fused", "fused_route"):
+            raise ValueError(
+                f"SGLANG_QWEN4_FUSED_MOE must be off|fused|fused_route, got {mode!r}"
+            )
+        if mode != "off" and not (
+            config.num_experts
+            and fused_moe_supported(self.mlp.experts)
+            and fused_moe_available()
+        ):
+            return "off"
+        if mode == "fused_route":
+            self._route_meta_words = meta_words(
+                config.num_experts_per_tok + self.mlp.num_fused_shared_experts
+            )
+        return mode
+
+    def _sp_route_mlp_input(self, ranges, residual, seq_parallel: SeqParallelPlan, ag):
+        """Pipelined MoE input with routing done on this rank's rows: the bf16 rows and a
+        small f32 routing-metadata row are all-gathered (bf16 transport)."""
+        attn_hc, mlp_hc = self.attn_hyper_connection, self.mlp_hyper_connection
+        ag_meta = _route_meta_all_gather(self._route_meta_words)
+        kw = dict(
+            num_tokens=seq_parallel.num_tokens,
+            local_rows=seq_parallel.local_rows,
+            pushes=len(ranges.bounds),
+        )
+        w_x, w_meta = ag.begin(**kw), ag_meta.begin(**kw)
+        combined = torch.empty_like(residual[0])
+        normed = torch.empty_like(combined)
+        for r0, r1, rows in ranges.rows():
+            attn_hc.combine_rows(rows, residual, out=combined, rows=slice(r0, r1))
+            mixed = mlp_hc.mix_rows(combined, normed_out=normed, rows=slice(r0, r1))
+            meta = route_meta(self.mlp, mixed)
+            w_x.push(r0, r1, mixed)
+            w_meta.push(r0, r1, meta)
+        x_all = w_x.finish()
+        # Read back by _sp_moe_partial; same carrier-attribute pattern as _sglang_sp_pending.
+        x_all._sglang_moe_route = (x_all, w_meta.finish())
+        return x_all, (combined, normed)
+
+    def _sp_moe_partial(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        """This rank's MoE partial sum (no TP reduction) of the gathered rows."""
+        routed = getattr(hidden_states, "_sglang_moe_route", None)
+        if routed is not None:
+            return route_partial(self.mlp, *routed)
+        if self._fused_moe_mode != "off":
+            partial = routed_partial(self.mlp, hidden_states)
+            if partial is not None:
+                return partial
+        with get_forward().scoped(mlp_reduce_scatter=True):
+            return self.mlp(hidden_states, forward_batch)
 
     def _qwen4_exp_use_dp_moe_gather(self) -> bool:
         return get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
@@ -1725,8 +1809,7 @@ class Qwen4ExpLayerExtensionMixin:
             return self.mlp(hidden_states)
         if seq_parallel is not None:
             # Returns this rank's partial sum; the postprocess reduce-scatters it.
-            with get_forward().scoped(mlp_reduce_scatter=True):
-                partial = self.mlp(hidden_states, forward_batch)
+            partial = self._sp_moe_partial(hidden_states, forward_batch)
             rs = (
                 _sdma_reduce_scatter_for(
                     seq_parallel, hidden_size=partial.shape[1], dtype=partial.dtype

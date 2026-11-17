@@ -70,6 +70,43 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     fused_moe_kwargs: Optional[dict[str, Any]] = None
 
 
+def _qwen4_decode_small(runner_input, quant_info, config, a1_scale, extra):
+    """SGLANG_QWEN4_FUSED_MOE_DECODE: small-M PTPC fp8 decode on aiter's batch1 kernels with
+    the output clear fused into gate-up; None when it does not apply."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_QWEN4_FUSED_MOE_DECODE.get():
+        return None
+    w13 = quant_info.w13_weight
+    if (
+        w13.dtype != torch.float8_e4m3fnuz
+        or quant_info.quant_type != AiterQuantType.PER_TOKEN
+        or quant_info.hidden_pad
+        or config.activation != "silu"
+        or a1_scale is not None
+        or quant_info.b13 is not None
+        or quant_info.b2 is not None
+        or quant_info.expert_mask is not None
+        or extra
+        or config.no_combine
+        or runner_input.num_local_tokens is not None
+    ):
+        return None
+    from sglang.srt.layers.moe.qwen4_fused_moe import decode_small
+
+    m = runner_input.hidden_states.shape[0]
+    return decode_small(
+        m=m,
+        hidden_states=runner_input.hidden_states,
+        w13=w13,
+        w13_scale=quant_info.w13_scale,
+        w2=quant_info.w2_weight,
+        w2_scale=quant_info.w2_scale,
+        topk_weights=runner_input.topk_weights,
+        topk_ids=runner_input.topk_ids,
+    )
+
+
 @dataclass
 class AiterRunnerInput(RunnerInput):
     hidden_states: torch.Tensor
@@ -327,6 +364,12 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
+
+        small = _qwen4_decode_small(
+            runner_input, quant_info, self.config, a1_scale, extra
+        )
+        if small is not None:
+            return AiterRunnerOutput(hidden_states=small)
 
         # gfx950 small-M MXFP4 kernel (on by default, SGLANG_ROCM_SMALLM_MOE=0 disables): same layouts as aiter, bf16 activations.
         if _SMALLM_MOE_ON and quant_info.w13_weight.element_size() == 1:
