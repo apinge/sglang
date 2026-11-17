@@ -449,6 +449,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 else {}
             ),
         )
+        self._flydsl_decode_cached: Optional[bool] = None
 
         self.out_proj = RowParallelLinear(
             self.value_dim,
@@ -606,6 +607,46 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             prefix=prefix,
             tp_rank=tp_rank,
             tp_size=tp_size,
+        )
+
+    def _gdn_attn_backend(self):
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+        if isinstance(backend, HybridLinearAttnBackend):
+            backend = backend.linear_attn_backend
+        return backend if isinstance(backend, GDNAttnBackend) else None
+
+    def _flydsl_decode_ok(self) -> bool:
+        """gfx942: decode hands the in_proj outputs to the FlyDSL GDN decode kernel."""
+        if self._flydsl_decode_cached is None:
+            backend = self._gdn_attn_backend()
+            self._flydsl_decode_cached = (
+                _use_aiter
+                and backend is not None
+                and backend.supports_flydsl_fused_qkvzba_decode(self.attn)
+            )
+        return self._flydsl_decode_cached
+
+    def _flydsl_prefill_front_ok(self, forward_batch, qkvz) -> bool:
+        """FlyDSL GDN prefill front end gate (gfx942); per batch."""
+        if not self._flydsl_decode_ok():
+            return False
+        from sglang.srt.layers.radix_linear_attention import (
+            get_tc_piecewise_forward_context,
+        )
+
+        if get_tc_piecewise_forward_context() is not None:
+            return False
+        real = forward_batch.global_num_token_non_padded_cpu
+        if real is not None and real < qkvz.shape[0]:
+            return False
+        return self._gdn_attn_backend().supports_flydsl_prefill_front(
+            self.attn, forward_batch
         )
 
     def fix_query_key_value_ordering(
@@ -937,9 +978,42 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     backend, projected_states_qkvz, projected_states_ba, forward_batch
                 )
 
+        if (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_mixed()
+            and isinstance(projected_states_qkvz, torch.Tensor)
+            and isinstance(projected_states_ba, torch.Tensor)
+            and projected_states_qkvz.shape[0] > 0
+            and self._flydsl_prefill_front_ok(forward_batch, projected_states_qkvz)
+        ):
+            from sglang.srt.layers.attention.linear.gdn_backend import (
+                GDNFlyDSLPrefillInput,
+            )
+
+            core_attn_out = self.attn(
+                forward_batch,
+                mixed_qkv=GDNFlyDSLPrefillInput(
+                    projected_states_qkvz, projected_states_ba
+                ),
+                a=None,
+                b=None,
+            )
+            v_tp = self.value_dim // self.attn_tp_size
+            # strided [T, HV, V] view of z: the gated norm reads it in place (Z_IS_3D),
+            # no reshape copy of the in_proj output
+            z = projected_states_qkvz[:, -v_tp:].view(
+                projected_states_qkvz.shape[0], -1, self.head_v_dim
+            )
+            core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+            core_attn_out = self.norm(core_attn_out, z)
+            core_attn_out = core_attn_out.reshape(projected_states_qkvz.shape[0], v_tp)
+            output, _ = self.out_proj(core_attn_out)
+            return output
+
         use_strided_prefill_z = False
         use_fused_decode_proj_conv = (
-            _gdn_decode_fused_proj_conv
+            (_gdn_decode_fused_proj_conv or self._flydsl_decode_ok())
             and forward_batch.forward_mode.is_decode()
             and isinstance(projected_states_qkvz, torch.Tensor)
             and isinstance(projected_states_ba, torch.Tensor)

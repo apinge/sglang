@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Union
+from typing import NamedTuple, Optional, Tuple, Union
 
 import msgspec
 import torch
@@ -12,6 +12,11 @@ from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_aiter import AiterGDNKernel
+from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import (
+    FlyDSLGDNKernel,
+    flydsl_gdn_decode_ops,
+    flydsl_gdn_prefill_op,
+)
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnBackends,
@@ -43,6 +48,22 @@ if is_cuda() or is_hip() or is_xpu():
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
 _fused_decode_proj_conv_logged = False
+
+_gdn_flydsl_prefill_logged = False
+
+
+class GDNFlyDSLPrefillInput(NamedTuple):
+    """Model -> backend payload: in_proj outputs for the FlyDSL prefill front end
+    (causal conv + SiLU + q/k/v split + q/k L2 norm in one kernel)."""
+
+    qkvz: torch.Tensor
+    ba: torch.Tensor
+
+    @property
+    def shape(self):  # RadixLinearAttention inspects mixed_qkv.shape[0]
+        return self.qkvz.shape
+
+
 _fused_decode_proj_conv_fallback_logged = False
 _fused_decode_proj_conv_layers_logged: set[int] = set()
 _fused_decode_real_tensor_verified_layers: set[int] = set()
@@ -269,6 +290,8 @@ class GDNKernelDispatcher:
         cutedsl_kernel = None
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
+            if _is_hip and flydsl_gdn_decode_ops() is not None:
+                self.decode_kernel = FlyDSLGDNKernel(fallback_kernel=triton_kernel)
         elif decode_backend.is_intel_xpu():
             if not is_xpu():
                 raise ValueError("--linear-attn-backend intel_xpu requires Intel XPU")
@@ -533,6 +556,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
         super().__init__(model_runner)
+        self._flydsl_layer_ok_cache: dict[int, bool] = {}
         self.enable_mis = get_exec().features.enable_mis
         self.mis_metadata: Optional[GDNMISMetadata] = None
         self.conv_states_shape = (
@@ -661,6 +685,105 @@ class GDNAttnBackend(MambaAttnBackendBase):
             retrieve_parent_token
         )
 
+    def _flydsl_layer_ok(self, layer: RadixLinearAttention) -> bool:
+        """Static per-layer gate shared by the FlyDSL decode and prefill paths."""
+        ok = self._flydsl_layer_ok_cache.get(layer.layer_id)
+        if ok is None:
+            layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+            kernel = self.kernel_dispatcher.decode_kernel
+            ok = (
+                isinstance(kernel, FlyDSLGDNKernel)
+                and layer_cache.replayssm_d is None
+                and layer.num_v_heads % layer.num_k_heads == 0
+                and layer.A_log.dtype == torch.float32
+                and kernel.supports_fused_qkvzba_conv1d_decode(
+                    conv_weights=layer.conv_weights,
+                    bias=layer.bias,
+                    activation=layer.activation,
+                    conv_states=layer_cache.conv[0],
+                    ssm_states=layer_cache.temporal,
+                    head_k_dim=layer.head_k_dim,
+                    head_v_dim=layer.head_v_dim,
+                )
+            )
+            self._flydsl_layer_ok_cache[layer.layer_id] = ok
+        return ok
+
+    def supports_flydsl_fused_qkvzba_decode(self, layer: RadixLinearAttention) -> bool:
+        """Whether decode should hand in (projected_qkvz, projected_ba) for this layer."""
+        return self._flydsl_layer_ok(layer)
+
+    def supports_flydsl_prefill_front(
+        self, layer: RadixLinearAttention, forward_batch: ForwardBatch
+    ) -> bool:
+        """Per-batch gate for GDNFlyDSLPrefillInput (static parts cached per layer)."""
+        if not self._flydsl_layer_ok(layer) or flydsl_gdn_prefill_op() is None:
+            return False
+        fm = self.forward_metadata
+        if (
+            self.mis_metadata is not None
+            or fm is None
+            or fm.has_mamba_track_mask
+            or fm.aiter_gdn_prefill_metadata is None
+            or not isinstance(self.kernel_dispatcher.extend_kernel, AiterGDNKernel)
+            or self.kernel_dispatcher.extend_kernel._ops is None
+            or forward_batch.extend_seq_lens_cpu is None
+        ):
+            return False
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        conv_states, ssm_states = layer_cache.conv[0], layer_cache.temporal
+        return (
+            conv_states.is_contiguous()
+            and ssm_states.is_contiguous()
+            and conv_states.stride(-2) == 3
+        )
+
+    def _forward_extend_flydsl_front(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        payload: "GDNFlyDSLPrefillInput",
+        **kwargs,
+    ):
+        global _gdn_flydsl_prefill_logged
+        if not _gdn_flydsl_prefill_logged:
+            rank0_log("Using FlyDSL GDN prefill front end (conv+split+l2norm).")
+            _gdn_flydsl_prefill_logged = True
+        fm = self.forward_metadata
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        conv_states, ssm_states = layer_cache.conv[0], layer_cache.temporal
+        qkvz, ba = payload.qkvz, payload.ba
+        hv = layer.num_v_heads
+        q, k, v = flydsl_gdn_prefill_op()(
+            qkvz,
+            layer.conv_weights,
+            conv_states,
+            fm.mamba_cache_indices,
+            forward_batch.extend_prefix_lens > 0,
+            fm.query_start_loc,
+            layer.num_k_heads,
+            hv,
+            max(forward_batch.extend_seq_lens_cpu),
+        )
+        g, beta = fused_gdn_gating(layer.A_log, ba[:, hv:], ba[:, :hv], layer.dt_bias)
+        core_attn_out, _, _ = self.kernel_dispatcher.extend(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            ssm_states=ssm_states,
+            cache_indices=fm.mamba_cache_indices,
+            query_start_loc=fm.query_start_loc,
+            aiter_gdn_prefill_metadata=fm.aiter_gdn_prefill_metadata,
+            state_checkpoint_cu_starts=fm.state_checkpoint_cu_starts,
+            num_state_checkpoints=fm.num_state_checkpoints,
+            state_checkpoint_every_n_tokens=fm.state_checkpoint_every_n_tokens,
+            output=kwargs.get("linear_attn_output"),
+            qk_l2normed=True,
+        )
+        return core_attn_out
+
     def forward_decode(
         self,
         layer: RadixLinearAttention,
@@ -704,6 +827,31 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "(projected_qkvz, projected_ba)"
                 )
             projected_qkvz, projected_ba = mixed_qkv
+            if self._flydsl_layer_ok(layer):
+                core_attn_out, z = (
+                    self.kernel_dispatcher.decode_kernel.fused_qkvzba_conv1d_decode(
+                        projected_qkvz,
+                        projected_ba,
+                        conv_states=conv_states,
+                        conv_weights=layer.conv_weights,
+                        A_log=layer.A_log,
+                        dt_bias=layer.dt_bias,
+                        scale=layer.head_k_dim**-0.5,
+                        ssm_states=ssm_states,
+                        cache_indices=cache_indices,
+                        num_k_heads=layer.num_k_heads,
+                        num_v_heads=layer.num_v_heads,
+                        head_v_dim=layer.head_v_dim,
+                    )
+                )
+                self._track_mamba_state_decode(
+                    forward_batch,
+                    conv_states,
+                    ssm_states,
+                    cache_indices,
+                    layer.layer_id,
+                )
+                return core_attn_out, z
             eligible, eligibility_reason = (
                 can_use_fused_qkvzba_causal_conv1d_update_contiguous(
                     projected_qkvz,
@@ -917,6 +1065,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        if isinstance(mixed_qkv, GDNFlyDSLPrefillInput):
+            return self._forward_extend_flydsl_front(
+                layer, forward_batch, mixed_qkv, **kwargs
+            )
         assert isinstance(mixed_qkv, torch.Tensor)
         seq_len = mixed_qkv.shape[0]
 
