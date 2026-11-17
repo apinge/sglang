@@ -124,6 +124,15 @@ class TestGdnFlyDSLGfx942(unittest.TestCase):
         )
         torch.testing.assert_close(ssm_p, ssm_ref, rtol=0, atol=1e-5)
 
+        # The FlyDSL kernel reads bf16 activations only; fp16 must take the Triton path.
+        mixed16, a16, b16 = mixed.half(), ba[:, HV:].half(), ba[:, :HV].half()
+        kw16 = dict(common, dt_bias=dt_bias.half(), num_v_heads=HV, head_v_dim=D)
+        ssm_t, ssm_h = ssm.clone(), ssm.clone()
+        o_t = triton.packed_decode(mixed16, a16, b16, ssm_states=ssm_t, **kw16)
+        o_h = flydsl.packed_decode(mixed16, a16, b16, ssm_states=ssm_h, **kw16)
+        torch.testing.assert_close(o_h, o_t, rtol=0, atol=0)
+        torch.testing.assert_close(ssm_h, ssm_t, rtol=0, atol=0)
+
     def test_prefill_front_matches_triton_chain(self):
         """Varlen boundaries: sequences shorter than the conv width, with and without
         an initial conv state, must give the same q/k/v and final conv cache."""

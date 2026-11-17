@@ -38,6 +38,42 @@ def _state_ok(ssm_states: torch.Tensor) -> bool:
     )
 
 
+def _params_ok(A_log: torch.Tensor, dt_bias: torch.Tensor) -> bool:
+    return A_log.dtype == torch.float32 and dt_bias.dtype in (
+        torch.bfloat16,
+        torch.float32,
+    )
+
+
+def _packed_decode_ok(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    scale: float,
+    ssm_states: torch.Tensor,
+    cache_indices: torch.Tensor,
+    num_v_heads: int,
+    head_v_dim: int,
+) -> bool:
+    # The FlyDSL kernel reads bf16 activations, fp32 A_log and K = V = 128 heads.
+    if not (
+        _state_ok(ssm_states)
+        and head_v_dim == 128
+        and ssm_states.shape[1] == num_v_heads
+        and cache_indices.dtype == torch.int32
+        and mixed_qkv.dtype == a.dtype == b.dtype == torch.bfloat16
+        and mixed_qkv.stride(-1) == a.stride(-1) == b.stride(-1) == 1
+        and _params_ok(A_log, dt_bias)
+        and abs(scale - 128**-0.5) < 1e-12
+    ):
+        return False
+    qk_dim = mixed_qkv.shape[1] - num_v_heads * 128
+    num_k_heads = qk_dim // 256
+    return qk_dim > 0 and qk_dim % 256 == 0 and num_v_heads % num_k_heads == 0
+
+
 class FlyDSLGDNKernel(LinearAttnKernelBase):
     """gfx942 FlyDSL GDN decode with the Triton kernel's interface.
 
@@ -77,11 +113,17 @@ class FlyDSLGDNKernel(LinearAttnKernelBase):
         head_v_dim: int,
         **kwargs,
     ) -> torch.Tensor:
-        if (
-            kwargs.get("replayssm_d") is not None
-            or not _state_ok(ssm_states)
-            or head_v_dim != 128
-            or cache_indices.dtype != torch.int32
+        if kwargs.get("replayssm_d") is not None or not _packed_decode_ok(
+            mixed_qkv,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            scale,
+            ssm_states,
+            cache_indices,
+            num_v_heads,
+            head_v_dim,
         ):
             return self.fallback_kernel.packed_decode(
                 mixed_qkv,
@@ -114,6 +156,8 @@ class FlyDSLGDNKernel(LinearAttnKernelBase):
 
     def supports_fused_qkvzba_conv1d_decode(
         self,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
         conv_weights: torch.Tensor,
         bias: Optional[torch.Tensor],
         activation: str,
@@ -125,6 +169,7 @@ class FlyDSLGDNKernel(LinearAttnKernelBase):
         return (
             head_k_dim == 128
             and head_v_dim == 128
+            and _params_ok(A_log, dt_bias)
             and bias is None
             and activation in ("silu", "swish")
             and conv_weights.dim() == 2

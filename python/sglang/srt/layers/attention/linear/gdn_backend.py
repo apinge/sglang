@@ -694,9 +694,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ok = (
                 isinstance(kernel, FlyDSLGDNKernel)
                 and layer_cache.replayssm_d is None
+                and layer.num_q_heads == layer.num_k_heads
+                and layer.head_q_dim == layer.head_k_dim
                 and layer.num_v_heads % layer.num_k_heads == 0
-                and layer.A_log.dtype == torch.float32
                 and kernel.supports_fused_qkvzba_conv1d_decode(
+                    A_log=layer.A_log,
+                    dt_bias=layer.dt_bias,
                     conv_weights=layer.conv_weights,
                     bias=layer.bias,
                     activation=layer.activation,
