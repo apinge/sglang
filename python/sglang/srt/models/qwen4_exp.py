@@ -45,12 +45,13 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.qwen4_fused_moe import (
-    fused_moe_available,
     fused_moe_supported,
+    fused_route_supported,
     meta_words,
     route_meta,
     route_partial,
 )
+from sglang.srt.layers.moe.topk import ROCM_TRITON_ROUTER_MAX_ROWS
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
@@ -1595,7 +1596,8 @@ class Qwen4ExpLayerExtensionMixin:
             and envs.SGLANG_QWEN4_SEQ_PARALLEL.get()
             and envs.SGLANG_QWEN4_SP_SDMA_AG_MOE.get()
         )
-        self._fused_moe = self._fused_moe_enabled(config)
+        # Resolved on the first SP prefill: the gate reads the loaded (shuffled) weights.
+        self._fused_moe: Optional[bool] = None
         if self._sp_sdma_ag:
             # The first reader of the attention / GDN input in prefill.
             _install_sp_sdma_ag_consumer(
@@ -1720,7 +1722,7 @@ class Qwen4ExpLayerExtensionMixin:
         if ag is None:
             return None
         ranges = _HcRanges(partial, seq_parallel)
-        if self._fused_moe:
+        if self._use_fused_route(ranges, seq_parallel):
             return self._sp_route_mlp_input(ranges, residual, seq_parallel, ag)
         writer = ag.begin(
             num_tokens=seq_parallel.num_tokens,
@@ -1735,26 +1737,34 @@ class Qwen4ExpLayerExtensionMixin:
             writer.push(r0, r1, mixed)
         return writer.finish(), (combined, normed)
 
-    def _fused_moe_enabled(self, config) -> bool:
-        """SP prefill MoE on aiter's fused-quant kernels, routed on this rank's rows before
-        the bf16 all-gather; only for gfx942 PTPC fp8 experts with those kernels present."""
-        if not (
-            self._sp_sdma_rs
-            and config.num_experts
-            and fused_moe_supported(self.mlp.experts)
-            and fused_moe_available()
-        ):
-            return False
-        self._route_meta_words = meta_words(
-            config.num_experts_per_tok + self.mlp.num_fused_shared_experts
+    def _use_fused_route(
+        self, ranges: _HcRanges, seq_parallel: SeqParallelPlan
+    ) -> bool:
+        """Route this rank's rows before the bf16 all-gather and run the MoE on aiter's
+        fused-quant kernels, only where that computes what self.mlp would."""
+        if self._fused_moe is None:
+            self._fused_moe = bool(
+                self._sp_sdma_rs
+                and self.config.num_experts
+                and fused_moe_supported(self.mlp)
+            )
+        return (
+            self._fused_moe
+            # The gathered rows always take the aiter router; keep every range above the
+            # row count where topk switches to the Triton router.
+            and min(r1 - r0 for r0, r1 in ranges.bounds) > ROCM_TRITON_ROUTER_MAX_ROWS
+            and fused_route_supported(self.mlp, seq_parallel.num_tokens)
         )
-        return True
 
     def _sp_route_mlp_input(self, ranges, residual, seq_parallel: SeqParallelPlan, ag):
         """Pipelined MoE input with routing done on this rank's rows: the bf16 rows and a
         small f32 routing-metadata row are all-gathered (bf16 transport)."""
         attn_hc, mlp_hc = self.attn_hyper_connection, self.mlp_hyper_connection
-        ag_meta = _route_meta_all_gather(self._route_meta_words)
+        ag_meta = _route_meta_all_gather(
+            meta_words(
+                self.mlp.topk.topk_config.top_k + self.mlp.num_fused_shared_experts
+            )
+        )
         kw = dict(
             num_tokens=seq_parallel.num_tokens,
             local_rows=seq_parallel.local_rows,
@@ -1769,9 +1779,12 @@ class Qwen4ExpLayerExtensionMixin:
             meta = route_meta(self.mlp, mixed)
             w_x.push(r0, r1, mixed)
             w_meta.push(r0, r1, meta)
+        # Both writers wait on the hub's shared per-peer put counter and their pushes
+        # interleave, so only the later-begun writer's wait covers every put: finish it first.
+        meta_all = w_meta.finish()
         x_all = w_x.finish()
         # Read back by _sp_moe_partial; same carrier-attribute pattern as _sglang_sp_pending.
-        x_all._sglang_moe_route = (x_all, w_meta.finish())
+        x_all._sglang_moe_route = (x_all, meta_all)
         return x_all, (combined, normed)
 
     def _sp_moe_partial(

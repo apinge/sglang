@@ -3,6 +3,7 @@ through the fused prefill MoE, and the gates that keep other models off these pa
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -20,7 +21,8 @@ HIDDEN, EXPERTS, TOPK, SHARED_ID = 2560, 513, 10, 512
 FP8 = torch.float8_e4m3fnuz
 
 
-def _ptpc_experts(inter: int) -> SimpleNamespace:
+def _ptpc_experts(inter: int, shuffled: bool = True) -> torch.nn.Module:
+    """Experts laid out like CompressedTensorsW8A8Fp8MoE's aiter PTPC weights."""
     from aiter.ops.shuffle import shuffle_weight
 
     gen = torch.Generator(device="cuda").manual_seed(0)
@@ -32,12 +34,17 @@ def _ptpc_experts(inter: int) -> SimpleNamespace:
 
     w13, s13 = quant(2 * inter, HIDDEN)
     w2, s2 = quant(HIDDEN, inter)
-    w13, w2 = shuffle_weight(w13, (16, 16)), shuffle_weight(w2, (16, 16))
-    w13.is_shuffled = True
-    w2.is_shuffled = True
-    return SimpleNamespace(
-        w13_weight=w13, w13_weight_scale=s13, w2_weight=w2, w2_weight_scale=s2
-    )
+    experts = torch.nn.Module()
+    experts.hidden_size = HIDDEN
+    for name, value in (("w13_weight_scale", s13), ("w2_weight_scale", s2)):
+        setattr(experts, name, torch.nn.Parameter(value, requires_grad=False))
+    for name, w in (("w13_weight", w13), ("w2_weight", w2)):
+        if shuffled:
+            w = shuffle_weight(w, (16, 16))
+        param = torch.nn.Parameter(w, requires_grad=False)
+        param.is_shuffled = shuffled
+        setattr(experts, name, param)
+    return experts
 
 
 class _TopK:
@@ -53,7 +60,9 @@ class _TopK:
 class _MoeBlock:
     """The attributes of a Qwen4 MoE block that qwen4_fused_moe reads."""
 
+    num_experts = EXPERTS - 1
     num_fused_shared_experts = 1
+    shared_expert = None
 
     def __init__(self, experts):
         self.experts = experts
@@ -119,22 +128,46 @@ class TestQwen4FusedMoeGfx942(CustomTestCase):
         ref = _aiter_fused_moe(x, topk_output, experts)
         torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
-    def test_prefill_gate_rejects_non_ptpc_experts(self):
-        """Default-on prefill path must only take per-output-channel fp8 experts."""
-        w13 = torch.empty(4, 64, 32, dtype=FP8, device="cuda")
+    def test_prefill_gate_takes_only_what_the_fused_path_computes(self):
+        """The default-on prefill path replaces self.mlp, so it must reject every block whose
+        MoE it would compute differently: unshuffled (Triton-runner) weights, a separate
+        shared-expert MLP, EP, non-per-channel scales, or a shape with no tuned config."""
+        parallel = SimpleNamespace(moe_ep_size=1)
+        a2a = SimpleNamespace(is_none=lambda: True)
+        no_capture = dict(
+            get_global_experts_capturer=lambda: None,
+            get_global_expert_distribution_recorder=lambda: SimpleNamespace(
+                recording=False
+            ),
+        )
+        with (
+            mock.patch.object(mm, "get_parallel", lambda: parallel),
+            mock.patch.object(mm, "get_moe_a2a_backend", lambda: a2a),
+            mock.patch.multiple(mm, **no_capture),
+        ):
+            block = _MoeBlock(_ptpc_experts(inter=192))
+            self.assertTrue(mm.fused_moe_supported(block))
+            self.assertTrue(mm.fused_route_supported(block, num_tokens=12000))
 
-        def experts(scale_shape):
-            module = torch.nn.Module()
-            module.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
-            module.w13_weight_scale = torch.nn.Parameter(
-                torch.ones(scale_shape, device="cuda"), requires_grad=False
+            self.assertFalse(
+                mm.fused_moe_supported(_MoeBlock(_ptpc_experts(192, shuffled=False)))
             )
-            return module
+            separate_shared = _MoeBlock(block.experts)
+            separate_shared.shared_expert = torch.nn.Module()
+            self.assertFalse(mm.fused_moe_supported(separate_shared))
+            per_tensor = _MoeBlock(_ptpc_experts(inter=192))
+            per_tensor.experts.w13_weight_scale = torch.nn.Parameter(
+                torch.ones(EXPERTS, 2, device="cuda"), requires_grad=False
+            )
+            self.assertFalse(mm.fused_moe_supported(per_tensor))
+            parallel.moe_ep_size = 2
+            self.assertFalse(mm.fused_moe_supported(block))
+            parallel.moe_ep_size = 1
 
-        self.assertTrue(mm.fused_moe_supported(experts((4, 64, 1))))
-        self.assertFalse(mm.fused_moe_supported(experts((4, 2))))  # per tensor
-        self.assertFalse(mm.fused_moe_supported(experts((4, 1, 1))))  # per expert
-        self.assertFalse(mm.fused_moe_supported(torch.nn.Module()))  # unquantized
+            # TP8 pads inter 80 to 128, which has no tuned FlyDSL prefill config.
+            tp8 = _MoeBlock(_ptpc_experts(inter=128))
+            self.assertTrue(mm.fused_moe_supported(tp8))
+            self.assertFalse(mm.fused_route_supported(tp8, num_tokens=12000))
 
     def test_decode_small_scope_and_graph_replay(self):
         """Default-on decode path: only Qwen4 shapes at small M; CUDA-graph replay matches

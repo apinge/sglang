@@ -159,6 +159,10 @@ _RENORMALIZE_SUM_EPSILON = 1e-20
 _skip_hip_pad_mask = get_bool_env_var("SGLANG_MORI_NO_PAD_MASK", "False")
 
 
+# Row cap of the ROCm Triton softmax router; larger inputs take aiter's topk kernel.
+ROCM_TRITON_ROUTER_MAX_ROWS = 128
+
+
 def _use_rocm_triton_softmax_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -177,7 +181,7 @@ def _use_rocm_triton_softmax_topk(
         will_use_aiter_moe()
         and arch_hidden_ok
         and hidden_states.dtype == torch.bfloat16
-        and gating_output.shape[0] <= 128
+        and gating_output.shape[0] <= ROCM_TRITON_ROUTER_MAX_ROWS
         and gating_output.shape[1] == 512
         and gating_output.dtype == torch.bfloat16
         and topk == 10

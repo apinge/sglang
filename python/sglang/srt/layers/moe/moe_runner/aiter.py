@@ -73,13 +73,22 @@ class AiterMoeQuantInfo(MoeQuantInfo):
 def _qwen4_decode_small(runner_input, quant_info, config, a1_scale, extra):
     """Small-M PTPC fp8 decode on aiter's batch1 kernels with the output clear fused into
     gate-up (Qwen4 MoE shapes on gfx942); None when it does not apply."""
-    w13 = quant_info.w13_weight
+    w13, w2 = quant_info.w13_weight, quant_info.w2_weight
     if (
         w13.dtype != torch.float8_e4m3fnuz
+        or w2.dtype != torch.float8_e4m3fnuz
+        or not (
+            getattr(w13, "is_shuffled", False) and getattr(w2, "is_shuffled", False)
+        )
         or quant_info.quant_type != AiterQuantType.PER_TOKEN
+        or tuple(quant_info.w13_scale.shape) != (*w13.shape[:2], 1)
+        or tuple(quant_info.w2_scale.shape) != (*w2.shape[:2], 1)
         or quant_info.hidden_pad
+        or quant_info.doweight_stage1
         or config.activation != "silu"
         or a1_scale is not None
+        or quant_info.a2_scale is not None
+        or runner_input.topk_ids.dtype != torch.int32
         or quant_info.b13 is not None
         or quant_info.b2 is not None
         or quant_info.expert_mask is not None
@@ -96,7 +105,7 @@ def _qwen4_decode_small(runner_input, quant_info, config, a1_scale, extra):
         hidden_states=runner_input.hidden_states,
         w13=w13,
         w13_scale=quant_info.w13_scale,
-        w2=quant_info.w2_weight,
+        w2=w2,
         w2_scale=quant_info.w2_scale,
         topk_weights=runner_input.topk_weights,
         topk_ids=runner_input.topk_ids,
