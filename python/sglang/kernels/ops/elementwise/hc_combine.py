@@ -11,6 +11,11 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 
+# The two-row kernel (ROCm only; measured on MI308X, not on NVIDIA) is bit-identical to the one-row
+# kernel. It wins up to 4 x 2560 elements per row and spills above (0.89x at 4 x 4096).
+_ROWS2 = torch.version.hip is not None
+_ROWS2_MAX_ROW = 4 * 2560
+
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
@@ -34,14 +39,17 @@ def _jit_hc_combine_module(
             "Must be a multiple of 2048."
         )
     args = make_cpp_args(hc_count, hidden_size, is_arch_support_pdl(), dtype)
+    wrappers = [
+        ("hc_combine", f"HcCombineKernel<{args}>::run"),
+        ("hc_combine_split", f"HcCombineSplitKernel<{args}>::run"),
+    ]
+    if _ROWS2:
+        wrappers.append(("hc_combine_rows2", f"HcCombineKernel<{args}, true>::run"))
     return load_jit(
         "hc_combine",
         *args,
         cuda_files=["elementwise/hc_combine.cuh"],
-        cuda_wrappers=[
-            ("hc_combine", f"HcCombineKernel<{args}>::run"),
-            ("hc_combine_split", f"HcCombineSplitKernel<{args}>::run"),
-        ],
+        cuda_wrappers=wrappers,
     )
 
 
@@ -88,7 +96,10 @@ def hc_combine(
         out = out.reshape(-1, hc_count * hidden_size)
 
     module = _jit_hc_combine_module(hc_count, hidden_size, residual.dtype)
-    module.hc_combine(y, r, n, inject_weight, out)
+    if _ROWS2 and hc_count * hidden_size <= _ROWS2_MAX_ROW:
+        module.hc_combine_rows2(y, r, n, inject_weight, out)
+    else:
+        module.hc_combine(y, r, n, inject_weight, out)
     return out.reshape(residual.shape)
 
 
