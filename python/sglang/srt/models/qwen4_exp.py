@@ -1,5 +1,6 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
+import functools
 import math
 from contextlib import nullcontext
 from typing import Any, Iterable, Iterator, List, Optional, Set, Tuple, Union
@@ -1482,6 +1483,9 @@ def _install_sp_sdma_ag_consumer(proj: nn.Module) -> None:
         pending: Optional[PendingAllGather] = getattr(x, "_sglang_sp_ag_pending", None)
         if pending is None:
             return plain_forward(x)
+        weights = _zero_copy_weights(proj)
+        if weights is not None:
+            return _consume_all_gather_into(pending, x, *weights), None
         out = bias = None
         for r0, r1, rows in pending.blocks():
             y, bias = plain_forward(rows)
@@ -1491,6 +1495,64 @@ def _install_sp_sdma_ag_consumer(proj: nn.Module) -> None:
         return out, bias
 
     proj.forward = forward
+
+
+@functools.cache
+def _aiter_gemm_takes_out() -> bool:
+    """Whether aiter.gemm_a8w8_bpreshuffle accepts out=. Its torch-op wrapper hides the
+    signature; the fake mirrors it."""
+    import inspect
+
+    try:
+        from aiter.ops.gemm_op_a8w8 import gemm_a8w8_bpreshuffle_fake
+    except ImportError:
+        return False
+    return "out" in inspect.signature(gemm_a8w8_bpreshuffle_fake).parameters
+
+
+def _zero_copy_weights(proj: nn.Module):
+    """(weight, weight_scale) where plain_forward is exactly aiter's PTPC FP8 GEMM on the rows
+    (compressed-tensors per-channel FP8), with no bias, output all-gather or layernorm-SP matmul."""
+    from compressed_tensors.quantization import QuantizationStrategy
+
+    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsLinearMethod,
+    )
+    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+        compressed_tensors_w8a8_fp8 as w8a8,
+    )
+
+    if (
+        not _aiter_gemm_takes_out()
+        or proj.gather_output
+        or proj.bias is not None
+        or (get_forward().sp_active and proj.tp_size > 1)
+        or not isinstance(proj.quant_method, CompressedTensorsLinearMethod)
+        or not isinstance(proj.scheme, w8a8.CompressedTensorsW8A8Fp8)
+        or not w8a8._use_aiter
+        or proj.scheme.strategy != QuantizationStrategy.CHANNEL
+        or proj.scheme.weight_block_size is not None
+    ):
+        return None
+    return proj.weight, proj.weight_scale
+
+
+def _consume_all_gather_into(
+    pending: PendingAllGather,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Each landed block's PTPC GEMM writes its rows of the output in place."""
+    import aiter
+
+    out = torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
+    for r0, r1, rows in pending.blocks():
+        x_q, x_scale = aiter.per_token_quant_hip(rows, quant_dtype=aiter.dtypes.fp8)
+        aiter.gemm_a8w8_bpreshuffle(
+            x_q, weight, x_scale, weight_scale, None, x.dtype, out=out[r0:r1]
+        )
+    return out
 
 
 def _needs_hc_state(forward_batch: ForwardBatch) -> bool:

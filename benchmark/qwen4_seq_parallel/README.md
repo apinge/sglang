@@ -87,6 +87,15 @@ reduce-scatter / all-gather of plain sequence parallelism.
 
 All of them act only with `SGLANG_QWEN4_SEQ_PARALLEL=1`.
 
+### TP2 prefill: AG zero copy, two-row hc_combine (MI308X)
+
+- AG consumer zero copy: each landed block's PTPC GEMM writes its rows of the gathered output
+  through `aiter.gemm_a8w8_bpreshuffle(out=...)`; an aiter without `out=` keeps the per-block copy.
+- ROCm two-row `hc_combine` for rows of at most 4 x 2560 elements, bit-identical to the one-row kernel.
+
+With aiter's TP2 prefill GEMM rows (`qwen38-flash-next-dev`), TP2 serving at 12000 in / 350 out goes
+from 0.916 / 1.043 to 0.959 / 1.088 req/s at c8 / c12 (+4.6 % / +4.3 %).
+
 ### mori dependency
 
 Everything except mori and the ibverbs headers comes with the ROCm 7.14 image; keep the image's versions.
