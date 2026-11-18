@@ -10,6 +10,12 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 from sglang.srt.utils.common import is_gfx942_supported, rank0_log
 
 
+@functools.lru_cache(maxsize=None)
+def log_flydsl_path(what: str) -> None:
+    """Log each FlyDSL GDN path once, the first time it runs."""
+    rank0_log(f"GDN: using aiter FlyDSL {what}.")
+
+
 @functools.lru_cache(maxsize=1)
 def flydsl_gdn_decode_ops():
     """aiter FlyDSL GDN decode entry points, or None when unavailable."""
@@ -88,12 +94,6 @@ class FlyDSLGDNKernel(LinearAttnKernelBase):
     def __init__(self, fallback_kernel: TritonGDNKernel):
         self.fallback_kernel = fallback_kernel
         self._packed_decode, self._fused_decode = flydsl_gdn_decode_ops()
-        self._logged = False
-
-    def _log_once(self, what: str) -> None:
-        if not self._logged:
-            rank0_log(f"GDN decode: using aiter FlyDSL {what}.")
-            self._logged = True
 
     def packed_decode(
         self,
@@ -135,7 +135,7 @@ class FlyDSLGDNKernel(LinearAttnKernelBase):
                 head_v_dim=head_v_dim,
                 **kwargs,
             )
-        self._log_once("packed decode")
+        log_flydsl_path("packed decode")
         out = mixed_qkv.new_empty(mixed_qkv.shape[0], 1, num_v_heads, head_v_dim)
         self._packed_decode(
             mixed_qkv=mixed_qkv,
@@ -196,7 +196,7 @@ class FlyDSLGDNKernel(LinearAttnKernelBase):
         head_v_dim: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns core_attn_out [1, B, HV, V] and a contiguous z [B, HV, V]."""
-        self._log_once("fused qkvz/ba unpack + conv1d + recurrent decode")
+        log_flydsl_path("decode (qkvz/ba unpack + conv1d update + recurrence)")
         B = projected_qkvz.shape[0]
         out = projected_qkvz.new_empty(B, 1, num_v_heads, head_v_dim)
         z = projected_qkvz.new_empty(B, num_v_heads, head_v_dim)

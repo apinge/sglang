@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import (
     FlyDSLGDNKernel,
     flydsl_gdn_decode_ops,
     flydsl_gdn_prefill_op,
+    log_flydsl_path,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -48,8 +49,6 @@ if is_cuda() or is_hip() or is_xpu():
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
 _fused_decode_proj_conv_logged = False
-
-_gdn_flydsl_prefill_logged = False
 
 
 class GDNFlyDSLPrefillInput(NamedTuple):
@@ -721,11 +720,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             return False
         fm = self.forward_metadata
         if (
-            self.mis_metadata is not None
-            or fm is None
-            or fm.has_mamba_track_mask
+            fm is None
+            # The q/k it emits are consumed only by the aiter chunked prefill; this
+            # metadata exists only when that path serves the batch.
             or fm.aiter_gdn_prefill_metadata is None
-            or not isinstance(self.kernel_dispatcher.extend_kernel, AiterGDNKernel)
+            # forward_extend handles these before the conv; the front end does not.
+            or self.mis_metadata is not None
+            or fm.has_mamba_track_mask
             or forward_batch.extend_seq_lens_cpu is None
         ):
             return False
@@ -742,10 +743,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         payload: GDNFlyDSLPrefillInput,
         **kwargs,
     ):
-        global _gdn_flydsl_prefill_logged
-        if not _gdn_flydsl_prefill_logged:
-            rank0_log("Using FlyDSL GDN prefill front end (conv+split+l2norm).")
-            _gdn_flydsl_prefill_logged = True
+        log_flydsl_path("prefill front end (conv + split + q/k l2norm)")
         fm = self.forward_metadata
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states, ssm_states = layer_cache.conv[0], layer_cache.temporal
