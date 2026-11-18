@@ -150,7 +150,7 @@ command=(
   --attention-backend aiter
   --moe-runner-backend aiter
   --linear-attn-backend triton
-  --linear-attn-decode-backend triton
+  --linear-attn-decode-backend aiter
   --linear-attn-prefill-backend "${LINEAR_ATTN_PREFILL_BACKEND}"
   --linear-attn-verify-backend triton
   --kv-cache-dtype auto

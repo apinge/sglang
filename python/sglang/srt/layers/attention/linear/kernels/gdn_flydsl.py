@@ -80,6 +80,35 @@ def _packed_decode_ok(
     return qk_dim > 0 and qk_dim % 256 == 0 and num_v_heads % num_k_heads == 0
 
 
+def flydsl_gdn_layer_supported(
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    conv_weights: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    activation: str,
+    conv_states: torch.Tensor,
+    ssm_states: torch.Tensor,
+    head_k_dim: int,
+    head_v_dim: int,
+) -> bool:
+    """Layer contract of the FlyDSL GDN kernels (decode and prefill front end)."""
+    return (
+        head_k_dim == 128
+        and head_v_dim == 128
+        and _params_ok(A_log, dt_bias)
+        and bias is None
+        and activation in ("silu", "swish")
+        and conv_weights.dim() == 2
+        and conv_weights.shape[-1] == 4
+        and conv_weights.dtype == torch.bfloat16
+        and conv_weights.is_contiguous()
+        and conv_states.dim() == 3
+        and conv_states.shape[-1] == 3
+        and conv_states.dtype == torch.bfloat16
+        and _state_ok(ssm_states)
+    )
+
+
 class FlyDSLGDNKernel(LinearAttnKernelBase):
     """gfx942 FlyDSL GDN decode with the Triton kernel's interface.
 
@@ -150,34 +179,6 @@ class FlyDSLGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
         )
         return out.transpose(0, 1)
-
-    def supports_fused_qkvzba_conv1d_decode(
-        self,
-        A_log: torch.Tensor,
-        dt_bias: torch.Tensor,
-        conv_weights: torch.Tensor,
-        bias: Optional[torch.Tensor],
-        activation: str,
-        conv_states: torch.Tensor,
-        ssm_states: torch.Tensor,
-        head_k_dim: int,
-        head_v_dim: int,
-    ) -> bool:
-        return (
-            head_k_dim == 128
-            and head_v_dim == 128
-            and _params_ok(A_log, dt_bias)
-            and bias is None
-            and activation in ("silu", "swish")
-            and conv_weights.dim() == 2
-            and conv_weights.shape[-1] == 4
-            and conv_weights.dtype == torch.bfloat16
-            and conv_weights.is_contiguous()
-            and conv_states.dim() == 3
-            and conv_states.shape[-1] == 3
-            and conv_states.dtype == torch.bfloat16
-            and _state_ok(ssm_states)
-        )
 
     def fused_qkvzba_conv1d_decode(
         self,

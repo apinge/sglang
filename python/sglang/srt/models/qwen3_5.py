@@ -449,7 +449,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 else {}
             ),
         )
-        self._flydsl_gdn_cached: Optional[bool] = None
+        self._flydsl_decode_cached: Optional[bool] = None
 
         self.out_proj = RowParallelLinear(
             self.value_dim,
@@ -621,24 +621,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             backend = backend.linear_attn_backend
         return backend if isinstance(backend, GDNAttnBackend) else None
 
-    def _flydsl_gdn_ok(self) -> bool:
-        """gfx942: the GDN backend serves this layer with the aiter FlyDSL kernels."""
-        if self._flydsl_gdn_cached is None:
+    def _flydsl_decode_ok(self) -> bool:
+        """--linear-attn-decode-backend aiter (gfx942): decode hands the in_proj outputs
+        to the FlyDSL GDN decode kernel."""
+        if self._flydsl_decode_cached is None:
             backend = self._gdn_attn_backend()
-            self._flydsl_gdn_cached = (
-                _use_aiter and backend is not None and backend.supports_flydsl(self.attn)
+            self._flydsl_decode_cached = (
+                _use_aiter
+                and backend is not None
+                and backend.supports_flydsl_decode(self.attn)
             )
-        return self._flydsl_gdn_cached
+        return self._flydsl_decode_cached
 
     def _flydsl_prefill_front_ok(self, forward_batch, qkvz) -> bool:
-        """FlyDSL GDN prefill front end gate (gfx942); per batch."""
+        """--linear-attn-prefill-backend aiter (gfx942): FlyDSL prefill front end; per batch."""
         mode = forward_batch.forward_mode
         if (
-            not mode.is_extend()
+            not _use_aiter
+            or not mode.is_extend()
             or mode.is_target_verify()
             or mode.is_mixed()
             or qkvz.shape[0] == 0
-            or not self._flydsl_gdn_ok()
         ):
             return False
         from sglang.srt.layers.radix_linear_attention import (
@@ -650,7 +653,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         real = forward_batch.global_num_token_non_padded_cpu
         if real is not None and real < qkvz.shape[0]:
             return False
-        return self._gdn_attn_backend().supports_flydsl_prefill_front(
+        backend = self._gdn_attn_backend()
+        return backend is not None and backend.supports_flydsl_prefill_front(
             self.attn, forward_batch
         )
 
@@ -990,7 +994,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         use_strided_prefill_z = False
         use_fused_decode_proj_conv = (
-            (_gdn_decode_fused_proj_conv or self._flydsl_gdn_ok())
+            (_gdn_decode_fused_proj_conv or self._flydsl_decode_ok())
             and forward_batch.forward_mode.is_decode()
             and isinstance(projected_states_qkvz, torch.Tensor)
             and isinstance(projected_states_ba, torch.Tensor)
@@ -1005,7 +1009,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
             # The backend runs conv + split + l2norm from the in_proj outputs; the gated
             # norm reads z as a strided [T, HV, V] view of them, so nothing is copied.
-            mixed_qkv = GDNFlyDSLPrefillInput(projected_states_qkvz, projected_states_ba)
+            mixed_qkv = GDNFlyDSLPrefillInput(
+                projected_states_qkvz, projected_states_ba
+            )
             z = projected_states_qkvz[:, -(self.value_dim // self.attn_tp_size) :]
             z = z.unflatten(-1, (-1, self.head_v_dim))
             a = b = None

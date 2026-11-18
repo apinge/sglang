@@ -21,6 +21,7 @@ from sglang.srt.arg_groups.choices import (
     FP4_GEMM_RUNNER_BACKEND_CHOICES,
     FP8_GEMM_RUNNER_BACKEND_CHOICES,
     GRAMMAR_BACKEND_CHOICES,
+    LINEAR_ATTN_DECODE_BACKEND_CHOICES,
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
     LINEAR_ATTN_PREFILL_BACKEND_CHOICES,
     MOE_RUNNER_BACKEND_CHOICES,
@@ -423,8 +424,8 @@ class ExecMamba(msgspec.Struct):
     linear_attn_decode_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention decode. If not set, uses --linear-attn-backend.",
-            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            help="Override the kernel backend for linear attention decode. If not set, uses --linear-attn-backend. AITER (FlyDSL) supports GDN decode on gfx942, with Triton fallback for unsupported inputs.",
+            choices=LINEAR_ATTN_DECODE_BACKEND_CHOICES,
         ),
     ] = None
     linear_attn_prefill_backend: A[

@@ -46,6 +46,20 @@ class TestGdnFlyDSLGfx942(unittest.TestCase):
 
     H, HV = 8, 24
 
+    def test_decode_backend_flag_selects_kernel(self):
+        """FlyDSL decode only when asked for: --linear-attn-decode-backend aiter selects
+        it, triton stays on the Triton kernel."""
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNKernelDispatcher
+        from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+
+        def decode_kernel(backend):
+            return GDNKernelDispatcher(
+                LinearAttnKernelBackend(backend), LinearAttnKernelBackend.TRITON
+            ).decode_kernel
+
+        self.assertIsInstance(decode_kernel("aiter"), FlyDSLGDNKernel)
+        self.assertIs(type(decode_kernel("triton")), TritonGDNKernel)
+
     def test_fused_decode_matches_triton_chain(self):
         """q/k conv channels are shared by 3 v-head workgroups; the conv cache must
         be shifted exactly once, and a -1 (CUDA-graph pad) slot left untouched.

@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.linear.kernels.gdn_aiter import AiterGDNKernel
 from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import (
     FlyDSLGDNKernel,
     flydsl_gdn_decode_ops,
+    flydsl_gdn_layer_supported,
     flydsl_gdn_prefill_op,
     log_flydsl_path,
 )
@@ -276,12 +277,10 @@ class GDNKernelDispatcher:
         prefill_backend: LinearAttnKernelBackend,
         verify_backend: Optional[LinearAttnKernelBackend] = None,
     ):
-        if decode_backend.is_aiter() or (
-            verify_backend is not None and verify_backend.is_aiter()
-        ):
+        if verify_backend is not None and verify_backend.is_aiter():
             raise ValueError(
-                "AITER GDN supports prefill only. Use "
-                "--linear-attn-prefill-backend aiter with Triton decode/verify."
+                "AITER GDN supports decode and prefill only. Use "
+                "--linear-attn-verify-backend triton."
             )
         triton_kernel = TritonGDNKernel()
         self.tree_verify_kernel = triton_kernel
@@ -289,8 +288,15 @@ class GDNKernelDispatcher:
         cutedsl_kernel = None
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
+        elif decode_backend.is_aiter():
             if _is_hip and flydsl_gdn_decode_ops() is not None:
                 self.decode_kernel = FlyDSLGDNKernel(fallback_kernel=triton_kernel)
+            else:
+                rank0_log(
+                    "AITER GDN decode requires gfx942 and the aiter FlyDSL GDN "
+                    "kernels. Falling back to Triton."
+                )
+                self.decode_kernel = triton_kernel
         elif decode_backend.is_intel_xpu():
             if not is_xpu():
                 raise ValueError("--linear-attn-backend intel_xpu requires Intel XPU")
@@ -555,7 +561,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
         super().__init__(model_runner)
-        self._supports_flydsl_cache: dict[int, bool] = {}
+        self._flydsl_layer_ok_cache: dict[int, bool] = {}
         self.enable_mis = get_exec().features.enable_mis
         self.mis_metadata: Optional[GDNMISMetadata] = None
         self.conv_states_shape = (
@@ -684,20 +690,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
             retrieve_parent_token
         )
 
-    def supports_flydsl(self, layer: RadixLinearAttention) -> bool:
-        """Static per-layer gate of the FlyDSL decode and prefill paths; when it holds the
-        model hands decode the in_proj outputs as (projected_qkvz, projected_ba)."""
-        ok = self._supports_flydsl_cache.get(layer.layer_id)
+    def _flydsl_layer_ok(self, layer: RadixLinearAttention) -> bool:
+        """Static per-layer contract of the FlyDSL decode and prefill front end."""
+        ok = self._flydsl_layer_ok_cache.get(layer.layer_id)
         if ok is None:
             layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-            kernel = self.kernel_dispatcher.decode_kernel
             ok = (
-                isinstance(kernel, FlyDSLGDNKernel)
-                and layer_cache.replayssm_d is None
+                layer_cache.replayssm_d is None
                 and layer.num_q_heads == layer.num_k_heads
                 and layer.head_q_dim == layer.head_k_dim
                 and layer.num_v_heads % layer.num_k_heads == 0
-                and kernel.supports_fused_qkvzba_conv1d_decode(
+                and flydsl_gdn_layer_supported(
                     A_log=layer.A_log,
                     dt_bias=layer.dt_bias,
                     conv_weights=layer.conv_weights,
@@ -709,14 +712,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     head_v_dim=layer.head_v_dim,
                 )
             )
-            self._supports_flydsl_cache[layer.layer_id] = ok
+            self._flydsl_layer_ok_cache[layer.layer_id] = ok
         return ok
+
+    def supports_flydsl_decode(self, layer: RadixLinearAttention) -> bool:
+        """--linear-attn-decode-backend aiter: when this holds, the model hands decode
+        the in_proj outputs as (projected_qkvz, projected_ba)."""
+        return isinstance(
+            self.kernel_dispatcher.decode_kernel, FlyDSLGDNKernel
+        ) and self._flydsl_layer_ok(layer)
 
     def supports_flydsl_prefill_front(
         self, layer: RadixLinearAttention, forward_batch: ForwardBatch
     ) -> bool:
         """Per-batch gate for GDNFlyDSLPrefillInput (static parts cached per layer)."""
-        if not self.supports_flydsl(layer) or flydsl_gdn_prefill_op() is None:
+        if flydsl_gdn_prefill_op() is None or not self._flydsl_layer_ok(layer):
             return False
         fm = self.forward_metadata
         if (
@@ -822,7 +832,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "(projected_qkvz, projected_ba)"
                 )
             projected_qkvz, projected_ba = mixed_qkv
-            if self.supports_flydsl(layer):
+            if self.supports_flydsl_decode(layer):
                 core_attn_out, z = (
                     self.kernel_dispatcher.decode_kernel.fused_qkvzba_conv1d_decode(
                         projected_qkvz,
