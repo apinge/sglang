@@ -89,7 +89,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -464,10 +468,48 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self,
         topk_output: StandardTopKOutput,
         hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> StandardTopKOutput:
         """Append shared expert ids and weights to topk output before fused MoE."""
         if not self.enable_shared_expert_fusion or self.shared_expert_gate is None:
             return topk_output
+
+        # Use native HIP for large prefill batches. Decode and unsupported
+        # layouts retain the existing fused Triton gate + sigmoid + append path.
+        if (
+            _use_aiter
+            and forward_batch is not None
+            and forward_batch.forward_mode
+            in (ForwardMode.EXTEND, ForwardMode.SPLIT_PREFILL)
+            and hidden_states.shape[0] >= 256
+            and self.shared_expert_gate.bias is None
+        ):
+            from sglang.kernels.ops.moe.shared_gate_append_hip import (
+                can_use_shared_gate_append_hip,
+                shared_gate_append_hip,
+            )
+
+            if can_use_shared_gate_append_hip(
+                hidden_states,
+                self.shared_expert_gate.weight,
+                topk_output.topk_ids,
+                topk_output.topk_weights,
+                self.num_fused_shared_experts,
+            ):
+                fused_topk_ids, fused_topk_weights = shared_gate_append_hip(
+                    hidden_states,
+                    self.shared_expert_gate.weight,
+                    topk_output.topk_ids,
+                    topk_output.topk_weights,
+                    self.num_experts,
+                    self.num_fused_shared_experts,
+                    self._shared_expert_scale(),
+                )
+                return StandardTopKOutput(
+                    topk_weights=fused_topk_weights,
+                    topk_ids=fused_topk_ids,
+                    router_logits=topk_output.router_logits,
+                )
 
         from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
             fused_append_shared_experts_with_weights,
@@ -678,7 +720,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             if self.enable_shared_expert_fusion:
                 topk_output = self._append_shared_to_topk_output(
-                    topk_output, hidden_states
+                    topk_output, hidden_states, forward_batch
                 )
             assert TopKOutputChecker.format_is_standard(topk_output), (
                 "MegaMoE pre-dispatch consumes raw topk ids/weights; "
@@ -712,6 +754,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         *,
         defer_finalize: bool = False,
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
@@ -730,7 +773,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
         ):
-            topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
+            topk_output = self._append_shared_to_topk_output(
+                topk_output, hidden_states, forward_batch
+            )
         return self.experts(hidden_states, topk_output)
 
     def _gate_shared_output_out_of_place(
@@ -751,6 +796,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         use_fused_gate: bool = False,
         defer_finalize: bool = False,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
 
@@ -759,7 +805,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # the shared branch reads the same input and writes a separate output.
             self.alt_stream.wait_stream(current_stream)
             router_output = self._forward_router_experts(
-                hidden_states, defer_finalize=True
+                hidden_states, defer_finalize=True, forward_batch=forward_batch
             )
             with torch.cuda.stream(self.alt_stream):
                 shared_output = self._forward_shared_experts(
@@ -798,7 +844,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # ===== END TO BE REFACTORED ====
 
         with torch.cuda.stream(self.alt_stream):
-            router_output = self._forward_router_experts(hidden_states)
+            router_output = self._forward_router_experts(
+                hidden_states, forward_batch=forward_batch
+            )
 
         current_stream.wait_stream(self.alt_stream)
 
@@ -851,6 +899,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 hidden_states,
                 use_fused_gate=use_fused_gate,
                 defer_finalize=defer_finalize,
+                forward_batch=forward_batch,
             )
         else:
             shared_output = self._forward_shared_experts(
@@ -861,7 +910,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     hidden_states, shared_output
                 )
             final_hidden_states = self._forward_router_experts(
-                hidden_states, defer_finalize=defer_finalize
+                hidden_states,
+                defer_finalize=defer_finalize,
+                forward_batch=forward_batch,
             )
 
         if defer_finalize:
