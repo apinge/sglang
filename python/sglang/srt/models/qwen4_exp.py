@@ -44,14 +44,13 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.qwen4_fused_moe import (
-    fused_moe_supported,
-    fused_route_supported,
-    meta_words,
-    route_meta,
-    route_partial,
+from sglang.srt.layers.moe.sp_local_routing import (
+    local_routing_allowed,
+    local_routing_supported,
+    meta_width,
+    route_rows,
+    run_routed_experts,
 )
-from sglang.srt.layers.moe.topk import ROCM_TRITON_ROUTER_MAX_ROWS
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
@@ -82,6 +81,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
     Qwen3_5ForCausalLM,
@@ -1443,18 +1443,18 @@ class _HcRanges:
 _ROUTE_META_AGS = {}
 
 
-def _route_meta_all_gather(meta_words: int) -> SdmaAllGather:
+def _route_meta_all_gather(width: int) -> SdmaAllGather:
     """SDMA all-gather of the f32 routing metadata rows; created collectively on first use,
     in the same order on every rank."""
-    if meta_words not in _ROUTE_META_AGS:
-        _ROUTE_META_AGS[meta_words] = SdmaAllGather(
+    if width not in _ROUTE_META_AGS:
+        _ROUTE_META_AGS[width] = SdmaAllGather(
             capacity_tokens=get_schedule().max_prefill_tokens,
-            hidden_size=meta_words,
+            hidden_size=width,
             dtype=torch.float32,
             device=torch.device("cuda", torch.cuda.current_device()),
             cpu_group=get_attn_tp_group().cpu_group,
         )
-    return _ROUTE_META_AGS[meta_words]
+    return _ROUTE_META_AGS[width]
 
 
 def _install_sp_sdma_proj(layer: nn.Module, proj: nn.Module) -> None:
@@ -1596,8 +1596,9 @@ class Qwen4ExpLayerExtensionMixin:
             and envs.SGLANG_QWEN4_SEQ_PARALLEL.get()
             and envs.SGLANG_QWEN4_SP_SDMA_AG_MOE.get()
         )
-        # Resolved on the first SP prefill: the gate reads the loaded (shuffled) weights.
-        self._fused_moe: Optional[bool] = None
+        self._sp_local_route = isinstance(
+            self.mlp, Qwen2MoeSparseMoeBlock
+        ) and local_routing_supported(self.mlp)
         if self._sp_sdma_ag:
             # The first reader of the attention / GDN input in prefill.
             _install_sp_sdma_ag_consumer(
@@ -1722,12 +1723,17 @@ class Qwen4ExpLayerExtensionMixin:
         if ag is None:
             return None
         ranges = _HcRanges(partial, seq_parallel)
-        if self._use_fused_route(ranges, seq_parallel):
-            return self._sp_route_mlp_input(ranges, residual, seq_parallel, ag)
-        writer = ag.begin(
+        kw = dict(
             num_tokens=seq_parallel.num_tokens,
             local_rows=seq_parallel.local_rows,
             pushes=len(ranges.bounds),
+        )
+        writer = ag.begin(**kw)
+        # Route this rank's rows here; their f32 routing rows are gathered with them.
+        meta_writer = (
+            _route_meta_all_gather(meta_width(self.mlp)).begin(**kw)
+            if self._sp_local_route and local_routing_allowed()
+            else None
         )
         combined = torch.empty_like(residual[0])
         normed = torch.empty_like(combined)
@@ -1735,67 +1741,17 @@ class Qwen4ExpLayerExtensionMixin:
             attn_hc.combine_rows(rows, residual, out=combined, rows=slice(r0, r1))
             mixed = mlp_hc.mix_rows(combined, normed_out=normed, rows=slice(r0, r1))
             writer.push(r0, r1, mixed)
-        return writer.finish(), (combined, normed)
-
-    def _use_fused_route(
-        self, ranges: _HcRanges, seq_parallel: SeqParallelPlan
-    ) -> bool:
-        """Route this rank's rows before the bf16 all-gather and run the MoE on aiter's
-        fused-quant kernels, only where that computes what self.mlp would."""
-        if self._fused_moe is None:
-            self._fused_moe = bool(
-                self._sp_sdma_rs
-                and self.config.num_experts
-                and fused_moe_supported(self.mlp)
-            )
-        return (
-            self._fused_moe
-            # The gathered rows always take the aiter router; keep every range above the
-            # row count where topk switches to the Triton router.
-            and min(r1 - r0 for r0, r1 in ranges.bounds) > ROCM_TRITON_ROUTER_MAX_ROWS
-            and fused_route_supported(self.mlp, seq_parallel.num_tokens)
-        )
-
-    def _sp_route_mlp_input(self, ranges, residual, seq_parallel: SeqParallelPlan, ag):
-        """Pipelined MoE input with routing done on this rank's rows: the bf16 rows and a
-        small f32 routing-metadata row are all-gathered (bf16 transport)."""
-        attn_hc, mlp_hc = self.attn_hyper_connection, self.mlp_hyper_connection
-        ag_meta = _route_meta_all_gather(
-            meta_words(
-                self.mlp.topk.topk_config.top_k + self.mlp.num_fused_shared_experts
-            )
-        )
-        kw = dict(
-            num_tokens=seq_parallel.num_tokens,
-            local_rows=seq_parallel.local_rows,
-            pushes=len(ranges.bounds),
-        )
-        w_x, w_meta = ag.begin(**kw), ag_meta.begin(**kw)
-        combined = torch.empty_like(residual[0])
-        normed = torch.empty_like(combined)
-        for r0, r1, rows in ranges.rows():
-            attn_hc.combine_rows(rows, residual, out=combined, rows=slice(r0, r1))
-            mixed = mlp_hc.mix_rows(combined, normed_out=normed, rows=slice(r0, r1))
-            meta = route_meta(self.mlp, mixed)
-            w_x.push(r0, r1, mixed)
-            w_meta.push(r0, r1, meta)
+            if meta_writer is not None:
+                meta_writer.push(r0, r1, route_rows(self.mlp, mixed))
+        if meta_writer is None:
+            return writer.finish(), (combined, normed)
         # Both writers wait on the hub's shared per-peer put counter and their pushes
         # interleave, so only the later-begun writer's wait covers every put: finish it first.
-        meta_all = w_meta.finish()
-        x_all = w_x.finish()
-        # Read back by _sp_moe_partial; same carrier-attribute pattern as _sglang_sp_pending.
-        x_all._sglang_moe_route = (x_all, meta_all)
-        return x_all, (combined, normed)
-
-    def _sp_moe_partial(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
-    ) -> torch.Tensor:
-        """This rank's MoE partial sum (no TP reduction) of the gathered rows."""
-        routed = getattr(hidden_states, "_sglang_moe_route", None)
-        if routed is not None:
-            return route_partial(self.mlp, *routed)
-        with get_forward().scoped(mlp_reduce_scatter=True):
-            return self.mlp(hidden_states, forward_batch)
+        meta = meta_writer.finish()
+        gathered = writer.finish()
+        # Read by _run_qwen4_exp_mlp; same carrier-attribute pattern as _sglang_sp_pending.
+        gathered._sglang_moe_route = meta
+        return gathered, (combined, normed)
 
     def _qwen4_exp_use_dp_moe_gather(self) -> bool:
         return get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
@@ -1814,7 +1770,12 @@ class Qwen4ExpLayerExtensionMixin:
             return self.mlp(hidden_states)
         if seq_parallel is not None:
             # Returns this rank's partial sum; the postprocess reduce-scatters it.
-            partial = self._sp_moe_partial(hidden_states, forward_batch)
+            route = getattr(hidden_states, "_sglang_moe_route", None)
+            with get_forward().scoped(mlp_reduce_scatter=True):
+                if route is not None:
+                    partial = run_routed_experts(self.mlp, hidden_states, route)
+                else:
+                    partial = self.mlp(hidden_states, forward_batch)
             rs = (
                 _sdma_reduce_scatter_for(
                     seq_parallel, hidden_size=partial.shape[1], dtype=partial.dtype
