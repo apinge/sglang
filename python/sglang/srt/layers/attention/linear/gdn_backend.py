@@ -556,7 +556,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
         super().__init__(model_runner)
-        self._flydsl_layer_ok_cache: dict[int, bool] = {}
+        self._supports_flydsl_cache: dict[int, bool] = {}
         self.enable_mis = get_exec().features.enable_mis
         self.mis_metadata: Optional[GDNMISMetadata] = None
         self.conv_states_shape = (
@@ -685,9 +685,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             retrieve_parent_token
         )
 
-    def _flydsl_layer_ok(self, layer: RadixLinearAttention) -> bool:
-        """Static per-layer gate shared by the FlyDSL decode and prefill paths."""
-        ok = self._flydsl_layer_ok_cache.get(layer.layer_id)
+    def supports_flydsl(self, layer: RadixLinearAttention) -> bool:
+        """Static per-layer gate of the FlyDSL decode and prefill paths; when it holds the
+        model hands decode the in_proj outputs as (projected_qkvz, projected_ba)."""
+        ok = self._supports_flydsl_cache.get(layer.layer_id)
         if ok is None:
             layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
             kernel = self.kernel_dispatcher.decode_kernel
@@ -709,18 +710,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     head_v_dim=layer.head_v_dim,
                 )
             )
-            self._flydsl_layer_ok_cache[layer.layer_id] = ok
+            self._supports_flydsl_cache[layer.layer_id] = ok
         return ok
-
-    def supports_flydsl_fused_qkvzba_decode(self, layer: RadixLinearAttention) -> bool:
-        """Whether decode should hand in (projected_qkvz, projected_ba) for this layer."""
-        return self._flydsl_layer_ok(layer)
 
     def supports_flydsl_prefill_front(
         self, layer: RadixLinearAttention, forward_batch: ForwardBatch
     ) -> bool:
         """Per-batch gate for GDNFlyDSLPrefillInput (static parts cached per layer)."""
-        if not self._flydsl_layer_ok(layer) or flydsl_gdn_prefill_op() is None:
+        if not self.supports_flydsl(layer) or flydsl_gdn_prefill_op() is None:
             return False
         fm = self.forward_metadata
         if (
@@ -729,23 +726,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
             or fm.has_mamba_track_mask
             or fm.aiter_gdn_prefill_metadata is None
             or not isinstance(self.kernel_dispatcher.extend_kernel, AiterGDNKernel)
-            or self.kernel_dispatcher.extend_kernel._ops is None
             or forward_batch.extend_seq_lens_cpu is None
         ):
             return False
+        # The front end and the aiter prefill write the pools in place by slot index.
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
-        conv_states, ssm_states = layer_cache.conv[0], layer_cache.temporal
         return (
-            conv_states.is_contiguous()
-            and ssm_states.is_contiguous()
-            and conv_states.stride(-2) == 3
+            layer_cache.conv[0].is_contiguous() and layer_cache.temporal.is_contiguous()
         )
 
     def _forward_extend_flydsl_front(
         self,
         layer: RadixLinearAttention,
         forward_batch: ForwardBatch,
-        payload: "GDNFlyDSLPrefillInput",
+        payload: GDNFlyDSLPrefillInput,
         **kwargs,
     ):
         global _gdn_flydsl_prefill_logged
@@ -830,7 +824,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "(projected_qkvz, projected_ba)"
                 )
             projected_qkvz, projected_ba = mixed_qkv
-            if self._flydsl_layer_ok(layer):
+            if self.supports_flydsl(layer):
                 core_attn_out, z = (
                     self.kernel_dispatcher.decode_kernel.fused_qkvzba_conv1d_decode(
                         projected_qkvz,

@@ -84,9 +84,6 @@ class FlyDSLGDNKernel(LinearAttnKernelBase):
     """
 
     supports_packed_decode = True
-    supports_strided_target_verify_qkv = (
-        TritonGDNKernel.supports_strided_target_verify_qkv
-    )
 
     def __init__(self, fallback_kernel: TritonGDNKernel):
         self.fallback_kernel = fallback_kernel
