@@ -116,6 +116,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -132,6 +133,7 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
+_is_gfx942 = is_gfx942_supported()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
@@ -166,10 +168,14 @@ def _use_rocm_triton_softmax_topk(
     packed_out: Optional[torch.Tensor],
 ) -> bool:
     """Use the lower-latency Triton router for Qwen3.5 decode-sized rows."""
+    # Also Qwen4 on gfx942 (MI308X), 512 experts, top-10: 7 us vs 11.5-13 us for aiter's
+    # topkGatingSoftmax, identical ids, weights within 2 f32 ulp.
+    arch_hidden_ok = (_is_gfx95 and hidden_states.shape[1] == 4096) or (
+        _is_gfx942 and hidden_states.shape[1] == 2560
+    )
     return (
         will_use_aiter_moe()
-        and _is_gfx95
-        and hidden_states.shape[1] == 4096
+        and arch_hidden_ok
         and hidden_states.dtype == torch.bfloat16
         and gating_output.shape[0] <= 128
         and gating_output.shape[1] == 512
