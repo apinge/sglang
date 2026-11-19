@@ -195,11 +195,11 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "helion",
     "intel_xpu",
 ]
-# AITER serves GDN decode and prefill on ROCm, not target verify.
-LINEAR_ATTN_DECODE_BACKEND_CHOICES = list(
+LINEAR_ATTN_PREFILL_BACKEND_CHOICES = list(
     dict.fromkeys([*LINEAR_ATTN_KERNEL_BACKEND_CHOICES, "aiter"])
 )
-LINEAR_ATTN_PREFILL_BACKEND_CHOICES = LINEAR_ATTN_DECODE_BACKEND_CHOICES
+# AITER serves GDN decode and prefill on ROCm, not target verify.
+LINEAR_ATTN_DECODE_BACKEND_CHOICES = LINEAR_ATTN_PREFILL_BACKEND_CHOICES
 
 
 # --------------------------------------------------------------------------
