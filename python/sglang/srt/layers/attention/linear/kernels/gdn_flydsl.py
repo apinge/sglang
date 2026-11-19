@@ -34,6 +34,20 @@ def flydsl_gdn_decode_ops():
     )
 
 
+@functools.lru_cache(maxsize=1)
+def flydsl_gdn_verify_op():
+    """aiter FlyDSL GDN chain target-verify entry point, or None when unavailable."""
+    if not is_gfx942_supported():
+        return None
+    try:
+        from aiter.ops.flydsl.gdn_decode import (
+            fused_qkvzba_conv1d_gated_delta_rule_verify_flydsl,
+        )
+    except ImportError:
+        return None
+    return fused_qkvzba_conv1d_gated_delta_rule_verify_flydsl
+
+
 def _state_ok(ssm_states: torch.Tensor) -> bool:
     # [slot, HV, V, K] fp32 with K = V = 128 contiguous inside a slot.
     return (
@@ -109,16 +123,39 @@ def flydsl_gdn_layer_supported(
     )
 
 
+def flydsl_gdn_verify_cache_supported(
+    intermediate_ssm: Optional[torch.Tensor],
+    intermediate_conv_window: torch.Tensor,
+    num_draft_tokens: int,
+) -> bool:
+    """Speculative scratch layout the FlyDSL verify kernel writes: per-step fp32 states
+    [row, step, HV, V, K] and bf16 conv windows [row, step, conv_dim, 3]."""
+    return (
+        intermediate_ssm is not None
+        and intermediate_ssm.dtype == torch.float32
+        and intermediate_ssm.dim() == 5
+        and intermediate_ssm.shape[1] >= num_draft_tokens
+        and intermediate_ssm[0, 0].is_contiguous()
+        and intermediate_conv_window.dim() == 4
+        and intermediate_conv_window.shape[1] >= num_draft_tokens
+        and intermediate_conv_window.shape[-1] == 3
+        and intermediate_conv_window.dtype == torch.bfloat16
+    )
+
+
 class FlyDSLGDNKernel(LinearAttnKernelBase):
     """gfx942 FlyDSL GDN decode with the Triton kernel's interface.
 
     ``packed_decode`` is a drop-in for ``TritonGDNKernel.packed_decode``;
-    ``fused_qkvzba_conv1d_decode`` serves the fused decode projection/Conv1D
-    protocol (in_proj outputs in, ``(core_attn_out, z)`` out). Anything the
-    FlyDSL kernels do not cover runs on the Triton kernel.
+    ``fused_qkvzba_conv1d_decode`` / ``fused_qkvzba_conv1d_verify`` serve the fused
+    projection/Conv1D protocol (in_proj outputs in, ``(core_attn_out, z)`` out) for
+    decode and chain target verify. Anything the FlyDSL kernels do not cover runs on
+    the Triton kernel.
     """
 
     supports_packed_decode = True
+    # target_verify itself is the Triton kernel's
+    supports_strided_target_verify_qkv = True
 
     def __init__(self, fallback_kernel: TritonGDNKernel):
         self.fallback_kernel = fallback_kernel
@@ -218,6 +255,56 @@ class FlyDSLGDNKernel(LinearAttnKernelBase):
             z_out=z,
         )
         return out.transpose(0, 1), z
+
+    def fused_qkvzba_conv1d_verify(
+        self,
+        projected_qkvz: torch.Tensor,
+        projected_ba: torch.Tensor,
+        *,
+        conv_states: torch.Tensor,
+        conv_weights: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        scale: float,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        intermediate_ssm: torch.Tensor,
+        intermediate_state_indices: torch.Tensor,
+        intermediate_conv_window: torch.Tensor,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_v_dim: int,
+        num_draft_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Chain target verify. Returns core_attn_out [1, B*T, HV, V] and a contiguous
+        z [B*T, HV, V]; writes the per-step intermediate states and conv windows."""
+        log_flydsl_path("target verify (qkvz/ba unpack + conv1d + recurrence)")
+        N = projected_qkvz.shape[0]
+        out = projected_qkvz.new_empty(N, num_v_heads, head_v_dim)
+        z = projected_qkvz.new_empty(N, num_v_heads, head_v_dim)
+        if cache_indices.dtype != torch.int32:
+            cache_indices = cache_indices.to(torch.int32)
+        if intermediate_state_indices.dtype != torch.int32:
+            intermediate_state_indices = intermediate_state_indices.to(torch.int32)
+        flydsl_gdn_verify_op()(
+            projected_qkvz=projected_qkvz,
+            projected_ba=projected_ba,
+            conv_states=conv_states,
+            conv_weights=conv_weights,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=ssm_states,
+            out=out,
+            ssm_state_indices=cache_indices,
+            intermediate_states=intermediate_ssm,
+            intermediate_state_indices=intermediate_state_indices,
+            intermediate_conv_window=intermediate_conv_window,
+            num_k_heads=num_k_heads,
+            num_draft_tokens=num_draft_tokens,
+            z_out=z,
+        )
+        return out.unsqueeze(0), z
 
     def decode(self, *args, **kwargs):
         return self.fallback_kernel.decode(*args, **kwargs)

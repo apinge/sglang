@@ -633,6 +633,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         return self._flydsl_decode_cached
 
+    def _flydsl_verify_ok(self, forward_batch) -> bool:
+        """--linear-attn-verify-backend aiter (gfx942): chain target verify hands the
+        in_proj outputs to the FlyDSL GDN verify kernel."""
+        if not (_use_aiter and forward_batch.forward_mode.is_target_verify()):
+            return False
+        from sglang.srt.layers.radix_linear_attention import (
+            get_tc_piecewise_forward_context,
+        )
+
+        if get_tc_piecewise_forward_context() is not None:
+            return False
+        backend = self._gdn_attn_backend()
+        return backend is not None and backend.supports_flydsl_verify(
+            self.attn, forward_batch
+        )
+
     def _flydsl_prefill_front_ok(self, forward_batch, qkvz) -> bool:
         """--linear-attn-prefill-backend aiter (gfx942): FlyDSL prefill front end; per batch."""
         mode = forward_batch.forward_mode
@@ -998,6 +1014,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and forward_batch.forward_mode.is_decode()
             and isinstance(projected_states_qkvz, torch.Tensor)
             and isinstance(projected_states_ba, torch.Tensor)
+        ) or (
+            isinstance(projected_states_qkvz, torch.Tensor)
+            and isinstance(projected_states_ba, torch.Tensor)
+            and self._flydsl_verify_ok(forward_batch)
         )
         use_fused_contiguous_unpack = (
             self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS

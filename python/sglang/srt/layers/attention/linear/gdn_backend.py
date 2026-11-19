@@ -17,6 +17,8 @@ from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import (
     flydsl_gdn_decode_ops,
     flydsl_gdn_layer_supported,
     flydsl_gdn_prefill_op,
+    flydsl_gdn_verify_cache_supported,
+    flydsl_gdn_verify_op,
     log_flydsl_path,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
@@ -277,11 +279,6 @@ class GDNKernelDispatcher:
         prefill_backend: LinearAttnKernelBackend,
         verify_backend: Optional[LinearAttnKernelBackend] = None,
     ):
-        if verify_backend is not None and verify_backend.is_aiter():
-            raise ValueError(
-                "AITER GDN supports decode and prefill only. Use "
-                "--linear-attn-verify-backend triton."
-            )
         triton_kernel = TritonGDNKernel()
         self.tree_verify_kernel = triton_kernel
 
@@ -391,6 +388,16 @@ class GDNKernelDispatcher:
         # --mamba-ssm-dtype bfloat16 setups must be able to force Triton here.
         if verify_backend is not None and verify_backend.is_triton():
             self.verify_kernel = triton_kernel
+            self.verify_kernel_is_flashinfer = False
+        elif verify_backend is not None and verify_backend.is_aiter():
+            if _is_hip and flydsl_gdn_verify_op() is not None:
+                self.verify_kernel = FlyDSLGDNKernel(fallback_kernel=triton_kernel)
+            else:
+                rank0_log(
+                    "AITER GDN verify requires gfx942 and the aiter FlyDSL GDN "
+                    "kernels. Falling back to Triton."
+                )
+                self.verify_kernel = triton_kernel
             self.verify_kernel_is_flashinfer = False
         elif (
             decode_backend.is_flashinfer() or prefill_backend.is_flashinfer()
@@ -721,6 +728,57 @@ class GDNAttnBackend(MambaAttnBackendBase):
         return isinstance(
             self.kernel_dispatcher.decode_kernel, FlyDSLGDNKernel
         ) and self._flydsl_layer_ok(layer)
+
+    def supports_flydsl_verify(
+        self, layer: RadixLinearAttention, forward_batch: ForwardBatch
+    ) -> bool:
+        """--linear-attn-verify-backend aiter: chain (topk = 1) target verify from the
+        in_proj outputs. Static per layer and spec config, so CUDA-graph safe."""
+        if not (
+            isinstance(self.kernel_dispatcher.verify_kernel, FlyDSLGDNKernel)
+            and self._flydsl_layer_ok(layer)
+            and self.forward_metadata is not None
+            and self.forward_metadata.retrieve_parent_token is None
+            and self.mis_metadata is None
+        ):
+            return False
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        return (
+            isinstance(layer_cache, MambaPool.SpeculativeState)
+            and layer_cache.replayssm_rawv is None
+            and flydsl_gdn_verify_cache_supported(
+                layer_cache.intermediate_ssm,
+                layer_cache.intermediate_conv_window[0],
+                forward_batch.spec_info.draft_token_num,
+            )
+        )
+
+    def _forward_verify_flydsl(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        projected_qkvz: torch.Tensor,
+        projected_ba: torch.Tensor,
+    ):
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        return self.kernel_dispatcher.verify_kernel.fused_qkvzba_conv1d_verify(
+            projected_qkvz,
+            projected_ba,
+            conv_states=layer_cache.conv[0],
+            conv_weights=layer.conv_weights,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            scale=layer.head_k_dim**-0.5,
+            ssm_states=layer_cache.temporal,
+            cache_indices=self.forward_metadata.mamba_cache_indices,
+            intermediate_ssm=layer_cache.intermediate_ssm,
+            intermediate_state_indices=self.verify_intermediate_state_indices,
+            intermediate_conv_window=layer_cache.intermediate_conv_window[0],
+            num_k_heads=layer.num_k_heads,
+            num_v_heads=layer.num_v_heads,
+            head_v_dim=layer.head_v_dim,
+            num_draft_tokens=forward_batch.spec_info.draft_token_num,
+        )
 
     def supports_flydsl_prefill_front(
         self, layer: RadixLinearAttention, forward_batch: ForwardBatch
@@ -1074,6 +1132,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             return self._forward_extend_flydsl_front(
                 layer, forward_batch, mixed_qkv, **kwargs
             )
+        if isinstance(mixed_qkv, tuple):
+            # (projected_qkvz, projected_ba): set only when supports_flydsl_verify held
+            return self._forward_verify_flydsl(layer, forward_batch, *mixed_qkv)
         assert isinstance(mixed_qkv, torch.Tensor)
         seq_len = mixed_qkv.shape[0]
 
