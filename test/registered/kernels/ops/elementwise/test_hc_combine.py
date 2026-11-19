@@ -81,7 +81,9 @@ def test_hc_combine_correctness(dtype, num_tokens):
     torch.testing.assert_close(out, expected, **_TOLERANCES[dtype])
 
 
-@pytest.mark.skipif(not is_gfx942_supported(), reason="the two-row kernel is gfx942 only")
+@pytest.mark.skipif(
+    not is_gfx942_supported(), reason="the two-row kernel is gfx942 only"
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_tokens", [1, 3, 33, 1501, 3000])
 def test_hc_combine_rows2_matches_one_row(dtype, num_tokens):
