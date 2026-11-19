@@ -3,10 +3,11 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.elementwise.hc_combine import _jit_hc_combine_module, hc_combine
+from sglang.srt.utils import is_gfx942_supported
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd")
 
 HC_COUNT = 4
 HIDDEN_SIZE = 2560
@@ -80,7 +81,7 @@ def test_hc_combine_correctness(dtype, num_tokens):
     torch.testing.assert_close(out, expected, **_TOLERANCES[dtype])
 
 
-@pytest.mark.skipif(torch.version.hip is None, reason="the two-row kernel is ROCm only")
+@pytest.mark.skipif(not is_gfx942_supported(), reason="the two-row kernel is gfx942 only")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_tokens", [1, 3, 33, 1501, 3000])
 def test_hc_combine_rows2_matches_one_row(dtype, num_tokens):

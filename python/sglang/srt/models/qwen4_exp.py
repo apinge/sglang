@@ -88,7 +88,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_rss_trimmer,
 )
 from sglang.srt.runtime_context import get_forward, get_parallel, get_schedule
-from sglang.srt.utils import get_bool_env_var, is_hip, logger
+from sglang.srt.utils import get_bool_env_var, is_gfx942_supported, is_hip, logger
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
@@ -1512,7 +1512,8 @@ def _aiter_gemm_takes_out() -> bool:
 
 def _zero_copy_weights(proj: nn.Module):
     """(weight, weight_scale) where plain_forward is exactly aiter's PTPC FP8 GEMM on the rows
-    (compressed-tensors per-channel FP8), with no bias, output all-gather or layernorm-SP matmul."""
+    (compressed-tensors per-channel FP8), with no bias, output all-gather or layernorm-SP matmul.
+    gfx942 only, where it is measured; other devices keep the per-block copy."""
     from compressed_tensors.quantization import QuantizationStrategy
 
     from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
@@ -1523,7 +1524,8 @@ def _zero_copy_weights(proj: nn.Module):
     )
 
     if (
-        not _aiter_gemm_takes_out()
+        not is_gfx942_supported()
+        or not _aiter_gemm_takes_out()
         or proj.gather_output
         or proj.bias is not None
         or (get_forward().sp_active and proj.tp_size > 1)

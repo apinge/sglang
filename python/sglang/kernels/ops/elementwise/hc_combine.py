@@ -10,9 +10,9 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_gfx942_supported
 
-# The two-row kernel (ROCm only; measured on MI308X, not on NVIDIA) is bit-identical to the one-row
+# The two-row kernel (gfx942 only, where it is measured: MI308X) is bit-identical to the one-row
 # kernel. It wins up to 4 x 2560 elements per row and spills above (0.89x at 4 x 4096).
 _ROWS2_MAX_ROW = 4 * 2560
 
@@ -43,7 +43,7 @@ def _jit_hc_combine_module(
         ("hc_combine", f"HcCombineKernel<{args}>::run"),
         ("hc_combine_split", f"HcCombineSplitKernel<{args}>::run"),
     ]
-    if is_hip():
+    if is_gfx942_supported():
         wrappers.append(("hc_combine_rows2", f"HcCombineKernel<{args}, true>::run"))
     return load_jit(
         "hc_combine",
@@ -96,7 +96,7 @@ def hc_combine(
         out = out.reshape(-1, hc_count * hidden_size)
 
     module = _jit_hc_combine_module(hc_count, hidden_size, residual.dtype)
-    if is_hip() and hc_count * hidden_size <= _ROWS2_MAX_ROW:
+    if is_gfx942_supported() and hc_count * hidden_size <= _ROWS2_MAX_ROW:
         module.hc_combine_rows2(y, r, n, inject_weight, out)
     else:
         module.hc_combine(y, r, n, inject_weight, out)
