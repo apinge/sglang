@@ -95,7 +95,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_rss_trimmer,
 )
 from sglang.srt.runtime_context import get_forward, get_parallel, get_schedule
-from sglang.srt.utils import get_bool_env_var, is_hip, logger
+from sglang.srt.utils import get_bool_env_var, is_gfx942_supported, is_hip, logger
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
@@ -1596,9 +1596,11 @@ class Qwen4ExpLayerExtensionMixin:
             and envs.SGLANG_QWEN4_SEQ_PARALLEL.get()
             and envs.SGLANG_QWEN4_SP_SDMA_AG_MOE.get()
         )
-        self._sp_local_route = isinstance(
-            self.mlp, Qwen2MoeSparseMoeBlock
-        ) and local_routing_supported(self.mlp)
+        self._sp_local_route = (
+            is_gfx942_supported()
+            and isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
+            and local_routing_supported(self.mlp)
+        )
         if self._sp_sdma_ag:
             # The first reader of the attention / GDN input in prefill.
             _install_sp_sdma_ag_consumer(
@@ -1723,18 +1725,19 @@ class Qwen4ExpLayerExtensionMixin:
         if ag is None:
             return None
         ranges = _HcRanges(partial, seq_parallel)
-        kw = dict(
+        writer = ag.begin(
             num_tokens=seq_parallel.num_tokens,
             local_rows=seq_parallel.local_rows,
             pushes=len(ranges.bounds),
         )
-        writer = ag.begin(**kw)
         # Route this rank's rows here; their f32 routing rows are gathered with them.
-        meta_writer = (
-            _route_meta_all_gather(meta_width(self.mlp)).begin(**kw)
-            if self._sp_local_route and local_routing_allowed()
-            else None
-        )
+        meta_writer = None
+        if self._sp_local_route and local_routing_allowed():
+            meta_writer = _route_meta_all_gather(meta_width(self.mlp)).begin(
+                num_tokens=seq_parallel.num_tokens,
+                local_rows=seq_parallel.local_rows,
+                pushes=len(ranges.bounds),
+            )
         combined = torch.empty_like(residual[0])
         normed = torch.empty_like(combined)
         for r0, r1, rows in ranges.rows():

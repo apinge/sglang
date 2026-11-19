@@ -167,8 +167,8 @@ def _use_rocm_triton_softmax_topk(
     num_fused_shared_experts: int,
     packed_out: Optional[torch.Tensor],
 ) -> bool:
-    """Use the lower-latency Triton router for Qwen3.5 / Qwen4 decode-sized rows."""
-    # Measured on MI308X (gfx942), 512 experts, top-10: 7 us vs 11.5-13 us for aiter's
+    """Use the lower-latency Triton router for Qwen3.5 decode-sized rows."""
+    # Also Qwen4 on gfx942 (MI308X), 512 experts, top-10: 7 us vs 11.5-13 us for aiter's
     # topkGatingSoftmax, identical ids, weights within 2 f32 ulp.
     arch_hidden_ok = (_is_gfx95 and hidden_states.shape[1] == 4096) or (
         _is_gfx942 and hidden_states.shape[1] == 2560
