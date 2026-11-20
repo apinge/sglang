@@ -266,6 +266,7 @@ class AiterGDNKernel(LinearAttnKernelBase):
             q, k, v, g, beta, ssm_states, cache_indices, query_start_loc
         ):
             fallback_reason = "unsupported tensor shape, dtype, device or layout"
+        qk_l2normed = kwargs.pop("qk_l2normed", False)
         if fallback_reason is not None:
             _log_fallback(fallback_reason)
             return self.fallback_kernel.extend(
@@ -291,5 +292,5 @@ class AiterGDNKernel(LinearAttnKernelBase):
             query_start_loc=query_start_loc,
             prefill_metadata=aiter_gdn_prefill_metadata,
             ops=self._ops,
-            l2norm=self._l2norm,
+            l2norm=(lambda x: x) if qk_l2normed else self._l2norm,
         )

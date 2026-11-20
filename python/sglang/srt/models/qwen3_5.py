@@ -449,6 +449,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 else {}
             ),
         )
+        self._flydsl_decode_cached: Optional[bool] = None
 
         self.out_proj = RowParallelLinear(
             self.value_dim,
@@ -606,6 +607,71 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             prefix=prefix,
             tp_rank=tp_rank,
             tp_size=tp_size,
+        )
+
+    def _gdn_attn_backend(self):
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+        if isinstance(backend, HybridLinearAttnBackend):
+            backend = backend.linear_attn_backend
+        return backend if isinstance(backend, GDNAttnBackend) else None
+
+    def _flydsl_decode_ok(self) -> bool:
+        """--linear-attn-decode-backend aiter (gfx942): decode hands the in_proj outputs
+        to the FlyDSL GDN decode kernel."""
+        if self._flydsl_decode_cached is None:
+            backend = self._gdn_attn_backend()
+            self._flydsl_decode_cached = (
+                _use_aiter
+                and backend is not None
+                and backend.supports_flydsl_decode(self.attn)
+            )
+        return self._flydsl_decode_cached
+
+    def _flydsl_verify_ok(self, forward_batch) -> bool:
+        """--linear-attn-verify-backend aiter (gfx942): chain target verify hands the
+        in_proj outputs to the FlyDSL GDN verify kernel."""
+        if not (_use_aiter and forward_batch.forward_mode.is_target_verify()):
+            return False
+        from sglang.srt.layers.radix_linear_attention import (
+            get_tc_piecewise_forward_context,
+        )
+
+        if get_tc_piecewise_forward_context() is not None:
+            return False
+        backend = self._gdn_attn_backend()
+        return backend is not None and backend.supports_flydsl_verify(
+            self.attn, forward_batch
+        )
+
+    def _flydsl_prefill_front_ok(self, forward_batch, qkvz) -> bool:
+        """--linear-attn-prefill-backend aiter (gfx942): FlyDSL prefill front end; per batch."""
+        mode = forward_batch.forward_mode
+        if (
+            not _use_aiter
+            or not mode.is_extend()
+            or mode.is_target_verify()
+            or mode.is_mixed()
+            or qkvz.shape[0] == 0
+        ):
+            return False
+        from sglang.srt.layers.radix_linear_attention import (
+            get_tc_piecewise_forward_context,
+        )
+
+        if get_tc_piecewise_forward_context() is not None:
+            return False
+        real = forward_batch.global_num_token_non_padded_cpu
+        if real is not None and real < qkvz.shape[0]:
+            return False
+        backend = self._gdn_attn_backend()
+        return backend is not None and backend.supports_flydsl_prefill_front(
+            self.attn, forward_batch
         )
 
     def fix_query_key_value_ordering(
@@ -937,17 +1003,40 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     backend, projected_states_qkvz, projected_states_ba, forward_batch
                 )
 
+        use_flydsl_prefill_front = (
+            isinstance(projected_states_qkvz, torch.Tensor)
+            and isinstance(projected_states_ba, torch.Tensor)
+            and self._flydsl_prefill_front_ok(forward_batch, projected_states_qkvz)
+        )
         use_strided_prefill_z = False
         use_fused_decode_proj_conv = (
-            _gdn_decode_fused_proj_conv
+            (_gdn_decode_fused_proj_conv or self._flydsl_decode_ok())
             and forward_batch.forward_mode.is_decode()
             and isinstance(projected_states_qkvz, torch.Tensor)
             and isinstance(projected_states_ba, torch.Tensor)
+        ) or (
+            isinstance(projected_states_qkvz, torch.Tensor)
+            and isinstance(projected_states_ba, torch.Tensor)
+            and self._flydsl_verify_ok(forward_batch)
         )
         use_fused_contiguous_unpack = (
             self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
         )
-        if use_fused_decode_proj_conv:
+        if use_flydsl_prefill_front:
+            from sglang.srt.layers.attention.linear.gdn_backend import (
+                GDNFlyDSLPrefillInput,
+            )
+
+            # The backend runs conv + split + l2norm from the in_proj outputs; the gated
+            # norm reads z as a strided [T, HV, V] view of them, so nothing is copied.
+            mixed_qkv = GDNFlyDSLPrefillInput(
+                projected_states_qkvz, projected_states_ba
+            )
+            z = projected_states_qkvz[:, -(self.value_dim // self.attn_tp_size) :]
+            z = z.unflatten(-1, (-1, self.head_v_dim))
+            a = b = None
+            use_strided_prefill_z = True
+        elif use_fused_decode_proj_conv:
             # GDN owns indexed Conv1D state and the safe unpack/Conv boundary;
             # it replaces these temporary B/A placeholders before recurrence.
             mixed_qkv = (projected_states_qkvz, projected_states_ba)
