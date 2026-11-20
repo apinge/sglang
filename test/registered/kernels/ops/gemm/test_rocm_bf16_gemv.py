@@ -71,7 +71,7 @@ def test_predicate_rejects_unsupported():
     assert not use_rocm_bf16_gemv(x, _make(1, 4096, 2560)[1])  # small N
     x_k, w_k = _make(4, 31040, 3072)  # untuned K
     assert not use_rocm_bf16_gemv(x_k, w_k)
-    assert not use_rocm_bf16_gemv(_make(33, 31040, 2560)[0], w)  # M > 32
+    assert not use_rocm_bf16_gemv(_make(65, 31040, 2560)[0], w)  # M > 64
     assert not use_rocm_bf16_gemv(x[:0], w)  # M == 0
     assert not use_rocm_bf16_gemv(x.half(), w.half())
     assert not use_rocm_bf16_gemv(x.float(), w)
@@ -159,7 +159,7 @@ def test_lm_head_routing(enabled):
     with patch.object(lp, "rocm_bf16_gemv", wraps=lp.rocm_bf16_gemv) as spy:
         logits = processor._compute_lm_head(x, _LMHeadStub(w))
         # Prefill with input logprobs can exceed the M bucket; must fall back.
-        processor._compute_lm_head(_make(33, n, k)[0], _LMHeadStub(w))
+        processor._compute_lm_head(_make(65, n, k)[0], _LMHeadStub(w))
     assert spy.call_count == (1 if enabled else 0)
     _assert_close_to_reference(logits, x, w)
 
