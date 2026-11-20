@@ -2,10 +2,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.elementwise.hc_combine import hc_combine
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.kernels.ops.elementwise.hc_combine import _jit_hc_combine_module, hc_combine
+from sglang.srt.utils import is_gfx942_supported
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd")
 
 HC_COUNT = 4
 HIDDEN_SIZE = 2560
@@ -77,6 +79,25 @@ def test_hc_combine_correctness(dtype, num_tokens):
     ).to(dtype)
 
     torch.testing.assert_close(out, expected, **_TOLERANCES[dtype])
+
+
+@pytest.mark.skipif(
+    not is_gfx942_supported(), reason="the two-row kernel is gfx942 only"
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_tokens", [1, 3, 33, 1501, 3000])
+def test_hc_combine_rows2_matches_one_row(dtype, num_tokens):
+    """The two-row kernel must stay bit-identical to the one-row kernel, odd tails included."""
+    block_output, residual, normed_residual, inject_weight = _make_inputs(
+        num_tokens, dtype
+    )
+    module = _jit_hc_combine_module(HC_COUNT, HIDDEN_SIZE, dtype)
+    one_row, two_row = torch.empty_like(residual), torch.empty_like(residual)
+    module.hc_combine(block_output, residual, normed_residual, inject_weight, one_row)
+    module.hc_combine_rows2(
+        block_output, residual, normed_residual, inject_weight, two_row
+    )
+    assert torch.equal(two_row, one_row)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
