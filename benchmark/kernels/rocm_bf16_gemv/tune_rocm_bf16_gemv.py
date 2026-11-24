@@ -47,7 +47,7 @@ def _tile_candidates(m, k):
                     cache_modifier=None,
                 )
         return
-    block_m = 16 if m <= 16 else 32
+    block_m = 16 if m <= 16 else 32 if m <= 32 else 64
     for bn, bk, warps in itertools.product(
         (16, 32, 64, 128, 256), (64, 128, 256, 512), (1, 2, 4, 8)
     ):
@@ -108,7 +108,7 @@ def tune_bucket(w, m):
     timing = dict(tuned_us=round(best[0], 1), hipblaslt_us=round(t_blas, 1))
     # Compare with the shipped entry so a re-tune only replaces it when it wins.
     current = _GFX942_CONFIGS.get((n, k))
-    if current is not None:
+    if current is not None and m <= max(current):
         cfg = current[min(b for b in current if m <= b)]
         timing["current_us"] = round(_final_time(lambda: _launch(x, w, cfg)), 1)
     return best[1], timing
