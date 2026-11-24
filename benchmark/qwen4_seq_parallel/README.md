@@ -87,6 +87,15 @@ reduce-scatter / all-gather of plain sequence parallelism.
 
 All of them act only with `SGLANG_QWEN4_SEQ_PARALLEL=1`.
 
+### TP2 prefill: AG zero copy, two-row hc_combine (MI308X)
+
+- gfx942 AG consumer zero copy: each landed block's PTPC GEMM writes its rows of the gathered output
+  through `aiter.gemm_a8w8_bpreshuffle(out=...)`; an aiter without `out=` keeps the per-block copy.
+- gfx942 two-row `hc_combine` for rows of at most 4 x 2560 elements, bit-identical to the one-row kernel.
+
+With aiter's TP2 prefill GEMM rows (`qwen38-flash-next-dev`), TP2 serving at 12000 in / 350 out goes
+from 0.916 / 1.043 to 0.959 / 1.088 req/s at c8 / c12 (+4.6 % / +4.3 %).
+
 ### mori dependency
 
 Everything except mori and the ibverbs headers comes with the ROCm 7.14 image; keep the image's versions.
@@ -97,12 +106,13 @@ Everything except mori and the ibverbs headers comes with the ROCm 7.14 image; k
 | torch | 2.12.0+rocm7.14.0 | image | |
 | FlyDSL | 0.3.2 | image | mori's device API compiles the push / wait kernels with it |
 | libibverbs-dev | distro package | **install** | build time only: mori's `setup.py` stops without the ibverbs headers |
-| mori | apinge/mori `qwen3.8-flash-sdma` | **install** | SDMA queues and engine-side completion signals |
+| mori | ROCm/mori `de97cea` | **install** | SDMA queues and engine-side completion signals |
 | PyHIP | `8027faa` | base branch | required by the base branch's QSA path, not by this feature |
 
 mori is pinned in `python/pyproject_other.toml` (`srt_hip`, next to PyHIP) as
-`amd_mori @ git+https://github.com/apinge/mori.git@qwen3.8-flash-sdma`. The branch includes the MI308X
-SDMA engine spread (without it, two of a GPU's xGMI links can share one SDMA engine at TP4).
+`amd_mori @ git+https://github.com/ROCm/mori.git@de97ceacefa96a6ba45b5ed3276abdb4a3bf7fd6`. That upstream
+commit includes the MI308X per-link SDMA engine balancing (ROCm/mori#921; without it, two of a GPU's xGMI links
+can share one SDMA engine at TP4).
 
 Install:
 
@@ -112,7 +122,7 @@ apt-get update && apt-get install -y libibverbs-dev       # RHEL/Fedora: dnf ins
 # 2. mori: pulled in by the srt_hip extras, or on its own into the current environment
 #    (add --target DIR and put DIR on PYTHONPATH to keep it separate). Do not use the
 #    [flydsl] extra: it is unpinned and would replace the image's FlyDSL.
-pip install "amd_mori @ git+https://github.com/apinge/mori.git@qwen3.8-flash-sdma"
+pip install "amd_mori @ git+https://github.com/ROCm/mori.git@de97ceacefa96a6ba45b5ed3276abdb4a3bf7fd6"
 ```
 
 The pip build uses mori's defaults (`BUILD_CCO_SDMA=ON`, local GPU arch); the built libraries do not link

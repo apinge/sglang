@@ -150,9 +150,9 @@ command=(
   --attention-backend aiter
   --moe-runner-backend aiter
   --linear-attn-backend triton
-  --linear-attn-decode-backend triton
+  --linear-attn-decode-backend aiter
   --linear-attn-prefill-backend "${LINEAR_ATTN_PREFILL_BACKEND}"
-  --linear-attn-verify-backend triton
+  --linear-attn-verify-backend aiter
   --kv-cache-dtype auto
   --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}"
   --watchdog-timeout 1200
