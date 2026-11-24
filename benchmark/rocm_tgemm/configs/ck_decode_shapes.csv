@@ -1,0 +1,10 @@
+M,N,K,q_dtype_w
+1,8192,2560,torch.float8_e4m3fnuz
+4,8192,2560,torch.float8_e4m3fnuz
+16,8192,2560,torch.float8_e4m3fnuz
+1,2560,3072,torch.float8_e4m3fnuz
+4,2560,3072,torch.float8_e4m3fnuz
+16,2560,3072,torch.float8_e4m3fnuz
+1,6656,2560,torch.float8_e4m3fnuz
+4,6656,2560,torch.float8_e4m3fnuz
+16,6656,2560,torch.float8_e4m3fnuz
