@@ -67,8 +67,12 @@ Qwen3.8 + MTP
 
 
 ## Tokenizer
-- Qwen3.5 launch scripts switch to `--tokenizer-backend fastokens` with `fastokens==0.3.6` to reduce TTFT CPU overhead.
-- Qwen3.8 launch scripts continue to use default tokenizer backend `--tokenizer-backend huggingface`.
+
+- Qwen3.5 and Qwen3.8 launch scripts select `--tokenizer-backend fastokens`.
+  The HIP dependencies in `python/pyproject_other.toml` install Fastokens 0.3.6.
+- Qwen3.8 base, MTP, and R-Fork CI cases share the TP2/TP4/TP8 launcher.
+  The TP1 and long-context launchers also select Fastokens; R-Fork wrappers
+  inherit it from the shared launcher.
 
 
 

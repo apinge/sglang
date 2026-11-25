@@ -101,6 +101,7 @@ PY
 command=(
   python3 -m sglang.launch_server
   --model-path "$MODEL_PATH"
+  --tokenizer-backend fastokens
   --served-model-name "$SERVED_MODEL_NAME"
   --host "$HOST"
   --port "$PORT"

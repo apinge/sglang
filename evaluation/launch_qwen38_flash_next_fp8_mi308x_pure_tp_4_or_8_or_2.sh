@@ -143,6 +143,7 @@ printf 'SSM state dtype: %s (extra CLI arguments may override script defaults)\n
 command=(
   "${SERVER_PYTHON:-python}" -m sglang.launch_server
   --model-path "${MODEL_PATH}"
+  --tokenizer-backend fastokens
   --served-model-name "${SERVED_MODEL_NAME}"
   --host "${HOST}"
   --port "${PORT}"
