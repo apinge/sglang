@@ -47,6 +47,7 @@ from .mistral_utils import (
 from .tokenizer import (
     _TOKENIZERS_BACKEND,
     _fix_added_tokens_encoding,
+    _fix_fastokens_tokenizer_components,
     _fix_special_tokens_pattern,
     _install_tokenizer_warnings_filter,
     get_tokenizer,
@@ -256,7 +257,10 @@ def get_processor(
         )
     if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
         return get_tokenizer(
-            tokenizer_name, trust_remote_code=trust_remote_code, revision=revision
+            tokenizer_name,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            tokenizer_backend=tokenizer_backend,
         )
     is_ocr2 = _is_deepseek_ocr2_model(config)
     if _is_deepseek_ocr_model(config) or is_ocr2:
@@ -268,6 +272,16 @@ def get_processor(
     # Checkpoints with language_model_only=True are text-only despite their
     # multimodal-family config; route to tokenizer instead of the mm processor.
     if getattr(config, "language_model_only", False):
+        if tokenizer_backend == "fastokens":
+            return get_tokenizer(
+                tokenizer_name,
+                *args,
+                tokenizer_mode=tokenizer_mode,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                tokenizer_backend=tokenizer_backend,
+                **kwargs,
+            )
         return AutoTokenizer.from_pretrained(
             tokenizer_name,
             *args,
@@ -377,6 +391,8 @@ def get_processor(
         else:
             processor.tokenizer = tokenizer
 
+    if tokenizer_backend == "fastokens":
+        _fix_fastokens_tokenizer_components(tokenizer, tokenizer_name, revision)
     _install_tokenizer_warnings_filter(tokenizer)
 
     if tokenizer.chat_template is None:
