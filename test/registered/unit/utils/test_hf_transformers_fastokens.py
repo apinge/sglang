@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 
@@ -23,7 +24,7 @@ except ImportError:
 
 
 @unittest.skipUnless(HAS_FASTOKENS, "fastokens package not installed")
-class TestFastokensBackend(unittest.TestCase):
+class TestFastokensBackend(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         from tokenizers import (
@@ -87,6 +88,7 @@ class TestFastokensBackend(unittest.TestCase):
         cls.reference = reference
 
     def setUp(self):
+        super().setUp()
         self._reset_fastokens()
         self.addCleanup(self._reset_fastokens)
 
