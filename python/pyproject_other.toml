@@ -107,6 +107,10 @@ tracing = [
   "opentelemetry-sdk",
 ]
 
+fastokens = [
+  "fastokens==0.3.6",
+]
+
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
 # => base docker rocm/vllm-dev:20250114, not from public vllm whl
 #
@@ -116,6 +120,7 @@ tracing = [
 srt_hip = [
   # SDMA overlap of Qwen4-Exp sequence parallelism; builds need libibverbs-dev.
   "amd_mori @ git+https://github.com/ROCm/mori.git@de97ceacefa96a6ba45b5ed3276abdb4a3bf7fd6",
+  "sglang[fastokens]",
   "sglang[runtime_common]",
   "torch",
   "petit_kernel==0.0.2",
@@ -132,6 +137,7 @@ srt_hip_rocm724 = [
   "compressed-tensors==0.16.0",
   "petit_kernel==0.0.2",
   "pyhip @ git+https://github.com/tingqli/pyhip.git@8027faad29415747707670db7776528c6b72db81",
+  "sglang[fastokens]",
   "sglang[runtime_common]",
   "torch==2.11.0",
   "wave-lang==3.8.2",

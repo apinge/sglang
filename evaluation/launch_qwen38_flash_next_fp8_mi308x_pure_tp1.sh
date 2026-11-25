@@ -71,6 +71,7 @@ export SGLANG_USE_PYHIP_QSA="${SGLANG_USE_PYHIP_QSA:-0}"
 command=(
   sglang serve
   --model-path "${MODEL_PATH}"
+  --tokenizer-backend fastokens
   --served-model-name "${SERVED_MODEL_NAME}"
   --host "${HOST}"
   --port "${PORT}"

@@ -314,6 +314,55 @@ def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
         backend.decoder = raw.decoder
 
 
+def _fix_fastokens_tokenizer_components(tokenizer, model_name_or_path, revision=None):
+    """Restore checkpoint components overwritten before the Fastokens backend swap.
+
+    Transformers v5 constructs the model-specific tokenizer before Fastokens
+    wraps it. Qwen2 can therefore replace a checkpoint's Split regex while both
+    pre-tokenizers remain Sequence instances. Compare their serialized contents
+    instead of their type names. Fastokens ignores component setters, so rebuild
+    its backend while retaining the live vocabulary and processing state.
+    """
+    from fastokens._compat import _TokenizerShim
+
+    backend = getattr(tokenizer, "_tokenizer", None)
+    if not isinstance(backend, _TokenizerShim):
+        return
+
+    try:
+        tok_file = _resolve_local_or_cached_file(
+            model_name_or_path, "tokenizer.json", revision
+        )
+        with open(tok_file) as f:
+            checkpoint = json.load(f)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError, RuntimeError) as e:
+        logger.warning(
+            "Could not restore Fastokens components for %s: %s",
+            model_name_or_path,
+            e,
+        )
+        return
+
+    live = json.loads(backend.to_str())
+    components = ("pre_tokenizer", "decoder")
+    if all(live.get(key) == checkpoint.get(key) for key in components):
+        return
+
+    for key in components:
+        live[key] = checkpoint.get(key)
+    rebuilt = type(backend).from_str(
+        json.dumps(live, ensure_ascii=False),
+        **dict(backend._pcre2_options),
+    )
+    # These settings can change independently of the serialized checkpoint.
+    rebuilt.post_processor = backend.post_processor
+    rebuilt.encode_special_tokens = backend.encode_special_tokens
+    tokenizer._tokenizer = rebuilt
+    logger.info("Restored checkpoint components for Fastokens: %s", model_name_or_path)
+
+
 def _fix_v5_add_bos_eos_token(tokenizer, model_name_or_path, revision=None):
     """Restore add_bos_token/add_eos_token stripped by transformers v5.
 
@@ -423,10 +472,15 @@ def _fix_special_tokens_pattern(tokenizer):
         tokenizer.special_tokens_pattern = "none"
 
 
-def _apply_post_load_fixes(tokenizer, tokenizer_name, revision):
+def _apply_post_load_fixes(
+    tokenizer, tokenizer_name, revision, tokenizer_backend="huggingface"
+):
     """Apply all post-load patches and return the final tokenizer."""
     _install_tokenizer_warnings_filter(tokenizer)
-    _fix_v5_tokenizer_components(tokenizer, tokenizer_name, revision)
+    if tokenizer_backend == "fastokens":
+        _fix_fastokens_tokenizer_components(tokenizer, tokenizer_name, revision)
+    else:
+        _fix_v5_tokenizer_components(tokenizer, tokenizer_name, revision)
     _fix_v5_add_bos_eos_token(tokenizer, tokenizer_name, revision)
 
     if not isinstance(tokenizer, PreTrainedTokenizerFast):
@@ -516,6 +570,12 @@ def get_tokenizer(
         clean_up_tokenization_spaces=False,
         **kwargs,
     )
+    revision = tokenizer_revision
+    if tokenizer_backend == "fastokens":
+        # Load the backend and its checkpoint components from the same revision.
+        revision = common_kwargs.setdefault(
+            "revision", common_kwargs.pop("tokenizer_revision")
+        )
 
     try:
         if is_bare_tekken_checkpoint(tokenizer_name, tokenizer_revision):
@@ -550,7 +610,9 @@ def get_tokenizer(
                     tokenizer_name, *args, **common_kwargs
                 )
 
-        return _apply_post_load_fixes(tokenizer, tokenizer_name, tokenizer_revision)
+        return _apply_post_load_fixes(
+            tokenizer, tokenizer_name, revision, tokenizer_backend=tokenizer_backend
+        )
     except Exception as e:
         if tokenizer_backend == "fastokens":
             raise RuntimeError(
