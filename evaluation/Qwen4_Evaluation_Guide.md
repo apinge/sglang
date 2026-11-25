@@ -66,6 +66,11 @@ Qwen3.8 + MTP
   ```
 
 
+## Tokenizer
+- Qwen3.5 launch scripts switch to `--tokenizer-backend fastokens` with `fastokens==0.3.6` to reduce TTFT CPU overhead.
+- Qwen3.8 launch scripts continue to use default tokenizer backend `--tokenizer-backend huggingface`.
+
+
 
 ## Qwen3.5 Target Only Evaluation
 
