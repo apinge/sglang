@@ -27,7 +27,7 @@ model="${MODEL_PATH:-/models/Qwen3.5-35B-A3B-PTPC-FP8/}"
 "${SERVER_PYTHON:-python3}" -m sglang.launch_server \
   --host "${HOST:-0.0.0.0}" --port "${PORT:-7080}" --served-model-name "${SERVED_MODEL_NAME:-$model}" \
   --model-path "${model}" \
-  --tp-size 4 \
+  --tp-size 2 \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
   --enable-multimodal \
@@ -45,7 +45,7 @@ model="${MODEL_PATH:-/models/Qwen3.5-35B-A3B-PTPC-FP8/}"
   --kv-cache-dtype fp8_e4m3 \
   --disable-radix-cache \
   --watchdog-timeout 1200 \
-  2>&1 | tee "${LOG_FILE:-${ROOT}/logs/server/qwen3.5-35B-fp8_tp4_disable_prefix_cache.log}"
+  2>&1 | tee "${LOG_FILE:-${ROOT}/logs/server/qwen3.5-35B-fp8_tp2_disable_prefix_cache.log}"
   # --linear-attn-backend aiter \
   # --linear-attn-decode-backend aiter \
 

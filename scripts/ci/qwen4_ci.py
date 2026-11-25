@@ -31,7 +31,7 @@ DATASETS = {
     "ShareGPT_V3_unfiltered_cleaned_split.json": "35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4",
 }
 # Default order: Qwen3.8 first, then Qwen3.5.
-# Case, model, TP, mode, launch script, approved 200-example full-02 accuracy.
+# Case, model, TP, mode, launch script, 200-example GSM8K reference.
 # "rfork" runs a seed and an R-Fork instance in the same container: 2 x TP GPUs.
 CASES = [
     (
@@ -59,11 +59,11 @@ CASES = [
         0.980,
     ),
     (
-        "Qwen3.5-35B-TP4-Base",
+        "Qwen3.5-35B-TP2-Base",
         "Qwen3.5-35B-A3B-PTPC-FP8",
-        4,
+        2,
         "base",
-        "launch_qwen3.5-35B-fp8_tp4_disable_prefix_cache.sh",
+        "launch_qwen3.5-35B-fp8_tp2_disable_prefix_cache.sh",
         0.970,
     ),
     (
