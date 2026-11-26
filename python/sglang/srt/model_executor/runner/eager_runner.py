@@ -41,8 +41,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
+    get_forward_context,
     get_req_to_token_pool,
     get_token_to_kv_pool,
+    has_forward_context,
 )
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -204,6 +206,15 @@ class EagerRunner(BaseRunner):
     def execute(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None, **kwargs
     ) -> Any:
+        ctx = (
+            get_forward_context()
+            if has_forward_context()
+            else ForwardContext(attn_backend=self.model_runner.attn_backend)
+        )
+        with forward_context(ctx, forward_mode=forward_batch.forward_mode):
+            return self._execute_with_phase(forward_batch, pp_proxy_tensors)
+
+    def _execute_with_phase(self, forward_batch, pp_proxy_tensors):
         mode = forward_batch.forward_mode
         if mode.is_decode():
             return self._execute_decode(forward_batch, pp_proxy_tensors)

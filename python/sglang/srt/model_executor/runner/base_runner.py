@@ -664,7 +664,10 @@ class BaseRunner(ABC):
 
         torch.get_device_module(mr.device).synchronize()
         mr.tp_group.barrier()
-        with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
+        with forward_context(
+            ForwardContext(attn_backend=mr.attn_backend),
+            forward_mode=forward_batch.forward_mode,
+        ):
             with run_ctx or empty_context():
                 run_once()
 
