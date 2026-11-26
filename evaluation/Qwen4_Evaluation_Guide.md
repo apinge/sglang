@@ -82,7 +82,7 @@ Target model: [sammysun0711/Qwen3.5-397B-A17B-PTPC-FP8](https://huggingface.co/s
 Target model: [sammysun0711/Qwen3.5-35B-A3B-PTPC-FP8](https://huggingface.co/sammysun0711/Qwen3.5-35B-A3B-PTPC-FP8)
 
 ```bash
-./launch_qwen3.5-35B-fp8_tp4_disable_prefix_cache.sh
+./launch_qwen3.5-35B-fp8_tp2_disable_prefix_cache.sh
 ```
 
 
@@ -252,7 +252,7 @@ python3 -m sglang.benchmark.serving \
 - Each new CI run resolves AITER `qwen38-flash-next-dev` and pyhip `dev` to their latest commits. Cases and GPU-only retries use the same resolved SHAs, recorded in `build.json`. Manual and reusable workflows accept `aiter_ref` and `pyhip_ref` overrides; companion-repository callers default to their PR or workflow commit.
 - Each GPU case job has a 60-minute timeout, including the image build. Cancellation stops its container, and the container also exits after 60 minutes from creation so its server workers cannot keep holding GPUs if the runner disconnects. Timed-out cases fail the final CI gate.
 - The final **Qwen4 CI** job calls `python3 scripts/ci/qwen4_ci.py summarize` to publish one combined table and the number of passing cases (for example, **7/7**).
-- The default case order is Qwen3.8 Flash TP2 base, Qwen3.8 Flash TP2 MTP, Qwen3.8 Flash TP2 R-Fork, Qwen3.5 35B TP4 base, Qwen3.5 35B TP1 DFlash, Qwen3.5 397B TP8 base, then Qwen3.5 397B TP8 DFlash. Local runs and the Actions matrix use this order. PR runs skip `Qwen3.8-Flash-TP2-RFork`; it runs in the daily schedule, or when selected with the `case` input. Direct local runs can evaluate multiple cases in one container and share its normal kernel cache:
+- The default case order is Qwen3.8 Flash TP2 base, Qwen3.8 Flash TP2 MTP, Qwen3.8 Flash TP2 R-Fork, Qwen3.5 35B TP2 base, Qwen3.5 35B TP1 DFlash, Qwen3.5 397B TP8 base, then Qwen3.5 397B TP8 DFlash. Local runs and the Actions matrix use this order. PR runs skip `Qwen3.8-Flash-TP2-RFork`; it runs in the daily schedule, or when selected with the `case` input. Direct local runs can evaluate multiple cases in one container and share its normal kernel cache:
 
 ```bash
 python3 scripts/ci/qwen4_ci.py --models-root /raid/models \
@@ -262,7 +262,9 @@ python3 scripts/ci/qwen4_ci.py --models-root /raid/models \
 For serving cases, the default command runs **performance, GSM8K accuracy, then a multimodal smoke test** against the
 same server. The R-Fork case checks startup, transferred weights, and GSM8K instead.
 Use it without `--accuracy-only` or `--smoke` for the full workload.
-Performance uses 10 warmup requests and 128 random requests at concurrency one;
+Performance uses 10 warmup requests. `Qwen3.5-35B-TP2-Base` runs
+`run_qwen35_pure_text_bench.sh` with 256 random requests at concurrency 8.
+Other serving cases use 128 random requests at concurrency 1.
 Qwen3.5 uses 8,000 input / 500 output tokens, and Qwen3.8 uses 12,000 / 350.
 Accuracy scores 200 examples and enforces the recorded gate.
 
@@ -321,11 +323,10 @@ Default runs evaluate all cases with 128 fixed-length performance requests and 2
 | Qwen3.8-Flash-TP2-Base  | 98.0%     | 191                   |
 | Qwen3.8-Flash-TP2-MTP   | 98.5%     | 192                   |
 | Qwen3.8-Flash-TP2-RFork | 98.0%     | 191                   |
-| Qwen3.5-35B-TP4-Base    | 97.0%     | 189                   |
+| Qwen3.5-35B-TP2-Base    | 97.0%     | 189                   |
 | Qwen3.5-35B-TP1-DFlash  | 97.0%     | 189                   |
 | Qwen3.5-397B-TP8-Base   | 99.0%     | 193                   |
 | Qwen3.5-397B-TP8-DFlash | 98.5%     | 192                   |
-
 
 Each case runs on the first idle GPUs (under 1 GiB used) among `--gpus`, which
 defaults to all eight; use `--case Qwen3.5-35B-TP1-DFlash --gpus 2,3` to restrict

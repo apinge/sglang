@@ -31,7 +31,7 @@ DATASETS = {
     "ShareGPT_V3_unfiltered_cleaned_split.json": "35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4",
 }
 # Default order: Qwen3.8 first, then Qwen3.5.
-# Case, model, TP, mode, launch script, approved 200-example full-02 accuracy.
+# Case, model, TP, mode, launch script, 200-example GSM8K reference.
 # "rfork" runs a seed and an R-Fork instance in the same container: 2 x TP GPUs.
 CASES = [
     (
@@ -59,11 +59,11 @@ CASES = [
         0.980,
     ),
     (
-        "Qwen3.5-35B-TP4-Base",
+        "Qwen3.5-35B-TP2-Base",
         "Qwen3.5-35B-A3B-PTPC-FP8",
-        4,
+        2,
         "base",
-        "launch_qwen3.5-35B-fp8_tp4_disable_prefix_cache.sh",
+        "launch_qwen3.5-35B-fp8_tp2_disable_prefix_cache.sh",
         0.970,
     ),
     (
@@ -755,8 +755,15 @@ def run_case(case, args, directory, row):
         for phase, script, timeout in phases:
             if phase == "multimodal":
                 row[phase] = {"status": "failed"}
+            phase_env = env
+            if (
+                phase == "performance"
+                and name == "Qwen3.5-35B-TP2-Base"
+                and not args.smoke
+            ):
+                phase_env = dict(env, MAX_CONCURRENCY="8", NUM_PROMPTS="256")
             try:
-                run_phase(script, directory, env, server, timeout)
+                run_phase(script, directory, phase_env, server, timeout)
                 if phase == "accuracy":
                     row[phase] = validate_accuracy(directory / "gsm8k.json", args.smoke)
                     check_accuracy_gate(row[phase]["score"], baseline, args.smoke)
@@ -791,7 +798,7 @@ def run_case(case, args, directory, row):
                 else:
                     row[phase] = validate_performance(
                         directory / "performance.jsonl",
-                        2 if args.smoke else 128,
+                        int(phase_env.get("NUM_PROMPTS", 128)),
                         output_tokens,
                         speculative=mode != "base",
                     )
