@@ -755,8 +755,15 @@ def run_case(case, args, directory, row):
         for phase, script, timeout in phases:
             if phase == "multimodal":
                 row[phase] = {"status": "failed"}
+            phase_env = env
+            if (
+                phase == "performance"
+                and name == "Qwen3.5-35B-TP2-Base"
+                and not args.smoke
+            ):
+                phase_env = dict(env, MAX_CONCURRENCY="8", NUM_PROMPTS="256")
             try:
-                run_phase(script, directory, env, server, timeout)
+                run_phase(script, directory, phase_env, server, timeout)
                 if phase == "accuracy":
                     row[phase] = validate_accuracy(directory / "gsm8k.json", args.smoke)
                     check_accuracy_gate(row[phase]["score"], baseline, args.smoke)
@@ -791,7 +798,7 @@ def run_case(case, args, directory, row):
                 else:
                     row[phase] = validate_performance(
                         directory / "performance.jsonl",
-                        2 if args.smoke else 128,
+                        int(phase_env.get("NUM_PROMPTS", 128)),
                         output_tokens,
                         speculative=mode != "base",
                     )

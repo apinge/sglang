@@ -262,7 +262,9 @@ python3 scripts/ci/qwen4_ci.py --models-root /raid/models \
 For serving cases, the default command runs **performance, GSM8K accuracy, then a multimodal smoke test** against the
 same server. The R-Fork case checks startup, transferred weights, and GSM8K instead.
 Use it without `--accuracy-only` or `--smoke` for the full workload.
-Performance uses 10 warmup requests and 128 random requests at concurrency one;
+Performance uses 10 warmup requests. `Qwen3.5-35B-TP2-Base` runs
+`run_qwen35_pure_text_bench.sh` with 256 random requests at concurrency 8.
+Other serving cases use 128 random requests at concurrency 1.
 Qwen3.5 uses 8,000 input / 500 output tokens, and Qwen3.8 uses 12,000 / 350.
 Accuracy scores 200 examples and enforces the recorded gate.
 
