@@ -85,6 +85,10 @@ Target model: [sammysun0711/Qwen3.5-35B-A3B-PTPC-FP8](https://huggingface.co/sam
 ./launch_qwen3.5-35B-fp8_tp2_disable_prefix_cache.sh
 ```
 
+At TP2 the launcher overlaps the prefill all-reduces with compute over SDMA through mori (install it as for
+Qwen3.8 below; without mori the all-reduce runs, with a warning; `SGLANG_QWEN4_SP_SDMA_RS=0` turns it off)
+and selects the FlyDSL GDN decode (`--linear-attn-decode-backend aiter`).
+
 
 
 ### Run benchmark
@@ -267,6 +271,8 @@ Performance uses 10 warmup requests. `Qwen3.5-35B-TP2-Base` runs
 Other serving cases use 128 random requests at concurrency 1.
 Qwen3.5 uses 8,000 input / 500 output tokens, and Qwen3.8 uses 12,000 / 350.
 Accuracy scores 200 examples and enforces the recorded gate.
+`Qwen3.5-35B-TP2-Base` also fails when its server log does not show the FlyDSL GDN decode or, after the
+performance phase, the SDMA all-reduce overlap, so a missing mori cannot pass silently.
 
 Resolve both development branches before building the local image. Passing their
 SHAs refreshes changed sources while preserving Docker's cache for unchanged layers:

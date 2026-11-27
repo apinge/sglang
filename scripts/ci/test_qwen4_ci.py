@@ -533,10 +533,47 @@ def test_qwen35_pure_text_workload(
             )
 
     monkeypatch.setattr(ci, "run_phase", run_phase)
+    (tmp_path / "server.log").write_text(QWEN35_TP2_OPTIMIZED_LOG)
     row = {"errors": []}
     ci.run_case(case, args, tmp_path, row)
     assert row["errors"] == []
     assert row["performance"]["completed"] == prompts
+
+
+QWEN35_TP2_OPTIMIZED_LOG = (
+    "[TP0] GDN kernel dispatcher: decode=FlyDSLGDNKernel, extend=AiterGDNKernel\n"
+    "[TP0] Qwen3.5 TP2 prefill: all-reduces over SDMA in 4 row chunks "
+    "(batches of at least 2048 tokens)\n"
+)
+
+
+@pytest.mark.parametrize(
+    "log,performance_ran,error",
+    [
+        (QWEN35_TP2_OPTIMIZED_LOG, True, None),
+        ("GDN kernel dispatcher: decode=TritonGDNKernel\n", False, "FlyDSL GDN decode"),
+        (
+            "GDN kernel dispatcher: decode=FlyDSLGDNKernel\n"
+            "SP SDMA overlap disabled (MORI_ENABLE_SDMA is not set)\n",
+            True,
+            "SDMA all-reduce overlap did not run",
+        ),
+        # Accuracy-only runs may never reach the SDMA token threshold.
+        ("GDN kernel dispatcher: decode=FlyDSLGDNKernel\n", False, None),
+    ],
+)
+def test_qwen35_tp2_requires_optimized_paths(tmp_path, log, performance_ran, error):
+    path = tmp_path / "server.log"
+    path.write_text(log)
+    if error is None:
+        ci.check_required_log_lines(path, "Qwen3.5-35B-TP2-Base", performance_ran)
+    else:
+        with pytest.raises(ValueError, match=error):
+            ci.check_required_log_lines(path, "Qwen3.5-35B-TP2-Base", performance_ran)
+
+
+def test_cases_without_required_log_lines_skip_the_log(tmp_path):
+    ci.check_required_log_lines(tmp_path / "missing.log", "Qwen3.5-397B-TP8-Base", True)
 
 
 def test_gpu_selection_skips_busy_devices_and_maps_to_host_indices(monkeypatch):

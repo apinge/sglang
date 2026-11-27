@@ -37,6 +37,7 @@ target verify), draft-model forwards, DP attention and EP all-to-all keep the or
 | Script | What it measures |
 |---|---|
 | `bench_rs_ag.py` | aiter all-reduce vs reduce-scatter + all-gather, and their bit-identity |
+| `bench_qwen35_sdma_all_reduce.py` | Qwen3.5 TP2 SDMA all-reduce correctness, and a layer stand-in vs RCCL |
 
 ## Results (8x MI308X, 12000 in / 350 out, `scripts/run_pure_text_bench.sh`)
 
@@ -95,6 +96,40 @@ All of them act only with `SGLANG_QWEN4_SEQ_PARALLEL=1`.
 
 With aiter's TP2 prefill GEMM rows (`qwen38-flash-next-dev`), TP2 serving at 12000 in / 350 out goes
 from 0.916 / 1.043 to 0.959 / 1.088 req/s at c8 / c12 (+4.6 % / +4.3 %).
+
+### Qwen3.5 MoE TP2: pipelined SDMA all-reduce
+
+Qwen3.5 (`qwen3_5_moe_text`, e.g. Qwen3.5-35B-A3B) has no hyper-connection residual, so it keeps the
+replicated residual and only borrows the SDMA overlap (`models/qwen3_5_sdma_all_reduce.py`). At TP2 an
+all-reduce is "push the partial to the peer, then add", the same bytes per rank as RS + AG:
+
+```
+o_proj / out_proj in row chunks, each pushed to the peer as soon as it is computed
+per landed chunk: rank 0 rows + rank 1 rows (bit-identical on both ranks)
+    -> residual add + RMSNorm -> MoE on that chunk (no all-reduce) -> push
+next layer: per landed chunk -> residual add + input RMSNorm
+```
+
+It covers eager TP2 EXTEND batches of at least `SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS` tokens and shares
+the Qwen4 switches, independently of `SGLANG_QWEN4_SEQ_PARALLEL`: `SGLANG_QWEN4_SP_SDMA_RS=0` keeps the
+all-reduce, `SGLANG_QWEN4_SP_SDMA_RS_CHUNKS` sets the row chunks (default 4 for Qwen3.5; 2 and 8 were
+5-12 % slower at 12k-token prefill). Other models, Qwen4-Exp included, and other TP sizes are unchanged.
+
+`bench_qwen35_sdma_all_reduce.py` checks the all-reduce (bit-identical ranks, delayed producer) and times
+a layer stand-in.
+
+MI308X TP2, `launch_qwen3.5-35B-fp8_tp2_disable_prefix_cache.sh`, two interleaved rounds against the launcher
+before this change (which also lacked the FlyDSL GDN decode; the middle column adds only that):
+
+| Workload | req/s before | + GDN decode | + SDMA all-reduce | TTFT | TPOT |
+|---|---|---|---|---|---|
+| 12000 in / 500 out, c8 | 1.211 | 1.281 | 1.399 (+15.5 %) | -9.1 % | -15.2 % |
+| 12000 in / 500 out, c16 | 1.660 | 1.702 | 1.946 (+17.2 %) | -13.4 % | -15.3 % |
+| 12000 in / 500 out, c32 | 2.000 | 2.062 | 2.382 (+19.1 %) | -16.4 % | -15.8 % |
+| 8000 in / 500 out, c8 x 256 (CI) | 1.425 | 1.477 | 1.602 (+12.4 %) | +0.8 % | -14.5 % |
+
+One full-attention layer of a 32k-token prefill (o_proj to the next GDN core) takes 11.6 ms instead of 16.1 ms:
+5.9 ms of RCCL all-reduce leave the critical path, 0.4 ms of SDMA wait remain.
 
 ### mori dependency
 
