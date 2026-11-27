@@ -37,6 +37,7 @@ target verify), draft-model forwards, DP attention and EP all-to-all keep the or
 | Script | What it measures |
 |---|---|
 | `bench_rs_ag.py` | aiter all-reduce vs reduce-scatter + all-gather, and their bit-identity |
+| `bench_qwen35_sdma_all_reduce.py` | Qwen3.5 TP2 SDMA all-reduce correctness, and a layer stand-in vs RCCL |
 
 ## Results (8x MI308X, 12000 in / 350 out, `scripts/run_pure_text_bench.sh`)
 
@@ -95,6 +96,52 @@ All of them act only with `SGLANG_QWEN4_SEQ_PARALLEL=1`.
 
 With aiter's TP2 prefill GEMM rows (`qwen38-flash-next-dev`), TP2 serving at 12000 in / 350 out goes
 from 0.916 / 1.043 to 0.959 / 1.088 req/s at c8 / c12 (+4.6 % / +4.3 %).
+
+### Qwen3.5 MoE TP2: pipelined SDMA all-reduce
+
+Qwen3.5 (`qwen3_5_moe_text`, e.g. Qwen3.5-35B-A3B) has no hyper-connection residual, so it keeps the
+replicated residual and only borrows the SDMA overlap (`models/qwen3_5_sdma_all_reduce.py`). At TP2 an
+all-reduce is "push the partial to the peer, then add", the same bytes per rank as RS + AG:
+
+```
+o_proj / out_proj in row chunks, each pushed to the peer as soon as it is computed
+per landed chunk: rank 0 rows + rank 1 rows (bit-identical on both ranks)
+    -> residual add + RMSNorm -> MoE on that chunk (no all-reduce) -> push
+next layer: per landed chunk -> residual add + input RMSNorm
+```
+
+Each chunk re-runs the MoE / quant / projection launches, a fixed host cost, so the chunk count follows the
+batch size: eager TP2 EXTEND batches of 8192-16383 tokens use 2 chunks, larger ones 4, smaller ones keep the
+all-reduce. Single-request prefill latency on MI308X (ms):
+
+| Tokens | all-reduce | 1 chunk | 2 chunks | 4 chunks |
+|---|---|---|---|---|
+| 4096 | **132** | 143 | 199 | 338 |
+| 8000 | 225 | 233 | **223** | 342 |
+| 12000 | 337 | 362 | **298** | 352 |
+| 16000 | 460 | 483 | 399 | **386** |
+| 24000 | 724 | 740 | 657 | **598** |
+| 32000 | 1021 | 1041 | 924 | **842** |
+
+It shares the Qwen4 switches, independently of `SGLANG_QWEN4_SEQ_PARALLEL`: `SGLANG_QWEN4_SP_SDMA_RS=0` keeps
+the all-reduce; `SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS` and `SGLANG_QWEN4_SP_SDMA_RS_CHUNKS`, when set, replace the
+Qwen3.5 threshold (8192) and the 2 / 4 chunk rule. Other models, Qwen4-Exp included, and other TP sizes are unchanged.
+
+`bench_qwen35_sdma_all_reduce.py` checks the all-reduce (bit-identical ranks, delayed producer) and times
+a layer stand-in.
+
+MI308X TP2, `launch_qwen3.5-35B-fp8_tp2_disable_prefix_cache.sh` and `evaluation/run_qwen35_pure_text_bench.sh`
+with its defaults (8000 in / 500 out, 128 prompts), mean of two rounds, against the launcher before this change
+(which also lacked the FlyDSL GDN decode; the middle column adds only that):
+
+| Concurrency | req/s before | + GDN decode | + SDMA all-reduce | TTFT | TPOT |
+|---|---|---|---|---|---|
+| c8 | 1.453 | 1.538 | 1.638 (+12.7 %) | -6.8 % | -12.6 % |
+| c16 | 2.081 | 2.217 | 2.394 (+15.0 %) | -11.0 % | -13.9 % |
+| c32 | 2.687 | 2.795 | 3.155 (+17.4 %) | -15.2 % | -14.6 % |
+
+One full-attention layer of a 32k-token prefill (o_proj to the next GDN core) takes 11.6 ms instead of 16.1 ms:
+5.9 ms of RCCL all-reduce leave the critical path, 0.4 ms of SDMA wait remain.
 
 ### mori dependency
 

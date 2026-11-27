@@ -31,7 +31,7 @@ DATASETS = {
     "ShareGPT_V3_unfiltered_cleaned_split.json": "35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4",
 }
 # Default order: Qwen3.8 first, then Qwen3.5.
-# Case, model, TP, mode, launch script, approved 200-example full-02 accuracy.
+# Case, model, TP, mode, launch script, 200-example GSM8K reference.
 # "rfork" runs a seed and an R-Fork instance in the same container: 2 x TP GPUs.
 CASES = [
     (
@@ -59,11 +59,11 @@ CASES = [
         0.980,
     ),
     (
-        "Qwen3.5-35B-TP4-Base",
+        "Qwen3.5-35B-TP2-Base",
         "Qwen3.5-35B-A3B-PTPC-FP8",
-        4,
+        2,
         "base",
-        "launch_qwen3.5-35B-fp8_tp4_disable_prefix_cache.sh",
+        "launch_qwen3.5-35B-fp8_tp2_disable_prefix_cache.sh",
         0.970,
     ),
     (
@@ -320,6 +320,40 @@ def check_rocjpeg_log(path):
         raise ValueError(
             "rocJPEG request batch decoding was not confirmed in server.log"
         )
+
+
+# Server-log lines proving that a case ran its optimized kernels instead of a silent
+# fallback: (needs the performance phase, pattern, what is missing).
+REQUIRED_LOG_LINES = {
+    "Qwen3.5-35B-TP2-Base": [
+        (
+            False,
+            r"GDN kernel dispatcher: decode=FlyDSLGDNKernel",
+            "FlyDSL GDN decode was not selected",
+        ),
+        # Concurrency-8 waves of 8,000-token prompts form prefill batches above the
+        # 8,192-token SDMA threshold; smoke runs send single prompts below it.
+        (
+            True,
+            r"Qwen3\.5 TP2 prefill: all-reduces over SDMA",
+            "the SDMA all-reduce overlap did not run (mori unavailable?)",
+        ),
+    ],
+}
+
+
+def check_required_log_lines(path, name, performance_ran):
+    required = [
+        (pattern, what)
+        for needs_performance, pattern, what in REQUIRED_LOG_LINES.get(name, [])
+        if performance_ran or not needs_performance
+    ]
+    if not required:
+        return
+    text = Path(path).read_text(errors="replace")
+    missing = [what for pattern, what in required if not re.search(pattern, text)]
+    if missing:
+        raise ValueError("; ".join(missing) + " (see server.log)")
 
 
 def validate_performance(path, prompts, output_tokens, speculative=False):
@@ -755,8 +789,15 @@ def run_case(case, args, directory, row):
         for phase, script, timeout in phases:
             if phase == "multimodal":
                 row[phase] = {"status": "failed"}
+            phase_env = env
+            if (
+                phase == "performance"
+                and name == "Qwen3.5-35B-TP2-Base"
+                and not args.smoke
+            ):
+                phase_env = dict(env, MAX_CONCURRENCY="8", NUM_PROMPTS="256")
             try:
-                run_phase(script, directory, env, server, timeout)
+                run_phase(script, directory, phase_env, server, timeout)
                 if phase == "accuracy":
                     row[phase] = validate_accuracy(directory / "gsm8k.json", args.smoke)
                     check_accuracy_gate(row[phase]["score"], baseline, args.smoke)
@@ -791,13 +832,22 @@ def run_case(case, args, directory, row):
                 else:
                     row[phase] = validate_performance(
                         directory / "performance.jsonl",
-                        2 if args.smoke else 128,
+                        int(phase_env.get("NUM_PROMPTS", 128)),
                         output_tokens,
                         speculative=mode != "base",
                     )
             except Exception as exc:
                 row["errors"].append(f"{phase}: {exc}")
     # managed_process has stopped the server and drained its log relay here.
+    if not pressure:
+        try:
+            check_required_log_lines(
+                directory / "server.log",
+                name,
+                performance_ran="performance" in row and not args.smoke,
+            )
+        except (OSError, ValueError) as exc:
+            row["errors"].append(f"server log: {exc}")
     # A successful image response alone could have used the PIL fallback.
     if row.get("multimodal", {}).get("status") == "passed":
         try:

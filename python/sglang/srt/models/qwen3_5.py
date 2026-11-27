@@ -105,6 +105,7 @@ from sglang.srt.models.qwen2_moe import (
     Qwen2MoeSparseMoeBlock,
     can_fuse_shared_expert,
 )
+from sglang.srt.models.qwen3_5_sdma_all_reduce import Qwen35SdmaAllReduce
 
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
@@ -1829,6 +1830,13 @@ class Qwen3_5ForCausalLM(nn.Module):
             self.norm = PPMissingLayer()
 
         self.layers_to_capture = []
+        self.sdma_all_reduce = Qwen35SdmaAllReduce.maybe_create(config)
+        if self.sdma_all_reduce is not None:
+            for layer in self.layers:
+                if isinstance(layer, Qwen3_5LinearDecoderLayer):
+                    self.sdma_all_reduce.wrap_projection(layer.linear_attn.out_proj)
+                elif isinstance(layer, Qwen3_5AttentionDecoderLayer):
+                    self.sdma_all_reduce.wrap_projection(layer.o_proj)
 
     def _build_embed_tokens(self, config: Qwen3_5TextConfig) -> nn.Module:
         """Embedding sharding hook for models reusing this backbone."""
@@ -1899,6 +1907,19 @@ class Qwen3_5ForCausalLM(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
+            )
+
+        if self.sdma_all_reduce is not None and self.sdma_all_reduce.eligible(
+            model=self,
+            forward_batch=forward_batch,
+            num_tokens=hidden_states.shape[0],
+            deepstack=input_deepstack_embeds,
+        ):
+            return self.sdma_all_reduce.forward_layers(
+                model=self,
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
             )
 
         aux_hidden_states = AuxHiddenStateList()

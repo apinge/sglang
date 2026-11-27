@@ -21,13 +21,25 @@ export USE_AITER_COMM=1
 
 export TVM_FFI_DISABLE_TORCH_C_DLPACK=1 # pip uninstall torch-c-dlpack-ext
 
+# TP2 prefill all-reduces run on the SDMA engines, overlapped with the GEMM / MoE
+# (models/qwen3_5_sdma_all_reduce.py); SGLANG_QWEN4_SP_SDMA_RS=0 keeps the all-reduce.
+# mori posts the copies from the GPU (amd_mori, pinned in python/pyproject_other.toml);
+# without a usable mori the all-reduce runs, with a warning.
+export MORI_ENABLE_SDMA="${MORI_ENABLE_SDMA:-1}"
+export MORI_SOCKET_IFNAME="${MORI_SOCKET_IFNAME:-lo}"
+# mori must use the same libdrm copy as the HIP runtime (ROCm's rocm_sysdeps one).
+ROCM_SYSDEPS_LIB="${ROCM_PATH:-/opt/rocm}/lib/rocm_sysdeps/lib"
+if [[ -f "${ROCM_SYSDEPS_LIB}/librocm_sysdeps_drm_amdgpu.so.1" && "${LD_PRELOAD:-}" != *rocm_sysdeps_drm_amdgpu* ]]; then
+  export LD_PRELOAD="${ROCM_SYSDEPS_LIB}/librocm_sysdeps_drm.so.2:${ROCM_SYSDEPS_LIB}/librocm_sysdeps_drm_amdgpu.so.1${LD_PRELOAD:+:${LD_PRELOAD}}"
+fi
+
 
 model="${MODEL_PATH:-/models/Qwen3.5-35B-A3B-PTPC-FP8/}"
 
 "${SERVER_PYTHON:-python3}" -m sglang.launch_server \
   --host "${HOST:-0.0.0.0}" --port "${PORT:-7080}" --served-model-name "${SERVED_MODEL_NAME:-$model}" \
   --model-path "${model}" \
-  --tp-size 4 \
+  --tp-size 2 \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
   --enable-multimodal \
@@ -39,13 +51,13 @@ model="${MODEL_PATH:-/models/Qwen3.5-35B-A3B-PTPC-FP8/}"
   --max-running-requests 128 \
   --cuda-graph-max-bs-decode 128 \
   --linear-attn-prefill-backend aiter \
+  --linear-attn-decode-backend aiter \
   --attention-backend aiter \
   --mm-attention-backend aiter_attn \
   --enable-strict-thinking \
   --kv-cache-dtype fp8_e4m3 \
   --disable-radix-cache \
   --watchdog-timeout 1200 \
-  2>&1 | tee "${LOG_FILE:-${ROOT}/logs/server/qwen3.5-35B-fp8_tp4_disable_prefix_cache.log}"
+  2>&1 | tee "${LOG_FILE:-${ROOT}/logs/server/qwen3.5-35B-fp8_tp2_disable_prefix_cache.log}"
   # --linear-attn-backend aiter \
-  # --linear-attn-decode-backend aiter \
 

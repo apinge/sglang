@@ -481,6 +481,101 @@ def test_case_runs_multimodal_after_text_phases_and_gates_failure(
     )
 
 
+@pytest.mark.parametrize(
+    "case_id,smoke,prompts,concurrency",
+    [
+        ("Qwen3.5-35B-TP2-Base", False, 256, 8),
+        ("Qwen3.5-35B-TP2-Base", True, 2, 1),
+        ("Qwen3.5-397B-TP8-Base", False, 128, 1),
+    ],
+)
+def test_qwen35_pure_text_workload(
+    tmp_path, monkeypatch, case_id, smoke, prompts, concurrency
+):
+    case = next(case for case in ci.CASES if case[0] == case_id)
+    model = tmp_path / case[1]
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    args = argparse.Namespace(
+        models_root=tmp_path,
+        datasets_root=None,
+        client_root=tmp_path,
+        gpus="0,1,2,3,4,5,6,7",
+        port=0,
+        server_timeout=1,
+        smoke=smoke,
+        accuracy_only=False,
+    )
+    monkeypatch.setattr(ci, "select_gpus", lambda env, devices, tp: devices[:tp])
+    monkeypatch.setattr(ci, "managed_process", lambda *args: contextlib.nullcontext())
+    monkeypatch.setattr(ci, "wait_ready", lambda *args: {})
+    monkeypatch.setattr(ci, "check_rocjpeg_log", lambda *args: None)
+
+    def run_phase(script, directory, env, server, timeout):
+        if script == "run_qwen35_pure_text_bench.sh":
+            assert int(env.get("NUM_PROMPTS", 128)) == prompts
+            assert int(env.get("MAX_CONCURRENCY", 1)) == concurrency
+            result = dict(
+                completed=prompts,
+                errors=[""] * prompts,
+                output_lens=[500] * prompts,
+                mean_ttft_ms=100,
+                mean_tpot_ms=2,
+                output_throughput=100,
+                request_throughput=1,
+            )
+            (directory / "performance.jsonl").write_text(json.dumps(result) + "\n")
+        elif script == "run_gsm8k.sh":
+            accuracy_result(directory, score=1, examples=2 if smoke else 200)
+        elif script == "run_multimodal_test.sh":
+            ci.write_json(
+                env["MM_OUTPUT_FILE"], multimodal_response(env["BENCH_SERVED_MODEL"])
+            )
+
+    monkeypatch.setattr(ci, "run_phase", run_phase)
+    (tmp_path / "server.log").write_text(QWEN35_TP2_OPTIMIZED_LOG)
+    row = {"errors": []}
+    ci.run_case(case, args, tmp_path, row)
+    assert row["errors"] == []
+    assert row["performance"]["completed"] == prompts
+
+
+QWEN35_TP2_OPTIMIZED_LOG = (
+    "[TP0] GDN kernel dispatcher: decode=FlyDSLGDNKernel, extend=AiterGDNKernel\n"
+    "[TP0] Qwen3.5 TP2 prefill: all-reduces over SDMA in 4 row chunks "
+    "(batches of at least 2048 tokens)\n"
+)
+
+
+@pytest.mark.parametrize(
+    "log,performance_ran,error",
+    [
+        (QWEN35_TP2_OPTIMIZED_LOG, True, None),
+        ("GDN kernel dispatcher: decode=TritonGDNKernel\n", False, "FlyDSL GDN decode"),
+        (
+            "GDN kernel dispatcher: decode=FlyDSLGDNKernel\n"
+            "SP SDMA overlap disabled (MORI_ENABLE_SDMA is not set)\n",
+            True,
+            "SDMA all-reduce overlap did not run",
+        ),
+        # Accuracy-only runs may never reach the SDMA token threshold.
+        ("GDN kernel dispatcher: decode=FlyDSLGDNKernel\n", False, None),
+    ],
+)
+def test_qwen35_tp2_requires_optimized_paths(tmp_path, log, performance_ran, error):
+    path = tmp_path / "server.log"
+    path.write_text(log)
+    if error is None:
+        ci.check_required_log_lines(path, "Qwen3.5-35B-TP2-Base", performance_ran)
+    else:
+        with pytest.raises(ValueError, match=error):
+            ci.check_required_log_lines(path, "Qwen3.5-35B-TP2-Base", performance_ran)
+
+
+def test_cases_without_required_log_lines_skip_the_log(tmp_path):
+    ci.check_required_log_lines(tmp_path / "missing.log", "Qwen3.5-397B-TP8-Base", True)
+
+
 def test_gpu_selection_skips_busy_devices_and_maps_to_host_indices(monkeypatch):
     seen = {}
 
