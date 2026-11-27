@@ -658,6 +658,7 @@ class ForwardFlags:
 
     _DEFAULTS = {
         "multi_stream": False,
+        "hipb_linear_decode": False,
         "moe_output_buffer": None,
         # Attention-TP input-scattering (set per forward by
         # AttnTpContext.maybe_input_scattered / set_attn_inputs).
@@ -692,6 +693,7 @@ class ForwardFlags:
             "attn_input_scattered",
             "attn_inputs",
             "is_extend_in_batch",
+            "hipb_linear_decode",
             "fuse_mlp_allreduce",
             "mlp_reduce_scatter",
             "flashinfer_trtllm_bypass",
