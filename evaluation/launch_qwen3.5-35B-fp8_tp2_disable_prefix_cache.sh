@@ -21,6 +21,18 @@ export USE_AITER_COMM=1
 
 export TVM_FFI_DISABLE_TORCH_C_DLPACK=1 # pip uninstall torch-c-dlpack-ext
 
+# TP2 prefill all-reduces run on the SDMA engines, overlapped with the GEMM / MoE
+# (models/qwen3_5_sdma_all_reduce.py); SGLANG_QWEN4_SP_SDMA_RS=0 keeps the all-reduce.
+# mori posts the copies from the GPU (amd_mori, pinned in python/pyproject_other.toml);
+# without a usable mori the all-reduce runs, with a warning.
+export MORI_ENABLE_SDMA="${MORI_ENABLE_SDMA:-1}"
+export MORI_SOCKET_IFNAME="${MORI_SOCKET_IFNAME:-lo}"
+# mori must use the same libdrm copy as the HIP runtime (ROCm's rocm_sysdeps one).
+ROCM_SYSDEPS_LIB="${ROCM_PATH:-/opt/rocm}/lib/rocm_sysdeps/lib"
+if [[ -f "${ROCM_SYSDEPS_LIB}/librocm_sysdeps_drm_amdgpu.so.1" && "${LD_PRELOAD:-}" != *rocm_sysdeps_drm_amdgpu* ]]; then
+  export LD_PRELOAD="${ROCM_SYSDEPS_LIB}/librocm_sysdeps_drm.so.2:${ROCM_SYSDEPS_LIB}/librocm_sysdeps_drm_amdgpu.so.1${LD_PRELOAD:+:${LD_PRELOAD}}"
+fi
+
 
 model="${MODEL_PATH:-/models/Qwen3.5-35B-A3B-PTPC-FP8/}"
 
