@@ -1,5 +1,9 @@
 # Qwen3.5 & Qwen3.8 PTPC Model Evaluation Guide
 
+For Qwen3.5-397B DFlash acceptance-length verification across GSM8K, MATH-500,
+HumanEval, MBPP and MT-Bench, see the
+[DFlash acceptance guide](../benchmark/dflash/README.md).
+
 ## Target Model
 
 Qwen3.5 + DFlash
