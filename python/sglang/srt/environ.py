@@ -320,7 +320,7 @@ class Envs:
     # tokens (reduce-scatter / all-gather instead of all-reduce); 0 restores the all-reduce.
     SGLANG_QWEN4_SEQ_PARALLEL = EnvBool(True)
     # Arbitrary; smaller batches (decode, short prefill) keep the all-reduce.
-    # Also the Qwen3.5 SDMA all-reduce threshold.
+    # Qwen3.5 SDMA all-reduce threshold only when set explicitly (its own default: 8192).
     SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS = EnvInt(2048)
     # ROCm, sequence-parallel prefill: move each communication to SDMA, overlapped with compute.
     # Needs mori (layers/sdma_mori.py); without it the aiter collectives run, with a warning.
@@ -330,7 +330,7 @@ class Envs:
     # "bf16" (exact) or "fp8" (peers' rows as fp8 + a bf16 scale per 32 values; lossy).
     SGLANG_QWEN4_SP_SDMA_RS_TRANSPORT = EnvStr("bf16")
     # Row chunks per owner block; None picks the measured best (2 at TP2, 1 above).
-    # Qwen3.5 TP2 all-reduce: row chunks over the whole batch; None picks 4.
+    # Qwen3.5 TP2 all-reduce: row chunks over the whole batch; unset picks 2, or 4 from 16384 tokens.
     SGLANG_QWEN4_SP_SDMA_RS_CHUNKS = EnvInt(None)
     # Attention / GDN input AG: the input projection consumes each peer's block as it lands.
     SGLANG_QWEN4_SP_SDMA_AG = EnvBool(True)

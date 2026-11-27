@@ -13,9 +13,12 @@ nothing outside the decoder stack changes:
 
 The copies run on the SDMA engines while the next chunk's GEMM / MoE runs on the
 compute units, so most of the prefill all-reduce time leaves the critical path.
-Shares the Qwen4 switches: SGLANG_QWEN4_SP_SDMA_RS (on by default),
-SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS and SGLANG_QWEN4_SP_SDMA_RS_CHUNKS. Batches
-that are not eager TP2 EXTEND batches of at least that many tokens keep the
+Each chunk re-runs the MoE / quant / projection launches, a fixed host cost, so
+small batches would be host-bound: the chunk count follows the batch size and
+batches under the threshold keep the all-reduce. Shares the Qwen4 switches:
+SGLANG_QWEN4_SP_SDMA_RS (on by default), and, when set explicitly,
+SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS and SGLANG_QWEN4_SP_SDMA_RS_CHUNKS override
+the Qwen3.5 defaults below. Batches that are not eager TP2 EXTEND batches keep the
 all-reduce path unchanged.
 """
 
@@ -31,8 +34,11 @@ from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
-# Measured on MI308X TP2 at 12k-token prefill: 4 chunks beat 2 and 8 by 5-12%.
-_DEFAULT_CHUNKS = 4
+# Measured on MI308X TP2, single-request prefill latency vs the all-reduce: under
+# 8192 tokens no chunking beats it (4k: 132 ms all-reduce, 199 ms at 2 chunks);
+# 2 chunks win from 8k (12k: -12%), 4 chunks from 16k (24k / 32k: -17% / -18%).
+_DEFAULT_MIN_TOKENS = 8192
+_FOUR_CHUNK_TOKENS = 16384
 _MOE_MODEL_TYPE = "qwen3_5_moe_text"
 
 
@@ -76,8 +82,13 @@ class Qwen35SdmaAllReduce:
 
     def __init__(self, *, hidden_size: int):
         self._hidden_size = hidden_size
-        self._chunks = envs.SGLANG_QWEN4_SP_SDMA_RS_CHUNKS.get() or _DEFAULT_CHUNKS
-        self._min_tokens = envs.SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS.get()
+        # The Qwen4 switches carry Qwen3.8's defaults; Qwen3.5 only follows explicit settings.
+        rs_chunks = envs.SGLANG_QWEN4_SP_SDMA_RS_CHUNKS
+        min_tokens = envs.SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS
+        self._fixed_chunks = rs_chunks.get() if rs_chunks.is_set() else None
+        self._min_tokens = (
+            min_tokens.get() if min_tokens.is_set() else _DEFAULT_MIN_TOKENS
+        )
         self._ag = None
         self._usable: Optional[bool] = None
         self._active: Optional[_Plan] = None
@@ -158,12 +169,17 @@ class Qwen35SdmaAllReduce:
             cpu_group=cpu_group,
         )
         logger.info(
-            "Qwen3.5 TP2 prefill: all-reduces over SDMA in %d row chunks "
+            "Qwen3.5 TP2 prefill: all-reduces over SDMA in %s row chunks "
             "(batches of at least %d tokens)",
-            self._chunks,
+            self._fixed_chunks or f"2 / 4 (4 from {_FOUR_CHUNK_TOKENS} tokens)",
             self._min_tokens,
         )
         return True
+
+    def _chunks_for(self, num_tokens: int) -> int:
+        if self._fixed_chunks:
+            return self._fixed_chunks
+        return 4 if num_tokens >= _FOUR_CHUNK_TOKENS else 2
 
     def _begin(self, plan: _Plan):
         return self._ag.begin(
@@ -181,7 +197,10 @@ class Qwen35SdmaAllReduce:
             get_global_expert_distribution_recorder,
         )
 
-        plan = _Plan(num_tokens=hidden_states.shape[0], chunks=self._chunks)
+        plan = _Plan(
+            num_tokens=hidden_states.shape[0],
+            chunks=self._chunks_for(hidden_states.shape[0]),
+        )
         residual = hidden_states.clone()
         x = model.layers[model.start_layer].input_layernorm(hidden_states)
         self._active = plan

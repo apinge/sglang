@@ -331,7 +331,8 @@ REQUIRED_LOG_LINES = {
             r"GDN kernel dispatcher: decode=FlyDSLGDNKernel",
             "FlyDSL GDN decode was not selected",
         ),
-        # 8,000-token prompts always reach the 2,048-token SDMA threshold.
+        # Concurrency-8 waves of 8,000-token prompts form prefill batches above the
+        # 8,192-token SDMA threshold; smoke runs send single prompts below it.
         (
             True,
             r"Qwen3\.5 TP2 prefill: all-reduces over SDMA",
@@ -843,7 +844,7 @@ def run_case(case, args, directory, row):
             check_required_log_lines(
                 directory / "server.log",
                 name,
-                performance_ran="performance" in row,
+                performance_ran="performance" in row and not args.smoke,
             )
         except (OSError, ValueError) as exc:
             row["errors"].append(f"server log: {exc}")

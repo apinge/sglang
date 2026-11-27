@@ -271,7 +271,7 @@ Performance uses 10 warmup requests. `Qwen3.5-35B-TP2-Base` runs
 Other serving cases use 128 random requests at concurrency 1.
 Qwen3.5 uses 8,000 input / 500 output tokens, and Qwen3.8 uses 12,000 / 350.
 Accuracy scores 200 examples and enforces the recorded gate.
-`Qwen3.5-35B-TP2-Base` also fails when its server log does not show the FlyDSL GDN decode or, after the
+`Qwen3.5-35B-TP2-Base` also fails when its server log does not show the FlyDSL GDN decode or, after the full
 performance phase, the SDMA all-reduce overlap, so a missing mori cannot pass silently.
 
 Resolve both development branches before building the local image. Passing their

@@ -110,10 +110,22 @@ per landed chunk: rank 0 rows + rank 1 rows (bit-identical on both ranks)
 next layer: per landed chunk -> residual add + input RMSNorm
 ```
 
-It covers eager TP2 EXTEND batches of at least `SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS` tokens and shares
-the Qwen4 switches, independently of `SGLANG_QWEN4_SEQ_PARALLEL`: `SGLANG_QWEN4_SP_SDMA_RS=0` keeps the
-all-reduce, `SGLANG_QWEN4_SP_SDMA_RS_CHUNKS` sets the row chunks (default 4 for Qwen3.5; 2 and 8 were
-5-12 % slower at 12k-token prefill). Other models, Qwen4-Exp included, and other TP sizes are unchanged.
+Each chunk re-runs the MoE / quant / projection launches, a fixed host cost, so the chunk count follows the
+batch size: eager TP2 EXTEND batches of 8192-16383 tokens use 2 chunks, larger ones 4, smaller ones keep the
+all-reduce. Single-request prefill latency on MI308X (ms):
+
+| Tokens | all-reduce | 1 chunk | 2 chunks | 4 chunks |
+|---|---|---|---|---|
+| 4096 | **132** | 143 | 199 | 338 |
+| 8000 | 225 | 233 | **223** | 342 |
+| 12000 | 337 | 362 | **298** | 352 |
+| 16000 | 460 | 483 | 399 | **386** |
+| 24000 | 724 | 740 | 657 | **598** |
+| 32000 | 1021 | 1041 | 924 | **842** |
+
+It shares the Qwen4 switches, independently of `SGLANG_QWEN4_SEQ_PARALLEL`: `SGLANG_QWEN4_SP_SDMA_RS=0` keeps
+the all-reduce; `SGLANG_QWEN4_SEQ_PARALLEL_MIN_TOKENS` and `SGLANG_QWEN4_SP_SDMA_RS_CHUNKS`, when set, replace the
+Qwen3.5 threshold (8192) and the 2 / 4 chunk rule. Other models, Qwen4-Exp included, and other TP sizes are unchanged.
 
 `bench_qwen35_sdma_all_reduce.py` checks the all-reduce (bit-identical ranks, delayed producer) and times
 a layer stand-in.
