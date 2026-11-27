@@ -130,15 +130,15 @@ Qwen3.5 threshold (8192) and the 2 / 4 chunk rule. Other models, Qwen4-Exp inclu
 `bench_qwen35_sdma_all_reduce.py` checks the all-reduce (bit-identical ranks, delayed producer) and times
 a layer stand-in.
 
-MI308X TP2, `launch_qwen3.5-35B-fp8_tp2_disable_prefix_cache.sh`, two interleaved rounds against the launcher
-before this change (which also lacked the FlyDSL GDN decode; the middle column adds only that):
+MI308X TP2, `launch_qwen3.5-35B-fp8_tp2_disable_prefix_cache.sh` and `evaluation/run_qwen35_pure_text_bench.sh`
+with its defaults (8000 in / 500 out, 128 prompts), mean of two rounds, against the launcher before this change
+(which also lacked the FlyDSL GDN decode; the middle column adds only that):
 
-| Workload | req/s before | + GDN decode | + SDMA all-reduce | TTFT | TPOT |
+| Concurrency | req/s before | + GDN decode | + SDMA all-reduce | TTFT | TPOT |
 |---|---|---|---|---|---|
-| 12000 in / 500 out, c8 | 1.211 | 1.281 | 1.399 (+15.5 %) | -9.1 % | -15.2 % |
-| 12000 in / 500 out, c16 | 1.660 | 1.702 | 1.946 (+17.2 %) | -13.4 % | -15.3 % |
-| 12000 in / 500 out, c32 | 2.000 | 2.062 | 2.382 (+19.1 %) | -16.4 % | -15.8 % |
-| 8000 in / 500 out, c8 x 256 (CI) | 1.425 | 1.477 | 1.602 (+12.4 %) | +0.8 % | -14.5 % |
+| c8 | 1.453 | 1.538 | 1.638 (+12.7 %) | -6.8 % | -12.6 % |
+| c16 | 2.081 | 2.217 | 2.394 (+15.0 %) | -11.0 % | -13.9 % |
+| c32 | 2.687 | 2.795 | 3.155 (+17.4 %) | -15.2 % | -14.6 % |
 
 One full-attention layer of a 32k-token prefill (o_proj to the next GDN core) takes 11.6 ms instead of 16.1 ms:
 5.9 ms of RCCL all-reduce leave the critical path, 0.4 ms of SDMA wait remain.
